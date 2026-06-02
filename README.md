@@ -115,3 +115,49 @@ stop repeating unhelpful moves.
 Set
 `PI_USE_SKILL_HARNESS_MEMORY=false` to disable prompt injection, or set
 `PI_SKILL_HARNESS_MEMORY_PATH` to choose a different memory file.
+
+## v2 Skill Evolution Loop
+
+The v2 scaffold treats SWE-Bench Verified as a direct training/evaluation
+stream:
+
+1. run a no-skills baseline on the selected test-set tasks;
+2. build a five-stage skill state from the baseline trajectories;
+3. evaluate the same tasks with the generated skill memory and skill pack;
+4. write a before/after score report.
+
+```bash
+python scripts/run_skill_evo_verified.py \
+  --run-name verified_glm51_round1 \
+  --dataset swe-bench/swe-bench-verified@2 \
+  --provider openai \
+  --n-tasks 10 \
+  --concurrency 2
+```
+
+The run writes artifacts under `analysis/evolution/<run-name>/`:
+
+- `training/curator_policy.md`
+- `training/reward_policy.md`
+- `training/skill_harness_memory.json`
+- `training/skill_packs/<version>/...`
+- `evaluation/score_report.json`
+- `evaluation/score_report.md`
+
+For a smoke test without launching E2B:
+
+```bash
+python scripts/run_skill_evo_verified.py \
+  --run-name dryrun_demo \
+  --n-tasks 1 \
+  --dry-run
+```
+
+To reuse existing jobs while testing the orchestration:
+
+```bash
+python scripts/run_skill_evo_verified.py \
+  --run-name reuse_existing \
+  --baseline-job-dir jobs/<baseline-job> \
+  --eval-job-dir jobs/<eval-job>
+```
