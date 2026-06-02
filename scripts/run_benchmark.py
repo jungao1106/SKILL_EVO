@@ -335,6 +335,8 @@ async def run_job(args: argparse.Namespace) -> Path:
 
 def parse_args() -> argparse.Namespace:
     provider_name = _provider()
+    if provider_name not in {"openai", "tinker"}:
+        provider_name = DEFAULT_PROVIDER
     provider = resolve_provider(provider_name)
     parser = argparse.ArgumentParser(
         description="Run SWE-Bench through Harbor/E2B with Pi and minimal model providers."

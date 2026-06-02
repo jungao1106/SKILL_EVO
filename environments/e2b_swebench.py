@@ -213,6 +213,12 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         reraise=True,
     )
     async def _create_template(self):
+        self.logger.info(
+            "E2B template build start: template=%s cpus=%s memory_mb=%s",
+            self._template_name,
+            self.task_env_config.cpus,
+            self.task_env_config.memory_mb,
+        )
         if self.task_env_config.docker_image:
             template = Template().from_image(
                 image=self.task_env_config.docker_image,
@@ -231,6 +237,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 cpu_count=self.task_env_config.cpus,
                 memory_mb=self.task_env_config.memory_mb,
             )
+        self.logger.info("E2B template build done: template=%s", self._template_name)
 
     @retry(
         stop=stop_after_attempt(2),
@@ -381,9 +388,29 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             raise
 
     async def start(self, force_build: bool):
-        if force_build or not await self._does_template_exist():
-            self.logger.debug("Creating template %s", self._template_name)
+        if force_build:
+            self.logger.info(
+                "E2B template check: force_build=true; building template=%s",
+                self._template_name,
+            )
             await self._create_template()
+        else:
+            candidates = self._candidate_template_names()
+            self.logger.info(
+                "E2B template check: candidates=%s",
+                ", ".join(candidates),
+            )
+            if await self._does_template_exist():
+                self.logger.info(
+                    "E2B template hit: using existing template=%s",
+                    self._template_name,
+                )
+            else:
+                self.logger.info(
+                    "E2B template miss: building template=%s",
+                    self._template_name,
+                )
+                await self._create_template()
 
         await self._create_sandbox()
 
