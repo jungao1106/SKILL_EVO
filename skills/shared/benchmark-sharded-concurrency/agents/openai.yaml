@@ -1,0 +1,3 @@
+display_name: Benchmark Sharded Concurrency
+short_description: Shard benchmark runs for faster throughput.
+default_prompt: Split this benchmark into multiple bounded-concurrency shards, launch the jobs, and monitor completion, rewards, exceptions, and trace artifact output.

@@ -1,0 +1,3 @@
+display_name: Reward=1 SFT Export
+short_description: Export successful benchmark traces into SWE-smith-style SFT JSONL.
+default_prompt: Export reward=1 traces from this benchmark job into SWE-smith-style SFT data.

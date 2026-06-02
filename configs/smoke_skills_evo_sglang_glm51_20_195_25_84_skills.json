@@ -1,0 +1,122 @@
+{
+  "job_name": "smoke_skills_evo_sglang_glm51_20_195_25_84_skills",
+  "jobs_dir": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/jobs",
+  "n_attempts": 1,
+  "timeout_multiplier": 1.0,
+  "agent_timeout_multiplier": null,
+  "verifier_timeout_multiplier": null,
+  "agent_setup_timeout_multiplier": 2.0,
+  "environment_build_timeout_multiplier": 2.0,
+  "debug": false,
+  "n_concurrent_trials": 1,
+  "quiet": false,
+  "retry": {
+    "max_retries": 0,
+    "include_exceptions": null,
+    "exclude_exceptions": [
+      "RewardFileNotFoundError",
+      "AgentTimeoutError",
+      "VerifierOutputParseError",
+      "RewardFileEmptyError",
+      "VerifierTimeoutError"
+    ],
+    "wait_multiplier": 1.0,
+    "min_wait_sec": 1.0,
+    "max_wait_sec": 60.0
+  },
+  "environment": {
+    "type": null,
+    "import_path": "environments.e2b_swebench:E2BSwebenchEnvironment",
+    "force_build": false,
+    "delete": true,
+    "override_cpus": 1,
+    "override_memory_mb": 4096,
+    "override_storage_mb": 10240,
+    "override_gpus": null,
+    "suppress_override_warnings": false,
+    "mounts_json": null,
+    "env": {
+      "LLM_PROVIDER": "${LLM_PROVIDER}",
+      "OPENAI_COMPAT_BASE_URL": "${OPENAI_COMPAT_BASE_URL}",
+      "OPENAI_COMPAT_MODEL": "${OPENAI_COMPAT_MODEL}",
+      "OPENAI_COMPAT_API_KEY": "${OPENAI_COMPAT_API_KEY}"
+    },
+    "kwargs": {
+      "template_namespace": "anchen1011",
+      "pi_template_suffix": "pi_c6d7003a",
+      "strip_dockerfile_comments": true,
+      "sandbox_timeout_sec": 3600
+    }
+  },
+  "verifier": {
+    "override_timeout_sec": null,
+    "max_timeout_sec": null,
+    "disable": false
+  },
+  "metrics": [
+    {
+      "type": "mean",
+      "kwargs": {}
+    }
+  ],
+  "agents": [
+    {
+      "name": null,
+      "import_path": "agents.pi_agent:PiAgent",
+      "model_name": "openai/glm-5.1-fp8-sglang-h200",
+      "override_timeout_sec": 900.0,
+      "override_setup_timeout_sec": 1200.0,
+      "max_timeout_sec": null,
+      "kwargs": {
+        "provider_name": "openai",
+        "api_key_env": "OPENAI_COMPAT_API_KEY",
+        "base_url_env": "OPENAI_COMPAT_BASE_URL",
+        "model_env": "OPENAI_COMPAT_MODEL",
+        "provider_api": "openai-completions",
+        "model_context_window": 202752,
+        "model_max_tokens": 32000,
+        "thinking": "off",
+        "tools": "read,write,edit,bash,grep,find,ls",
+        "openai_compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsReasoningEffort": false,
+          "supportsUsageInStreaming": false,
+          "maxTokensField": "max_tokens",
+          "requiresToolResultName": false,
+          "requiresAssistantAfterToolResult": false,
+          "requiresThinkingAsText": true,
+          "requiresReasoningContentOnAssistantMessages": false,
+          "supportsStrictMode": false,
+          "supportsLongCacheRetention": false,
+          "thinkingFormat": "zai"
+        },
+        "auth_header": true,
+        "model_reasoning": false,
+        "default_api_key": null,
+        "result_only": false,
+        "use_skills": true
+      },
+      "env": {}
+    }
+  ],
+  "datasets": [
+    {
+      "path": null,
+      "name": "swe-bench/swe-bench-verified",
+      "version": null,
+      "ref": "2",
+      "registry_url": null,
+      "registry_path": null,
+      "overwrite": false,
+      "download_dir": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/.cache/harbor_tasks",
+      "task_names": [
+        "swe-bench/matplotlib__matplotlib-14623"
+      ],
+      "exclude_task_names": null,
+      "n_tasks": null
+    }
+  ],
+  "tasks": [],
+  "artifacts": []
+}

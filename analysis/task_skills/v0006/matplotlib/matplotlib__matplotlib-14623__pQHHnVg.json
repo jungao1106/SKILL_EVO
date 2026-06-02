@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "version_id": "v0006",
+  "parent_version": "v0005",
+  "kind": "swe_task_specific_skill",
+  "entry": {
+    "kind": "swe_task_specific_skill",
+    "entry_id": "smoke_skills_evo_novita_glm51_openai_compat_skills:matplotlib__matplotlib-14623__pQHHnVg",
+    "task_skill_id": "matplotlib__matplotlib-14623__pQHHnVg",
+    "source_job": "smoke_skills_evo_novita_glm51_openai_compat_skills",
+    "trial_dir": "jobs/smoke_skills_evo_novita_glm51_openai_compat_skills/matplotlib__matplotlib-14623__pQHHnVg",
+    "task_name": "swe-bench/matplotlib__matplotlib-14623",
+    "repo": "matplotlib",
+    "issue_title": "Inverting an axis using its limits does not work for log scale",
+    "reward": 1.0,
+    "exception": null,
+    "provider": "openai",
+    "provider_model": "zai-org/glm-5.1",
+    "provider_base_url": "https://api.novita.ai/v3/openai",
+    "provider_api": "openai-completions",
+    "api_key_env": "OPENAI_COMPAT_API_KEY",
+    "use_skills": true,
+    "selected_skill": {
+      "name": "testing-python",
+      "path": "/tmp/pi-skills/fix-build-agentops/testing-python/SKILL.md",
+      "relative_path": "fix-build-agentops/testing-python/SKILL.md"
+    },
+    "selected_skills": [
+      {
+        "name": "testing-python",
+        "path": "/tmp/pi-skills/fix-build-agentops/testing-python/SKILL.md",
+        "relative_path": "fix-build-agentops/testing-python/SKILL.md"
+      }
+    ],
+    "tool_counts": {
+      "bash": 14,
+      "read": 11,
+      "grep": 4,
+      "edit": 1
+    },
+    "touched_paths": [
+      "lib/matplotlib/ticker.py",
+      "lib/matplotlib",
+      "lib/matplotlib/axes/_base.py",
+      "lib/matplotlib/transforms.py",
+      "/testbed",
+      "lib/matplotlib/scale.py",
+      "lib/matplotlib/axis.py"
+    ],
+    "edited_paths": [
+      "lib/matplotlib/ticker.py"
+    ],
+    "test_commands": [
+      "cd /testbed && python -m pytest lib/matplotlib/tests/test_ticker.py -x -q -k \"log\" 2>&1 | tail -30",
+      "cd /testbed && python -m pytest lib/matplotlib/tests/test_scale.py -x -q 2>&1 | tail -20",
+      "cd /testbed && python -m pytest lib/matplotlib/tests/test_axes.py -x -q -k \"ylim or xlim or invert\" 2>&1 | tail -20",
+      "cd /testbed && python -m pytest lib/matplotlib/tests/test_axes.py::test_polar_invertedylim -x -v 2>&1 | tail -30",
+      "cd /testbed && python -m pytest lib/matplotlib/tests/test_ticker.py -x -q -k \"LogLocator\" 2>&1 | tail -10"
+    ],
+    "tool_sequence": [
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"find /testbed -type f -name \\\"*.py\\\" | head -30\"}"
+      },
+      {
+        "tool": "grep",
+        "arguments": "{\"glob\": \"**/*.py\", \"path\": \"/testbed\", \"pattern\": \"class LogScale\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"path\": \"/testbed/lib/matplotlib/scale.py\", \"limit\": 150, \"offset\": 340}"
+      },
+      {
+        "tool": "grep",
+        "arguments": "{\"glob\": \"**/*.py\", \"path\": \"/testbed/lib/matplotlib\", \"pattern\": \"def set_ylim|def set_yscale\"}"
+      },
+      {
+        "tool": "grep",
+        "arguments": "{\"glob\": \"**/*.py\", \"path\": \"/testbed/lib/matplotlib\", \"pattern\": \"limit_range_for_scale\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"path\": \"/testbed/lib/matplotlib/axes/_base.py\", \"limit\": 50, \"offset\": 3540}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"path\": \"/testbed/lib/matplotlib/axis.py\", \"limit\": 20, \"offset\": 800}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 80, \"offset\": 3590, \"path\": \"/testbed/lib/matplotlib/axes/_base.py\"}"
+      },
+      {
+        "tool": "grep",
+        "arguments": "{\"glob\": \"**/*.py\", \"path\": \"/testbed/lib/matplotlib\", \"pattern\": \"def nonsingular\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 20, \"offset\": 1523, \"path\": \"/testbed/lib/matplotlib/ticker.py\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 30, \"offset\": 2791, \"path\": \"/testbed/lib/matplotlib/transforms.py\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 30, \"offset\": 2821, \"path\": \"/testbed/lib/matplotlib/transforms.py\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 50, \"offset\": 2460, \"path\": \"/testbed/lib/matplotlib/axes/_base.py\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 30, \"offset\": 2622, \"path\": \"/testbed/lib/matplotlib/ticker.py\"}"
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\n\\ny = np.linspace(1000e2, 1, 100)\\nx = np.exp(-np.linspace(0, 1, y.size))\\n\\nfor yscale in ('linear', 'log'):\\n    fig, ax = plt.subplots()\\n    ax.plot(x, y)\\n   "
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\nfrom matplotlib.ticker import LogLocator\\n\\n# Test LogLocator.nonsingular\\nloc = LogLocator()\\nvmin, vmax = 100000, 1  # inverted\\nresult = loc.nonsingular(vmin, v"
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\n\\ny = np.linspace(1000e2, 1, 100)\\nx = np.exp(-np.linspace(0, 1, y.size))\\n\\nfig, ax = plt.subplots()\\nax.plot(x, y)\\nax.set_yscale('log')\\n\\n# Now check what LogL"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"limit\": 40, \"offset\": 2378, \"path\": \"/testbed/lib/matplotlib/ticker.py\"}"
+      },
+      {
+        "tool": "read",
+        "arguments": "{\"path\": \"/tmp/pi-skills/fix-build-agentops/testing-python/SKILL.md\"}"
+      },
+      {
+        "tool": "edit",
+        "arguments": "{\"edits\": [{\"newText\": \"    def nonsingular(self, vmin, vmax):\\n        if not np.isfinite(vmin) or not np.isfinite(vmax):\\n            return 1, 10  # initial range, no data plotted yet\\n\\n        if vmin > vmax:\\n            vmin, vmax = vmax, vmin\\n            swapped = True\\n        else:\\n     "
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\n\\ny = np.linspace(1000e2, 1, 100)\\nx = np.exp(-np.linspace(0, 1, y.size)\\n\\nfor yscale in ('linear', 'log'):\\n    fig, ax = plt.subplots()\\n    ax.plot(x, y)\\n    "
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\n\\ny = np.linspace(1000e2, 1, 100)\\nx = np.exp(-np.linspace(0, 1, y.size))\\n\\nfor yscale in ('linear', 'log'):\\n    fig, ax = plt.subplots()\\n    ax.plot(x, y)\\n   "
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\n\\n# Test 1: Normal (non-inverted) log scale still works\\nfig, ax = plt.subplots()\\nax.plot([1, 2, 3], [10, 100, 1000])\\nax.set_yscale('log')\\nax.set_ylim(1, 10000)"
+      },
+      {
+        "tool": "bash",
+        "arguments": "{\"command\": \"cd /testbed && python -c \\\"\\nimport numpy as np\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\n\\n# Test x-axis inversion with log scale\\nfig, ax = plt.subplots()\\nax.plot([1, 10, 100, 1000], [1, 2, 3, 4])\\nax.set_xscale('log')\\nax.set_xlim(10000, 1)\\nleft, r"
+      }
+    ],
+    "problem_excerpt": "Use Pi's available tools to inspect the repository, read one relevant skill's SKILL.md before your first source edit, make a targeted source-code fix, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.\n\nBENCHMARK ISSUE:\nInverting an axis using its limits does not work for log scale\n### Bug report\n\n**Bug summary**\nStarting in matplotlib 3.1.0 it is no longer possible to invert a log axis using its limits.\n\n**Code for reproduction**\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\n\n\ny = np.linspace(1000e2, 1, 100)\nx = np.exp(-np.linspace(0, 1, y.size))\n\nfor yscale in ('linear', 'log'):\n    fig, ax = plt.subplots()\n    ax.plot(x, y)\n    ax.set_yscale(yscale)\n    ax.set_ylim(y.max(), y.min())\n```\n\n**Actual outcome**\nThe yaxis is only inverted for the ``\"linear\"`` scale.\n\n![linear](https://user-images.githubusercontent.com/9482218/60081191-99245e80-9731-11e9-9e4a-eadb3ef58666.png)\n\n![log](https://user-images.githubusercontent.com/9482218/60081203-9e81a900-9731-11e9-8bae-0be1c9762b16.png)\n\n**Expected outcome**\nI would expect the yaxis to be inverted for both the ``\"linear\"`` and the ``\"log\"`` scale.\n\n**Matplotlib version**\n  * Operating system: Linux and MacOS\n  * Matplotlib version: 3.1.0 \n  * Python version: 3.7.3\n \nPython and matplotlib have been installed using conda.\n\n",
+    "summary": "Fix matplotlib log-scale axis inversion by preserving vmin>vmax ordering in LogLocator.nonsingular. The bug occurred because nonsingular swapped inverted limits for internal processing but never swapped them back, silently discarding the inversion signal.",
+    "summary_source": "backbone",
+    "keywords": [
+      "_base",
+      "agentops",
+      "axes",
+      "axis",
+      "axis inversion",
+      "bench",
+      "build",
+      "does",
+      "fix",
+      "invert",
+      "inverting",
+      "its",
+      "lib",
+      "limit_range_for_scale",
+      "limits",
+      "log",
+      "log scale inverted limits",
+      "loglocator",
+      "matplotlib",
+      "matplotlib ticker",
+      "matplotlib__matplotlib",
+      "name",
+      "nonsingular",
+      "path",
+      "pytest",
+      "python",
+      "relative_path",
+      "scale",
+      "set_ylim inverted",
+      "skill",
+      "skills",
+      "swe",
+      "tail",
+      "test_axes",
+      "test_polar_invertedylim",
+      "test_scale",
+      "test_ticker",
+      "testbed",
+      "testing",
+      "tests",
+      "ticker",
+      "tmp",
+      "transforms",
+      "work",
+      "xlim",
+      "ylim"
+    ],
+    "skill_hints": [],
+    "skill_summaries": [
+      {
+        "name": "axis-inversion-preservation",
+        "role": "Ensure axis inversion via limit ordering survives scale-specific limit processing methods.",
+        "hints": [
+          "Track swap at entry; restore swap at exit. Test both linear and log scales with inverted limits."
+        ]
+      }
+    ],
+    "generated_skills": [
+      {
+        "name": "axis-inversion-preservation",
+        "source_skills": [
+          "testing-python"
+        ],
+        "trigger": "Axis inversion (set_ylim/set_xlim with max,min) fails on non-linear scales; nonsingular or limit_range_for_scale methods silently un-invert limits.",
+        "actions": [
+          "Identify the scale-specific nonsingular/limit_range_for_scale method that processes limits",
+          "Add a swap-tracking flag when vmin > vmax at method entry",
+          "Perform normal processing on the ordered (vmin < vmax) pair",
+          "Swap the result back if the flag indicates original inversion",
+          "Verify with both linear and log scale inversion tests"
+        ],
+        "stop_condition": "Inverted limits (max,min) are preserved after nonsingular processing for all scale types."
+      }
+    ],
+    "control_points": [
+      {
+        "phase": "diagnosis",
+        "trigger": "Axis inversion works on linear scale but not log/symlog scale.",
+        "action": "Grep for limit_range_for_scale and nonsingular in scale.py, ticker.py, axes/_base.py. Read the scale-specific nonsingular method to check if it discards inversion ordering.",
+        "evidence_to_collect": "Whether nonsingular swaps vmin/vmax internally without restoring the original order.",
+        "stop_condition": "Root cause identified: a method that normalizes limits loses the inversion signal."
+      },
+      {
+        "phase": "fix",
+        "trigger": "Root cause is nonsingular (or similar) discarding inversion by swapping without restoring.",
+        "action": "Add swapped=True flag when vmin>vmax, process normally, then conditionally swap back before returning.",
+        "evidence_to_collect": "Edited method now returns (vmax, vmin) when input was (vmax, vmin).",
+        "stop_condition": "Code edit preserves inversion ordering through nonsingular."
+      },
+      {
+        "phase": "verification",
+        "trigger": "Fix is applied to nonsingular method.",
+        "action": "Run targeted tests: (1) log scale with inverted ylim, (2) log scale with inverted xlim, (3) non-inverted log scale still works, (4) linear scale inversion still works. Also run existing test suites for ticker and scale.",
+        "evidence_to_collect": "All four manual scenarios pass; pytest for test_ticker.py and test_scale.py pass.",
+        "stop_condition": "No regressions; inversion works for both linear and log scales."
+      }
+    ],
+    "harness_hints": [
+      "When testing matplotlib axis behavior, always use matplotlib.use('Agg') to avoid display issues. Test both x and y axes. Compare linear vs log scale behavior side-by-side. Check get_ylim()/get_xlim() return values directly rather than relying on visual inspection."
+    ],
+    "avoid": [
+      "Do not assume axis inversion is handled only in axes/_base.py; scale-specific locators and transformers can override or discard it.",
+      "Do not modify limit_range_for_scale without also checking nonsingular in the corresponding Locator subclass.",
+      "Do not test only the y-axis; x-axis inversion has the same code path and must be verified separately."
+    ],
+    "summary_confidence": 0.95
+  }
+}
