@@ -6,7 +6,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MEMORY_PATH = ROOT / "analysis" / "skill_harness_memory.json"
+DEFAULT_MEMORY_PATH = ROOT / "run_logs" / "skill_harness_memory.json"
 
 STOPWORDS = {
     "a",
@@ -33,6 +33,20 @@ STOPWORDS = {
     "when",
     "with",
 }
+GENERIC_FALLBACK_SKILL_NAMES = {
+    "task-recover-from-drift",
+    "task-reproduce-from-issue",
+    "task-validate-targeted",
+    "task-edit-minimal-owner",
+    "task-localize-high-signal-paths",
+}
+BLOCKED_SKILL_RISKS = {
+    "generic_fallback_skill",
+    "private_or_sandbox_path",
+    "unresolved_source_trace",
+    "source_trace_exception",
+}
+MIN_MEMORY_SKILL_QUALITY = float(os.getenv("PI_MIN_MEMORY_SKILL_QUALITY", "0.58"))
 
 
 def tokenize_text(text: str) -> set[str]:
@@ -78,6 +92,29 @@ def active_version(memory: dict[str, Any]) -> dict[str, Any] | None:
             version.setdefault("version_id", fallback_id)
             return version
     return None
+
+
+def task_slug_from_text(text: str) -> str:
+    patterns = (
+        r"swe-bench/([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
+        r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _entry_task_slug(entry: dict[str, Any]) -> str:
+    for key in ("task_name", "task_skill_id", "entry_id", "trial_dir"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        slug = task_slug_from_text(str(value))
+        if slug:
+            return slug
+    return ""
 
 
 def _entry_text(entry: dict[str, Any]) -> str:
@@ -143,6 +180,24 @@ def _short_list(values: Any, limit: int = 4) -> str:
     return ", ".join(clean[:limit]) if clean else "none"
 
 
+def _stage_skill_active(stage_skill: dict[str, Any]) -> bool:
+    name = str(stage_skill.get("name") or "")
+    if name in GENERIC_FALLBACK_SKILL_NAMES:
+        return False
+    if stage_skill.get("active") is False:
+        return False
+    quality = stage_skill.get("quality_score")
+    if isinstance(quality, (int, float)) and quality < MIN_MEMORY_SKILL_QUALITY:
+        return False
+    risks = {str(item) for item in (stage_skill.get("risk_flags") or [])}
+    if risks & BLOCKED_SKILL_RISKS:
+        return False
+    use_policy = str(stage_skill.get("use_policy") or "").strip().lower()
+    if use_policy in {"memory-only", "disabled", "inactive"}:
+        return False
+    return True
+
+
 def format_memory_prompt(
     version: dict[str, Any],
     selected_entries: list[dict[str, Any]],
@@ -161,6 +216,7 @@ def format_memory_prompt(
         + (f" (parent: {parent_id})" if parent_id else ""),
         "- There are no global skills here. Each item below is one previous SWE task, organized by stage-specific skills: reproduce, localize, edit, validate, recover.",
         "- Treat these as weak priors and control points. Still inspect the current repository before editing.",
+        "- Stage-skill details below are filtered to active, evidence-gated skills; if no concrete evidence matches, ignore them and continue normally.",
     ]
     for item in selected_entries:
         entry = item["entry"]
@@ -219,7 +275,12 @@ def format_memory_prompt(
             if not isinstance(stage_item, dict):
                 continue
             stage = stage_item.get("stage") or "stage"
-            for stage_skill in (stage_item.get("skills") or [])[:3]:
+            active_stage_skills = [
+                skill
+                for skill in (stage_item.get("skills") or [])
+                if isinstance(skill, dict) and _stage_skill_active(skill)
+            ]
+            for stage_skill in active_stage_skills[:3]:
                 if not isinstance(stage_skill, dict):
                     continue
                 name = stage_skill.get("name") or "unknown"
@@ -227,8 +288,10 @@ def format_memory_prompt(
                 actions = _short_list(stage_skill.get("actions"), limit=2)
                 evidence = stage_skill.get("evidence_to_collect") or ""
                 stop = stage_skill.get("stop_condition") or ""
+                quality = stage_skill.get("quality_score")
+                quality_text = f"; quality={quality:.2f}" if isinstance(quality, (int, float)) else ""
                 lines.append(
-                    f"  stage_skill[{stage}/{name}]=trigger={trigger}; actions={actions}; evidence={evidence}; stop={stop}"
+                    f"  stage_skill[{stage}/{name}]=trigger={trigger}; actions={actions}; evidence={evidence}; stop={stop}{quality_text}"
                 )
                 scripts = stage_skill.get("script_resources") or []
                 if scripts:
@@ -299,6 +362,17 @@ def retrieve_task_memory(
     entries = version.get("entries") or []
     if not isinstance(entries, list):
         entries = []
+    task_slug = task_slug_from_text(task_text)
+    if not task_slug:
+        return {
+            "enabled": False,
+            "memory_path": str(memory_path),
+            "version_id": version.get("version_id"),
+            "retrieval_scope": "task_exact",
+            "reason": "missing_task_slug_for_task_specific_memory",
+            "prompt": "",
+            "selected_entries": [],
+        }
     query_tokens = tokenize_text(task_text)
     limit = max_entries
     if limit is None:
@@ -310,6 +384,8 @@ def retrieve_task_memory(
     ranked: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
+            continue
+        if _entry_task_slug(entry) != task_slug:
             continue
         score = score_entry(query_tokens, entry)
         if score <= 0:
@@ -332,6 +408,9 @@ def retrieve_task_memory(
         "parent_version": version.get("parent_version"),
         "created_at": version.get("created_at"),
         "source_jobs": version.get("source_jobs") or [],
+        "retrieval_scope": "task_exact",
+        "task_slug": task_slug,
+        "reason": "selected_exact_task_memory" if selected else "no_exact_task_memory",
         "prompt": prompt,
         "selected_entries": [
             {

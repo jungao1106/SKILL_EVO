@@ -57,6 +57,19 @@ def _safe_template_segment(value: str) -> str:
     return segment or "swebench-task"
 
 
+def _benchmark_log(message: str) -> None:
+    log_path = os.getenv("SKILL_EVO_BENCHMARK_LOG")
+    if not log_path:
+        return
+    try:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(message.rstrip() + "\n")
+    except OSError:
+        return
+
+
 def _strip_dockerfile_comments(content: str) -> str:
     lines: list[str] = []
     for line in content.splitlines():
@@ -219,6 +232,14 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             self.task_env_config.cpus,
             self.task_env_config.memory_mb,
         )
+        _benchmark_log(
+            "E2B_TEMPLATE "
+            f"task={self.environment_name} "
+            f"status=build_start "
+            f"template={self._template_name} "
+            f"cpus={self.task_env_config.cpus} "
+            f"memory_mb={self.task_env_config.memory_mb}"
+        )
         if self.task_env_config.docker_image:
             template = Template().from_image(
                 image=self.task_env_config.docker_image,
@@ -238,6 +259,12 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 memory_mb=self.task_env_config.memory_mb,
             )
         self.logger.info("E2B template build done: template=%s", self._template_name)
+        _benchmark_log(
+            "E2B_TEMPLATE "
+            f"task={self.environment_name} "
+            f"status=build_done "
+            f"template={self._template_name}"
+        )
 
     @retry(
         stop=stop_after_attempt(2),
@@ -393,6 +420,12 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 "E2B template check: force_build=true; building template=%s",
                 self._template_name,
             )
+            _benchmark_log(
+                "E2B_TEMPLATE "
+                f"task={self.environment_name} "
+                f"status=force_build "
+                f"template={self._template_name}"
+            )
             await self._create_template()
         else:
             candidates = self._candidate_template_names()
@@ -400,15 +433,33 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 "E2B template check: candidates=%s",
                 ", ".join(candidates),
             )
+            _benchmark_log(
+                "E2B_TEMPLATE "
+                f"task={self.environment_name} "
+                "status=check "
+                f"candidates={','.join(candidates)}"
+            )
             if await self._does_template_exist():
                 self.logger.info(
                     "E2B template hit: using existing template=%s",
                     self._template_name,
                 )
+                _benchmark_log(
+                    "E2B_TEMPLATE "
+                    f"task={self.environment_name} "
+                    f"status=hit "
+                    f"template={self._template_name}"
+                )
             else:
                 self.logger.info(
                     "E2B template miss: building template=%s",
                     self._template_name,
+                )
+                _benchmark_log(
+                    "E2B_TEMPLATE "
+                    f"task={self.environment_name} "
+                    f"status=miss "
+                    f"template={self._template_name}"
                 )
                 await self._create_template()
 

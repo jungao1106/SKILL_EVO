@@ -36,6 +36,27 @@ TEST_COMMAND_PATTERNS = (
     "cargo test",
     "go test",
 )
+GENERIC_FALLBACK_SKILL_NAMES = {
+    "task-recover-from-drift",
+    "task-reproduce-from-issue",
+    "task-validate-targeted",
+    "task-edit-minimal-owner",
+    "task-localize-high-signal-paths",
+}
+GENERIC_SKILL_PHRASES = (
+    "inspect high-signal paths",
+    "patch only the owner location",
+    "run the nearest focused test",
+    "stop the loop",
+    "re-localize from the strongest evidence",
+    "small diff preserving existing api",
+    "behavior-owning module",
+)
+SOURCE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+    r"\.(?:py|pyi|js|ts|tsx|jsx|rst|txt|cfg|ini|toml|yml|yaml|json|md)"
+)
+PRIVATE_PATH_RE = re.compile(r"(/tmp/(?!pi-skills\b)|/root/|/home/|/opt/miniconda)")
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -66,6 +87,13 @@ def _first_reward_value(rewards: dict[str, Any] | None) -> float | None:
         return float(next(iter(rewards.values())))
     except (StopIteration, TypeError, ValueError):
         return None
+
+
+def _entry_reward_value(entry: dict[str, Any]) -> float:
+    try:
+        return float(entry.get("reward"))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _repo_from_task_name(task_name: str | None) -> str:
@@ -1113,6 +1141,128 @@ def write_task_skill_cards(
     return cards_dir
 
 
+def skill_quality_metadata(
+    *,
+    entry: dict[str, Any],
+    stage: str,
+    stage_skill: dict[str, Any],
+) -> dict[str, Any]:
+    name = str(stage_skill.get("name") or f"{stage}-task-skill").strip()
+    trigger = str(stage_skill.get("trigger") or "")
+    actions = [str(action) for action in (stage_skill.get("actions") or []) if action]
+    evidence = str(stage_skill.get("evidence_to_collect") or "")
+    stop = str(stage_skill.get("stop_condition") or "")
+    source_skill_paths = [str(path) for path in (stage_skill.get("source_skill_paths") or [])]
+    script_resources = stage_skill.get("script_resources") or []
+    distilled_scripts = stage_skill.get("distilled_scripts") or []
+    entry_paths = [str(path) for path in (entry.get("touched_paths") or []) + (entry.get("edited_paths") or [])]
+    entry_tests = [str(command) for command in (entry.get("test_commands") or [])]
+    combined = "\n".join(
+        [name, trigger, *actions, evidence, stop, *source_skill_paths, *entry_paths, *entry_tests]
+    )
+    lowered = combined.lower()
+
+    risk_flags: list[str] = []
+    useful_signals: list[str] = []
+    if name in GENERIC_FALLBACK_SKILL_NAMES:
+        risk_flags.append("generic_fallback_skill")
+    if any(phrase in lowered for phrase in GENERIC_SKILL_PHRASES):
+        risk_flags.append("generic_workflow_language")
+    if PRIVATE_PATH_RE.search(combined):
+        risk_flags.append("private_or_sandbox_path")
+
+    source_paths = sorted(set(SOURCE_PATH_RE.findall(combined)))
+    if source_paths:
+        useful_signals.append("repository_relative_paths")
+    elif stage in {"localize", "edit"}:
+        risk_flags.append("missing_owner_path")
+
+    has_test_command = bool(entry_tests) or any(pattern in lowered for pattern in TEST_COMMAND_PATTERNS)
+    if has_test_command:
+        useful_signals.append("focused_validation")
+    elif stage in {"reproduce", "validate"}:
+        risk_flags.append("missing_validation_command")
+
+    if len(" ".join(actions).strip()) < 24:
+        risk_flags.append("thin_actions")
+    if len(stop.strip()) < 18:
+        risk_flags.append("missing_abort_or_stop_condition")
+    if _entry_reward_value(entry) < 1.0:
+        risk_flags.append("unresolved_source_trace")
+    if entry.get("exception"):
+        risk_flags.append("source_trace_exception")
+    if len(source_paths) > 6:
+        risk_flags.append("over_specific_path_list")
+    risk_flags = sorted(set(risk_flags))
+
+    score = 0.15
+    if _entry_reward_value(entry) >= 1.0:
+        score += 0.22
+    if source_paths:
+        score += min(len(source_paths), 3) * 0.08
+    if has_test_command:
+        score += 0.16
+    if len(trigger.strip()) >= 24:
+        score += 0.08
+    if len(evidence.strip()) >= 24:
+        score += 0.08
+    if len(stop.strip()) >= 18:
+        score += 0.08
+    if name and name not in GENERIC_FALLBACK_SKILL_NAMES and not name.startswith("task-"):
+        score += 0.12
+    if script_resources or distilled_scripts:
+        score += 0.06
+    if "generic_fallback_skill" in risk_flags:
+        score -= 0.30
+    if "generic_workflow_language" in risk_flags:
+        score -= 0.12
+    if "private_or_sandbox_path" in risk_flags:
+        score -= 0.20
+    if "missing_owner_path" in risk_flags:
+        score -= 0.16
+    if "missing_validation_command" in risk_flags:
+        score -= 0.10
+    if "unresolved_source_trace" in risk_flags:
+        score -= 0.25
+    if "source_trace_exception" in risk_flags:
+        score -= 0.15
+    score = max(0.0, min(1.0, score))
+
+    active = (
+        score >= 0.58
+        and "generic_fallback_skill" not in risk_flags
+        and "private_or_sandbox_path" not in risk_flags
+        and "unresolved_source_trace" not in risk_flags
+    )
+    if score >= 0.76:
+        tier = "high"
+    elif score >= 0.58:
+        tier = "medium"
+    else:
+        tier = "low"
+    applicability_bits = []
+    if source_paths:
+        applicability_bits.append("First confirm repository evidence around: " + ", ".join(source_paths[:4]) + ".")
+    if has_test_command:
+        applicability_bits.append("Prefer this skill only when the issue can be checked with the recorded focused reproduction or validation command.")
+    if trigger:
+        applicability_bits.append("The observed behavior should match the trigger: " + trigger[:240])
+    if not applicability_bits:
+        applicability_bits.append("Use only as background memory; do not follow it unless current repository evidence independently matches.")
+    return {
+        "active": active,
+        "score": round(score, 3),
+        "quality_score": round(score, 3),
+        "tier": tier,
+        "quality_tier": tier,
+        "risk_flags": risk_flags,
+        "useful_signals": useful_signals,
+        "source_paths": source_paths[:8],
+        "use_policy": "evidence-gated" if active else "memory-only",
+        "applicability": " ".join(applicability_bits),
+    }
+
+
 def _skill_md_text(
     *,
     entry: dict[str, Any],
@@ -1122,6 +1272,9 @@ def _skill_md_text(
     version: dict[str, Any],
 ) -> str:
     name = str(stage_skill.get("name") or f"{stage}-task-skill")
+    quality = stage_skill.get("quality_metadata")
+    if not isinstance(quality, dict):
+        quality = skill_quality_metadata(entry=entry, stage=stage, stage_skill=stage_skill)
     description = (
         f"Task-specific {stage} skill from {entry.get('task_name')}. "
         f"Use when {stage_skill.get('trigger') or entry.get('issue_title') or 'a similar stage appears'}."
@@ -1134,6 +1287,11 @@ def _skill_md_text(
         "---",
         f"name: {name}",
         "description: " + json.dumps(description, ensure_ascii=False),
+        f"active: {'true' if quality['active'] else 'false'}",
+        f"quality_score: {quality['score']:.2f}",
+        f"quality_tier: {quality['tier']}",
+        "risk_flags: " + json.dumps(quality["risk_flags"], ensure_ascii=False),
+        "use_policy: " + json.dumps(quality["use_policy"], ensure_ascii=False),
         "---",
         "",
         f"# {name}",
@@ -1144,6 +1302,13 @@ def _skill_md_text(
         f"- Source job: `{entry.get('source_job')}`",
         f"- Stage: `{stage}`",
         f"- Reward: `{entry.get('reward')}`",
+        f"- Active: `{str(quality['active']).lower()}`",
+        f"- Quality score: `{quality['score']:.2f}` (`{quality['tier']}`)",
+        f"- Risk flags: `{', '.join(quality['risk_flags']) or 'none'}`",
+        "",
+        "## Applicability",
+        "",
+        str(quality["applicability"]),
         "",
         "## Trigger",
         "",
@@ -1160,6 +1325,10 @@ def _skill_md_text(
         "## Stop Condition",
         "",
         str(stage_skill.get("stop_condition") or ""),
+        "",
+        "## Abort Conditions",
+        "",
+        "Ignore this skill if the first concrete repository check does not match its applicability, owner paths, or validation evidence.",
         "",
         "## Source Skill Files",
         "",
@@ -1297,6 +1466,44 @@ def _entry_task_stage_skills(entry: dict[str, Any]) -> list[dict[str, Any]]:
     return _fallback_task_stage_skills(entry)
 
 
+def annotate_entry_skill_quality(entry: dict[str, Any]) -> None:
+    for stage_item in _entry_task_stage_skills(entry):
+        if not isinstance(stage_item, dict):
+            continue
+        stage = _stage_slug(str(stage_item.get("stage") or "recover"))
+        for stage_skill in stage_item.get("skills") or []:
+            if not isinstance(stage_skill, dict):
+                continue
+            quality = skill_quality_metadata(
+                entry=entry,
+                stage=stage,
+                stage_skill=stage_skill,
+            )
+            stage_skill["active"] = quality["active"]
+            stage_skill["quality_score"] = quality["quality_score"]
+            stage_skill["quality_tier"] = quality["quality_tier"]
+            stage_skill["risk_flags"] = quality["risk_flags"]
+            stage_skill["use_policy"] = quality["use_policy"]
+            stage_skill["applicability"] = quality["applicability"]
+            stage_skill["quality_metadata"] = quality
+
+
+def annotate_version_skill_quality(version: dict[str, Any]) -> None:
+    for entry in version.get("entries") or []:
+        if isinstance(entry, dict):
+            annotate_entry_skill_quality(entry)
+    version["skill_quality_policy"] = {
+        "min_active_score": 0.58,
+        "blocked_risks": [
+            "generic_fallback_skill",
+            "private_or_sandbox_path",
+            "unresolved_source_trace",
+            "source_trace_exception",
+        ],
+        "generic_fallback_skill_names": sorted(GENERIC_FALLBACK_SKILL_NAMES),
+    }
+
+
 def write_generated_skill_files(
     version: dict[str, Any],
     *,
@@ -1365,6 +1572,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory for generated task/stage skill folders.",
     )
     parser.add_argument("--no-generated-skill-files", action="store_true")
+    parser.add_argument(
+        "--append-generated-skill-files",
+        action="store_true",
+        help=(
+            "Append generated SKILL.md files into an existing version directory "
+            "instead of clearing the whole version first. Use this for sharded "
+            "runs where multiple processes write different task-specific skills "
+            "into one iteration version."
+        ),
+    )
     parser.add_argument(
         "--summarize-with-backbone",
         action="store_true",
@@ -1457,6 +1674,8 @@ def main() -> None:
             "mode": "heuristic",
             "reason": "not_requested",
         }
+    annotate_version_skill_quality(version)
+    version["aggregates"] = _aggregate(version["entries"])
     memory["versions"][version_id] = version
     if not args.no_activate:
         memory["active_version"] = version_id
@@ -1477,7 +1696,7 @@ def main() -> None:
         generated_dir = write_generated_skill_files(
             version,
             output_root=args.generated_skill_dir.expanduser(),
-            clean=True,
+            clean=not args.append_generated_skill_files,
         )
     print(f"Wrote {out}")
     print(f"Wrote {md_out}")

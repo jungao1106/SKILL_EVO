@@ -93,9 +93,9 @@ skills contain bundled Python or shell scripts, the model distills their purpose
 command shape, and useful checks into the task/stage skill card. Generated
 skills are written under
 `skills/tasks/<version>/<repo>/<task>/<stage>/<skill>/SKILL.md`, with optional
-distilled helpers under that skill's `scripts/` directory. PiAgent reads only
-the active memory version by default and injects the most similar task/stage
-cards into the next task prompt when `--use-skills` is enabled.
+distilled helpers under that skill's `scripts/` directory. PiAgent uses the
+active skill version as an archive root, but only injects skills and harness
+memory that exactly match the current SWE-Bench task id.
 
 ```bash
 set -a; . .env; set +a
@@ -121,10 +121,27 @@ Set
 The v2 scaffold treats SWE-Bench Verified as a direct training/evaluation
 stream:
 
-1. run a no-skills baseline on the selected test-set tasks;
+1. run a no-skills baseline on the selected benchmark tasks;
 2. build a five-stage skill state from the baseline trajectories;
 3. evaluate the same tasks with the generated skill memory and skill pack;
 4. write a before/after score report.
+
+This setup supports full-distribution skill evolution on SWE-Bench Verified:
+use `--all-verified` when running against the complete Verified task selection.
+
+Full Verified run:
+
+```bash
+python scripts/run_skill_evo_verified.py \
+  --run-name verified_glm51_full_round1 \
+  --dataset swe-bench/swe-bench-verified@2 \
+  --provider openai \
+  --all-verified \
+  --concurrency 2 \
+  --summarize-with-backbone
+```
+
+Small round:
 
 ```bash
 python scripts/run_skill_evo_verified.py \
@@ -135,14 +152,31 @@ python scripts/run_skill_evo_verified.py \
   --concurrency 2
 ```
 
-The run writes artifacts under `analysis/evolution/<run-name>/`:
+The run writes orchestration artifacts under `run_logs/evolution/<run-name>/`:
 
 - `training/curator_policy.md`
 - `training/reward_policy.md`
 - `training/skill_harness_memory.json`
-- `training/skill_packs/<version>/...`
+- `training/task_skill_cards/<version>/...`
 - `evaluation/score_report.json`
 - `evaluation/score_report.md`
+
+Generated task/stage `SKILL.md` files are archived under repo-level versioned
+directories:
+
+- `skills/tasks/<version>/...`
+- `skills/tasks/VERSIONS.json`
+
+The runner picks the next unused `vXXXX` version by scanning existing
+`skills/tasks` directories, the version index, and git-tracked historical
+versions. To pin a version explicitly:
+
+```bash
+python scripts/run_skill_evo_verified.py \
+  --run-name verified_glm51_round1 \
+  --skill-version-id v0012 \
+  --n-tasks 10
+```
 
 For a smoke test without launching E2B:
 

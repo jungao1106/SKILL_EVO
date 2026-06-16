@@ -10,7 +10,7 @@ __pycache__/
 .ruff_cache/
 .cache/
 
-analysis/evolution/
+analysis/
 jobs/
 logs/*.log
 run_logs/*.out

@@ -2,10 +2,10 @@ import base64
 import io
 import json
 import os
+import re
 import shlex
 import tarfile
 import textwrap
-from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -40,6 +40,21 @@ PI_SKILL_PACK_B64_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz.b64")
 PI_SKILL_PACK_TAR_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz")
 PI_SKILL_PACK_EXCLUDE_DIRS = {"benchmark-sharded-concurrency"}
 PI_SKILL_PACK_CHUNK_SIZE = 24_000
+PI_MAX_PROMPT_SKILLS = 8
+PI_MIN_ACTIVE_SKILL_QUALITY = float(os.getenv("PI_MIN_ACTIVE_SKILL_QUALITY", "0.58"))
+PI_BLOCKED_SKILL_RISKS = {
+    "generic_fallback_skill",
+    "private_or_sandbox_path",
+    "unresolved_source_trace",
+    "source_trace_exception",
+}
+PI_GENERIC_FALLBACK_SKILL_NAMES = {
+    "task-recover-from-drift",
+    "task-reproduce-from-issue",
+    "task-validate-targeted",
+    "task-edit-minimal-owner",
+    "task-localize-high-signal-paths",
+}
 FORBIDDEN_ASSISTANT_CONTENT_MARKERS = (
     "</think>",
     "<think>",
@@ -87,7 +102,7 @@ BENCHMARK ISSUE:
 """
 
 
-PI_TASK_PREFIX_WITH_SKILLS = """Use Pi's available tools to inspect the repository, use task/stage skill memory as weak control hints, read one to three relevant task skill SKILL.md files if the system prompt lists a task skill pack, make a targeted source-code fix, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.
+PI_TASK_PREFIX_WITH_SKILLS = """Use Pi's available tools to inspect the repository, treat task/stage skill memory as evidence-gated weak hints, make a targeted source-code fix, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.
 
 BENCHMARK ISSUE:
 """
@@ -107,8 +122,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _parse_skill_metadata(text: str) -> dict[str, str]:
-    metadata: dict[str, str] = {}
+def _parse_bool_metadata(value: str, default: bool = True) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
+def _parse_list_metadata(value: str) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return [item.strip().strip("'\"") for item in text.strip("[]").split(",") if item.strip()]
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    return [str(parsed)]
+
+
+def _parse_skill_metadata(text: str) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
     in_frontmatter = text.startswith("---")
     lines = text.splitlines()
     iterable = lines[1:] if in_frontmatter else lines
@@ -122,11 +157,36 @@ def _parse_skill_metadata(text: str) -> dict[str, str]:
             continue
         key, value = line.split(":", 1)
         key = key.strip()
-        if key in {"name", "description"} and value.strip():
+        if key in {"name", "description", "quality_tier", "use_policy"} and value.strip():
             metadata[key] = _unquote_yaml_scalar(value)
-        if "name" in metadata and "description" in metadata:
-            break
+        elif key == "active":
+            metadata[key] = _parse_bool_metadata(value, default=True)
+        elif key == "quality_score":
+            try:
+                metadata[key] = float(_unquote_yaml_scalar(value))
+            except ValueError:
+                metadata[key] = 0.0
+        elif key == "risk_flags":
+            metadata[key] = _parse_list_metadata(value)
     return metadata
+
+
+def _skill_is_active(metadata: dict[str, Any]) -> bool:
+    name = str(metadata.get("name") or "")
+    if name in PI_GENERIC_FALLBACK_SKILL_NAMES:
+        return False
+    if metadata.get("active") is False:
+        return False
+    quality = metadata.get("quality_score")
+    if isinstance(quality, (int, float)) and quality < PI_MIN_ACTIVE_SKILL_QUALITY:
+        return False
+    risks = {str(item) for item in (metadata.get("risk_flags") or [])}
+    if risks & PI_BLOCKED_SKILL_RISKS:
+        return False
+    use_policy = str(metadata.get("use_policy") or "").strip().lower()
+    if use_policy in {"memory-only", "disabled", "inactive"}:
+        return False
+    return True
 
 
 def _active_task_skills_root() -> Path:
@@ -151,6 +211,8 @@ def _discover_pi_skills(skills_root: Path) -> list[dict[str, str]]:
             continue
 
         metadata = _parse_skill_metadata(skill_md.read_text(errors="replace"))
+        if not _skill_is_active(metadata):
+            continue
         name = metadata.get("name") or relative_dir.name
         relative_path = relative_dir / "SKILL.md"
         sandbox_path = PI_SANDBOX_SKILLS_DIR / relative_path.as_posix()
@@ -158,11 +220,52 @@ def _discover_pi_skills(skills_root: Path) -> list[dict[str, str]]:
             {
                 "name": name,
                 "description": metadata.get("description", ""),
+                "quality_score": metadata.get("quality_score"),
+                "quality_tier": metadata.get("quality_tier", ""),
+                "risk_flags": metadata.get("risk_flags", []),
+                "use_policy": metadata.get("use_policy", "evidence-gated"),
                 "relative_path": relative_path.as_posix(),
                 "path": sandbox_path.as_posix(),
             }
         )
     return skills
+
+
+def _task_slug_from_instruction(instruction: str) -> str:
+    patterns = (
+        r"swe-bench/([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
+        r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, instruction)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _repo_slug_from_instruction(instruction: str) -> str:
+    task_slug = _task_slug_from_instruction(instruction)
+    if "__" in task_slug:
+        return task_slug.split("__", 1)[0]
+    return ""
+
+
+def _filter_task_specific_skills(
+    skills: list[dict[str, str]],
+    instruction: str,
+) -> list[dict[str, str]]:
+    if not skills:
+        return []
+    task_slug = _task_slug_from_instruction(instruction)
+    if not task_slug:
+        return []
+
+    exact = [
+        skill
+        for skill in skills
+        if task_slug in skill.get("relative_path", "")
+    ]
+    return exact[:PI_MAX_PROMPT_SKILLS]
 
 
 def _iter_pi_skill_pack_files(skills_root: Path) -> list[Path]:
@@ -184,13 +287,39 @@ def _iter_pi_skill_pack_files(skills_root: Path) -> list[Path]:
     return files
 
 
-@lru_cache(maxsize=1)
-def _pi_skill_pack() -> tuple[list[dict[str, str]], str, str]:
+def _iter_pi_skill_pack_files_for_skills(
+    skills_root: Path,
+    skills: list[dict[str, str]],
+) -> list[Path]:
+    if not skills_root.exists() or not skills:
+        return []
+
+    selected_dirs: list[Path] = []
+    for skill in skills:
+        relative_path = skill.get("relative_path")
+        if not relative_path:
+            continue
+        selected_dirs.append(Path(relative_path).parent)
+
+    files: list[Path] = []
+    for path in _iter_pi_skill_pack_files(skills_root):
+        relative_path = path.relative_to(skills_root)
+        if any(
+            relative_path == selected_dir
+            or relative_path.is_relative_to(selected_dir)
+            for selected_dir in selected_dirs
+        ):
+            files.append(path)
+    return files
+
+
+def _pi_skill_pack(instruction: str) -> tuple[list[dict[str, str]], str, str, int, dict[str, str]]:
     skills_root = _active_task_skills_root()
-    skills = _discover_pi_skills(skills_root)
+    all_skills = _discover_pi_skills(skills_root)
+    skills = _filter_task_specific_skills(all_skills, instruction)
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for path in _iter_pi_skill_pack_files(skills_root):
+        for path in _iter_pi_skill_pack_files_for_skills(skills_root, skills):
             relative_path = path.relative_to(skills_root)
             info = archive.gettarinfo(str(path), arcname=relative_path.as_posix())
             info.uid = 0
@@ -202,7 +331,21 @@ def _pi_skill_pack() -> tuple[list[dict[str, str]], str, str]:
                 archive.addfile(info, handle)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     wrapped = "\n".join(textwrap.wrap(encoded, width=76))
-    return skills, wrapped, str(skills_root)
+    task_filter = {
+        "task_slug": _task_slug_from_instruction(instruction),
+        "repo_slug": _repo_slug_from_instruction(instruction),
+        "max_prompt_skills": str(PI_MAX_PROMPT_SKILLS),
+    }
+    return skills, wrapped, str(skills_root), len(all_skills), task_filter
+
+
+def _task_filter_text(instruction: str, environment: BaseEnvironment) -> str:
+    parts = [instruction]
+    for attr in ("environment_name", "session_id"):
+        value = getattr(environment, attr, "")
+        if value:
+            parts.append(str(value))
+    return "\n".join(parts)
 
 
 def _pi_skills_prompt(skills: list[dict[str, str]]) -> str:
@@ -215,15 +358,18 @@ def _pi_skills_prompt(skills: list[dict[str, str]]) -> str:
         f"- Read-only task-specific stage skill files are available under {PI_SANDBOX_SKILLS_DIR}.",
         f"- The skill index is saved at {PI_SKILLS_INDEX_PATH}.",
         "- These are previous task skills from evolution memory, not a global skill catalog.",
-        "- After your first repository inspection and before your first source edit, read at least one and at most three listed task skill SKILL.md files with tool calls when they match the current stage.",
-        "- Choose a compact set of the most relevant task/stage skills for the repository and issue.",
-        "- After reading the relevant SKILL.md file(s), continue with the repository fix; do not spend extra turns reading unrelated skills.",
+        "- First inspect the current repository evidence. Read a listed SKILL.md only if that first inspection matches its applicability, owner path, error signal, or validation command.",
+        "- You may read zero skills. If no listed skill matches concrete repository evidence, continue with the normal no-skill workflow.",
+        "- If a skill's first concrete check does not match the current repository, ignore that skill and do not force its patch shape.",
+        "- Read at most two skill files before the first edit; prefer the highest-quality evidence-gated skill over multiple generic hints.",
         "- Load referenced scripts, assets, or reference files only when they are directly useful.",
         "",
         "Available task/stage skills:",
     ]
     for skill in skills:
-        lines.append(f"- {skill['name']}: {skill['path']}")
+        quality = skill.get("quality_score")
+        quality_text = f", quality={quality:.2f}" if isinstance(quality, (int, float)) else ""
+        lines.append(f"- {skill['name']}: {skill['path']} ({skill.get('use_policy', 'evidence-gated')}{quality_text})")
     return "\n".join(lines)
 
 
@@ -233,6 +379,10 @@ def _pi_skills_metadata(skills: list[dict[str, str]]) -> list[dict[str, str]]:
             "name": skill["name"],
             "relative_path": skill["relative_path"],
             "path": skill["path"],
+            "quality_score": skill.get("quality_score"),
+            "quality_tier": skill.get("quality_tier"),
+            "risk_flags": skill.get("risk_flags", []),
+            "use_policy": skill.get("use_policy"),
         }
         for skill in skills
     ]
@@ -1076,10 +1226,25 @@ class PiAgent(BaseInstalledAgent):
         provider_base_url = env[self.base_url_env]
         model = self.model_name or f"{self.provider_name}/{provider_model}"
         models_config = self._models_config(env)
+        task_filter_text = _task_filter_text(instruction, environment)
         if self.use_skills:
-            pi_skills, pi_skill_pack_b64, pi_skill_source_root = _pi_skill_pack()
+            (
+                pi_skills,
+                pi_skill_pack_b64,
+                pi_skill_source_root,
+                all_pi_skills_count,
+                task_skill_filter,
+            ) = _pi_skill_pack(task_filter_text)
         else:
-            pi_skills, pi_skill_pack_b64, pi_skill_source_root = [], "", ""
+            pi_skills = []
+            pi_skill_pack_b64 = ""
+            pi_skill_source_root = ""
+            all_pi_skills_count = 0
+            task_skill_filter = {
+                "task_slug": "",
+                "repo_slug": "",
+                "max_prompt_skills": str(PI_MAX_PROMPT_SKILLS),
+            }
         has_skill_pack = self.use_skills and bool(pi_skills)
         skill_harness_memory = {
             "enabled": False,
@@ -1088,7 +1253,7 @@ class PiAgent(BaseInstalledAgent):
             "selected_entries": [],
         }
         if self.use_skills and _env_bool("PI_USE_SKILL_HARNESS_MEMORY", True):
-            skill_harness_memory = retrieve_task_memory(instruction)
+            skill_harness_memory = retrieve_task_memory(task_filter_text)
         effective_use_skills = self.use_skills and (
             has_skill_pack or bool(skill_harness_memory.get("prompt"))
         )
@@ -1127,6 +1292,8 @@ class PiAgent(BaseInstalledAgent):
             "skills_source_root": pi_skill_source_root,
             "use_skills": effective_use_skills,
             "skills_count": len(pi_skills),
+            "all_skills_count": all_pi_skills_count,
+            "task_skill_filter": task_skill_filter,
             "skills": pi_skills_metadata,
             "skill_harness_memory": {
                 key: value

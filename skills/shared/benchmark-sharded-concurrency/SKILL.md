@@ -54,6 +54,54 @@ The target is not "maximum configured concurrency"; it is "maximum completed res
 
 ## Launch Helper
 
+## SKILLS_EVO Full Verified Skill Evolution
+
+For this repository, use the project-specific launcher to run SWE-Bench Verified
+as both training and eval with fixed curator/reward policies. It starts five
+tmux sessions, each with per-process concurrency 20. All shards append
+task-specific five-stage skills into the same iteration directory:
+
+```text
+skills/tasks/<skill-version-id>/<repo>/<task>/<stage>/<skill>/SKILL.md
+```
+
+Dry-run first:
+
+```bash
+python skills/shared/benchmark-sharded-concurrency/scripts/launch_skill_evo_verified_shards.py \
+  --skill-version-id v0001 \
+  --job-prefix skill_evo_verified_glm51_full_v0001 \
+  --n-shards 5 \
+  --concurrency 20 \
+  --agent-timeout-sec 900 \
+  --dry-run
+```
+
+Then launch:
+
+```bash
+python skills/shared/benchmark-sharded-concurrency/scripts/launch_skill_evo_verified_shards.py \
+  --skill-version-id v0001 \
+  --job-prefix skill_evo_verified_glm51_full_v0001 \
+  --n-shards 5 \
+  --concurrency 20 \
+  --agent-timeout-sec 900 \
+  --stagger-sec 120
+```
+
+Each shard calls `scripts/run_skill_evo_verified.py` with:
+
+- `--provider openai`
+- `--task-names-file <shard-file>`
+- `--skill-version-id <same-version-for-all-shards>`
+- `--append-skill-version`
+- `--concurrency 20`
+
+The version id is the skill iteration id, not the shard id. Five shards write
+different task-specific skills into the same version directory for easier
+management. During inference, Pi only exposes skills matching the current task,
+even though the version directory may contain skills for many tasks.
+
 Use `scripts/launch_sharded_benchmark.py` when the benchmark runner accepts task-name/args files and can be launched from the shell.
 
 Dry-run an execution plan first:

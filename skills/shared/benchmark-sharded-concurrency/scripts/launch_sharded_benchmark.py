@@ -4,12 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
 import shlex
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
+
+
+def repo_root() -> Path:
+    env_root = os.getenv("SKILLS_EVO_ROOT") or os.getenv("REPO_ROOT")
+    return Path(env_root).expanduser().resolve() if env_root else DEFAULT_REPO_ROOT
 
 
 def parse_range(value: str) -> tuple[int, int]:
@@ -32,6 +44,85 @@ def read_tasks(path: Path) -> list[str]:
     if not tasks:
         raise SystemExit(f"task list is empty: {path}")
     return tasks
+
+
+def parse_dataset(value: str) -> tuple[str, str | None]:
+    if "@" in value:
+        name, ref = value.split("@", 1)
+        return name, ref
+    return value, None
+
+
+async def resolve_dataset_tasks(dataset: str, *, python_root: Path) -> list[str]:
+    root = python_root
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from scripts.run_benchmark import build_config
+
+    class Args:
+        pass
+
+    args = Args()
+    args.dataset = dataset
+    args.provider = "openai"
+    args.job_name = "task_list_probe"
+    args.concurrency = 1
+    args.n_tasks = None
+    args.include_task_name = None
+    args.exclude_task_name = None
+    args.overwrite_tasks = False
+    args.force_build = False
+    args.keep_sandboxes = False
+    args.e2b_template_namespace = os.getenv("E2B_TEMPLATE_NAMESPACE", "anchen1011")
+    args.e2b_pi_template_suffix = os.getenv("E2B_PI_TEMPLATE_SUFFIX", "pi_c6d7003a")
+    args.keep_dockerfile_comments = False
+    args.e2b_sandbox_timeout_sec = int(os.getenv("E2B_SANDBOX_TIMEOUT_SEC", "3600"))
+    args.agent_setup_timeout_sec = 1200
+    args.agent_timeout_sec = 1
+    args.override_cpus = 1
+    args.override_memory_mb = 4096
+    args.override_storage_mb = 10240
+    args.timeout_multiplier = 1.0
+    args.agent_timeout_multiplier = None
+    args.verifier_timeout_multiplier = None
+    args.agent_setup_timeout_multiplier = 2.0
+    args.environment_build_timeout_multiplier = 2.0
+    args.quiet = True
+    args.debug = False
+    args.model_context_window = 128000
+    args.model_max_tokens = 32000
+    args.thinking = os.getenv("PI_THINKING", "off")
+    args.tools = os.getenv("PI_TOOLS", "read,write,edit,bash,grep,find,ls")
+    args.result_only = False
+    args.use_skills = False
+
+    config = build_config(args)
+    task_names: list[str] = []
+    for dataset_config in config.datasets:
+        for task_config in await dataset_config.get_task_configs():
+            if task_config.name:
+                task_names.append(task_config.name)
+            elif task_config.path:
+                task_names.append(task_config.path.name)
+    return task_names
+
+
+def contiguous_ranges(n_tasks: int, n_shards: int) -> list[tuple[int, int]]:
+    if n_shards < 1:
+        raise ValueError("n_shards must be positive")
+    if n_tasks < 1:
+        raise ValueError("n_tasks must be positive")
+    ranges: list[tuple[int, int]] = []
+    base, remainder = divmod(n_tasks, n_shards)
+    start = 1
+    for index in range(n_shards):
+        size = base + (1 if index < remainder else 0)
+        if size <= 0:
+            continue
+        end = start + size - 1
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
 
 
 def range_label(start: int, end: int) -> str:
@@ -63,6 +154,18 @@ def build_command(args: argparse.Namespace, job_name: str, task_file: Path) -> l
             cmd.extend([args.task_name_arg, task_name])
     if args.agent:
         cmd.extend(["--agent", args.agent])
+    if args.provider:
+        cmd.extend(["--provider", args.provider])
+    if args.run_name:
+        cmd.extend(["--run-name", job_name])
+    if args.skill_version_id:
+        cmd.extend(["--skill-version-id", args.skill_version_id])
+    if args.append_skill_version:
+        cmd.append("--append-skill-version")
+    if args.summarize_with_backbone:
+        cmd.append("--summarize-with-backbone")
+    if args.agent_setup_timeout:
+        cmd.extend(["--agent-setup-timeout-sec", str(args.agent_setup_timeout)])
     if args.result_only:
         cmd.append("--result-only")
     if args.quiet:
@@ -84,13 +187,21 @@ def main() -> int:
         description="Split a task list into ranges and launch one benchmark runner per shard."
     )
     parser.add_argument("--runner", required=True, help="Benchmark runner script, e.g. scripts/run_benchmark.py")
-    parser.add_argument("--dataset", required=True, help="Dataset argument passed to the runner")
-    parser.add_argument("--task-list", required=True, type=Path, help="One task name per line")
-    parser.add_argument("--ranges", required=True, help="Comma-separated 1-based ranges, e.g. 1-100,101-200")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET, help="Dataset argument passed to the runner")
+    parser.add_argument("--task-list", type=Path, default=None, help="One task name per line")
+    parser.add_argument("--ranges", default="", help="Comma-separated 1-based ranges, e.g. 1-100,101-200")
+    parser.add_argument("--auto-task-list", action="store_true", help="Resolve all dataset tasks and write a stable task list.")
+    parser.add_argument("--n-shards", type=int, default=5, help="Number of contiguous shards for --auto-task-list.")
     parser.add_argument("--job-prefix", required=True, help="Prefix for generated job names")
     parser.add_argument("--agent", default="", help="Optional --agent value for the runner")
+    parser.add_argument("--provider", default="", help="Optional --provider value for the runner")
+    parser.add_argument("--run-name", action="store_true", help="Pass each generated job name as --run-name to the runner.")
+    parser.add_argument("--skill-version-id", default="", help="Shared iteration skill version, e.g. v0001.")
+    parser.add_argument("--append-skill-version", action="store_true", help="Pass --append-skill-version to the runner.")
+    parser.add_argument("--summarize-with-backbone", action="store_true", help="Pass --summarize-with-backbone to the runner.")
     parser.add_argument("--concurrency", type=int, default=20, help="Per-process concurrency")
     parser.add_argument("--timeout", type=float, default=900, help="Agent timeout in seconds")
+    parser.add_argument("--agent-setup-timeout", type=float, default=1200, help="Agent setup timeout passed to the runner.")
     parser.add_argument("--python", default="python", help="Python executable")
     parser.add_argument("--output-dir", type=Path, default=Path("data/task_splits"), help="Where shard task files are written")
     parser.add_argument("--workdir", type=Path, default=None, help="Working directory for tmux-launched runner commands")
@@ -139,7 +250,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    tasks = read_tasks(args.task_list)
+    root = repo_root()
+    if args.auto_task_list:
+        date_hint = args.date_tag or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        task_list_path = args.task_list or args.output_dir / f"{args.job_prefix}_all_tasks_{date_hint}.txt"
+        tasks = asyncio.run(resolve_dataset_tasks(args.dataset, python_root=root))
+        task_list_path.write_text("\n".join(tasks) + "\n")
+        args.task_list = task_list_path
+        if not args.ranges:
+            args.ranges = ",".join(
+                f"{start}-{end}" for start, end in contiguous_ranges(len(tasks), args.n_shards)
+            )
+    else:
+        if args.task_list is None:
+            raise SystemExit("--task-list is required unless --auto-task-list is used")
+        tasks = read_tasks(args.task_list)
+    if not args.ranges:
+        raise SystemExit("--ranges is required unless --auto-task-list is used")
     ranges = [parse_range(item.strip()) for item in args.ranges.split(",") if item.strip()]
     date_tag = args.date_tag or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     args.output_dir.mkdir(parents=True, exist_ok=True)

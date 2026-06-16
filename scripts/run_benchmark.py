@@ -265,6 +265,7 @@ async def run_job(args: argparse.Namespace) -> Path:
 
     log_file = ROOT / "logs" / f"{args.job_name}.log"
     log_file.write_text("")
+    os.environ["SKILL_EVO_BENCHMARK_LOG"] = str(log_file)
 
     provider = _provider_spec()
     _log(f"job={args.job_name} dataset={_pin_dataset(args.dataset)}", log_file=log_file)
