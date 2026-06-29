@@ -85,13 +85,48 @@ def active_version(memory: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(version_id, str) and isinstance(versions.get(version_id), dict):
         version = dict(versions[version_id])
         version.setdefault("version_id", version_id)
+        version["entries"] = _version_chain_entries(versions, version_id)
         return version
     for fallback_id in sorted(versions):
         if isinstance(versions.get(fallback_id), dict):
             version = dict(versions[fallback_id])
             version.setdefault("version_id", fallback_id)
+            version["entries"] = _version_chain_entries(versions, fallback_id)
             return version
     return None
+
+
+def _version_chain_entries(
+    versions: dict[str, Any],
+    version_id: str,
+) -> list[dict[str, Any]]:
+    chain: list[str] = []
+    seen: set[str] = set()
+    current = version_id
+    while current and current not in seen:
+        seen.add(current)
+        version = versions.get(current)
+        if not isinstance(version, dict):
+            break
+        chain.append(current)
+        parent = version.get("parent_version")
+        current = str(parent) if parent else ""
+
+    entries: list[dict[str, Any]] = []
+    seen_entry_ids: set[str] = set()
+    for chain_id in reversed(chain):
+        version = versions.get(chain_id)
+        if not isinstance(version, dict):
+            continue
+        for entry in version.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            key = str(entry.get("entry_id") or entry.get("task_name") or id(entry))
+            if key in seen_entry_ids:
+                continue
+            seen_entry_ids.add(key)
+            entries.append(entry)
+    return entries
 
 
 def task_slug_from_text(text: str) -> str:
@@ -211,12 +246,12 @@ def format_memory_prompt(
     parent_id = version.get("parent_version")
     lines = [
         "",
-        "Trace-derived SWE task/stage skill memory:",
+        "Trace-derived SWE task evidence memory:",
         f"- Active memory version: {version_id}"
         + (f" (parent: {parent_id})" if parent_id else ""),
-        "- There are no global skills here. Each item below is one previous SWE task, organized by stage-specific skills: reproduce, localize, edit, validate, recover.",
+        "- There are no global skills here. Each item below is one previous SWE task evidence record.",
         "- Treat these as weak priors and control points. Still inspect the current repository before editing.",
-        "- Stage-skill details below are filtered to active, evidence-gated skills; if no concrete evidence matches, ignore them and continue normally.",
+        "- Details below are filtered to active, evidence-gated observations; if no concrete evidence matches, ignore them and continue normally.",
     ]
     for item in selected_entries:
         entry = item["entry"]
@@ -291,7 +326,7 @@ def format_memory_prompt(
                 quality = stage_skill.get("quality_score")
                 quality_text = f"; quality={quality:.2f}" if isinstance(quality, (int, float)) else ""
                 lines.append(
-                    f"  stage_skill[{stage}/{name}]=trigger={trigger}; actions={actions}; evidence={evidence}; stop={stop}{quality_text}"
+                    f"  evidence_observation[{stage}/{name}]=trigger={trigger}; actions={actions}; evidence={evidence}; stop={stop}{quality_text}"
                 )
                 scripts = stage_skill.get("script_resources") or []
                 if scripts:

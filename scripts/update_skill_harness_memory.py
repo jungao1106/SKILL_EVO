@@ -20,8 +20,8 @@ except ImportError:  # pragma: no cover - local env convenience only
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "analysis" / "skill_harness_memory.json"
-DEFAULT_TASK_SKILL_DIR = ROOT / "analysis" / "task_skills"
-DEFAULT_GENERATED_SKILL_DIR = ROOT / "skills" / "tasks"
+DEFAULT_TASK_SKILL_DIR = ROOT / "analysis" / "task_evidence"
+DEFAULT_GENERATED_SKILL_DIR = ROOT / "skills" / "accepted"
 SWE_AGENT_SKILLS_ROOT = ROOT / "swe_agent_skills"
 SHARED_SKILLS_ROOT = ROOT / "skills" / "shared"
 TASK_STAGE_SKILLS_ROOT = ROOT / "skills" / "tasks"
@@ -63,6 +63,41 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(errors="replace"))
 
 
+TASK_LOOKUP_RE = re.compile(
+    r"([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?:__[A-Za-z0-9]+)?"
+)
+
+
+def _task_lookup_key(value: str | None) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    leaf = text.split("/")[-1]
+    match = TASK_LOOKUP_RE.search(leaf)
+    if match:
+        return match.group(1)
+    return leaf
+
+
+def _read_task_names_file(path: Path) -> list[str]:
+    names: list[str] = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.append(line)
+    return names
+
+
+def _read_task_names_files(paths: list[Path] | None) -> set[str] | None:
+    if not paths:
+        return None
+    names: set[str] = set()
+    for path in paths:
+        for name in _read_task_names_file(path.expanduser()):
+            names.add(_task_lookup_key(name) or name)
+    return names
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -96,11 +131,98 @@ def _entry_reward_value(entry: dict[str, Any]) -> float:
         return 0.0
 
 
+def _entry_reward_optional(entry: dict[str, Any], key: str = "reward") -> float | None:
+    try:
+        value = entry.get(key)
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_diagnostic_reason(entry: dict[str, Any]) -> str | None:
+    exception = str(entry.get("exception") or "").strip()
+    if exception:
+        return f"exception:{exception}"
+    if _entry_reward_optional(entry) is None:
+        return "missing_reward"
+    return None
+
+
+def _entry_case_label(entry: dict[str, Any]) -> str:
+    diagnostic_reason = _entry_diagnostic_reason(entry)
+    if diagnostic_reason:
+        return "diagnostic"
+    current = _entry_reward_optional(entry)
+    previous = _entry_reward_optional(entry, "previous_reward")
+    if current is None:
+        return "diagnostic"
+    if previous is None:
+        return "weak_positive" if current >= 1.0 else "weak_negative"
+    if previous < 1.0 <= current:
+        return "strong_positive"
+    if previous >= 1.0 and current >= 1.0:
+        return "weak_positive"
+    if previous >= 1.0 > current:
+        return "strong_negative"
+    return "weak_negative"
+
+
+def _entry_update_budget(case_label: str) -> dict[str, Any]:
+    if case_label == "strong_positive":
+        return {"step": "large", "task_stage_edits": 3, "promote_upward": True}
+    if case_label == "weak_positive":
+        return {"step": "small", "task_stage_edits": 0, "promote_upward": True}
+    if case_label == "strong_negative":
+        return {"step": "rollback_or_rewrite", "task_stage_edits": 2, "promote_upward": False}
+    if case_label == "weak_negative":
+        return {"step": "small_rewrite_or_inactive", "task_stage_edits": 1, "promote_upward": False}
+    return {"step": "diagnostic_only", "task_stage_edits": 0, "promote_upward": False}
+
+
+def _entry_failure_signature(entry: dict[str, Any]) -> str:
+    exception = str(entry.get("exception") or "").strip()
+    if exception:
+        return f"runtime-{re.sub(r'[^A-Za-z0-9_.-]+', '-', exception.lower()).strip('-') or 'diagnostic'}"
+    reward = _entry_reward_optional(entry)
+    if reward is None:
+        return "runtime-missing-reward"
+    if reward >= 1.0:
+        return "resolved"
+    if not entry.get("edited_paths"):
+        return "no-diff-recovery"
+    if not entry.get("test_commands"):
+        return "weak-validation"
+    return "localization-drift"
+
+
+def annotate_entry_outcome(entry: dict[str, Any]) -> None:
+    case_label = _entry_case_label(entry)
+    diagnostic_reason = _entry_diagnostic_reason(entry)
+    entry["case_label"] = case_label
+    entry["outcome_class"] = case_label
+    entry["is_diagnostic"] = bool(diagnostic_reason)
+    entry["diagnostic_reason"] = diagnostic_reason
+    entry["update_budget"] = _entry_update_budget(case_label)
+    entry["failure_signature"] = _entry_failure_signature(entry)
+    entry["public_validation"] = {
+        "has_test_command": bool(entry.get("test_commands")),
+        "has_diff": bool(entry.get("edited_paths")),
+        "has_touched_paths": bool(entry.get("touched_paths")),
+        "verifier_reward_observed": _entry_reward_optional(entry) is not None,
+    }
+
+
 def _repo_from_task_name(task_name: str | None) -> str:
-    if not task_name:
+    task_key = _task_lookup_key(task_name)
+    if not task_key:
         return ""
-    leaf = task_name.split("/")[-1]
-    return leaf.split("__", 1)[0]
+    if "__" not in task_key:
+        return task_key.rsplit("-", 1)[0]
+    org, repo_and_issue = task_key.split("__", 1)
+    repo = repo_and_issue.rsplit("-", 1)[0]
+    if repo:
+        return f"{org}__{repo}"
+    return org
 
 
 def _issue_title(problem_text: str) -> str:
@@ -375,10 +497,17 @@ def load_task_skill_resources(
     }
 
 
-def _trial_entry(job_dir: Path, trial_result_path: Path) -> dict[str, Any] | None:
+def _trial_entry(
+    job_dir: Path,
+    trial_result_path: Path,
+    *,
+    previous_by_task: dict[str, dict[str, Any]] | None = None,
+    previous_job_names: set[str] | None = None,
+) -> dict[str, Any] | None:
     trial_dir = trial_result_path.parent
     result = _load_json(trial_result_path)
     task_name = result.get("task_name") or result.get("trial_name")
+    task_lookup_key = _task_lookup_key(str(task_name) if task_name is not None else None)
     agent_dir = trial_dir / "agent"
     problem_path = agent_dir / "problem_statement.md"
     metadata_path = agent_dir / "pi-metadata.json"
@@ -407,12 +536,13 @@ def _trial_entry(job_dir: Path, trial_result_path: Path) -> dict[str, Any] | Non
         f"verification={'; '.join(signal['test_commands'][:2]) or 'none'}"
     )
     entry = {
-        "kind": "swe_task_stage_skills",
+        "kind": "task_evidence",
         "entry_id": f"{job_dir.name}:{trial_dir.name}",
         "task_skill_id": trial_dir.name,
         "source_job": job_dir.name,
         "trial_dir": str(trial_dir.relative_to(ROOT)),
         "task_name": task_name,
+        "task_lookup_key": task_lookup_key,
         "repo": repo,
         "issue_title": title,
         "reward": reward,
@@ -444,6 +574,13 @@ def _trial_entry(job_dir: Path, trial_result_path: Path) -> dict[str, Any] | Non
             signal["test_commands"],
         ),
     }
+    previous_job_names = previous_job_names or set()
+    if previous_by_task and job_dir.name not in previous_job_names:
+        previous = previous_by_task.get(task_lookup_key)
+        if previous is not None:
+            entry["previous_reward"] = previous.get("reward")
+            entry["previous_source_job"] = previous.get("source_job")
+            entry["previous_exception"] = previous.get("exception_type")
     return entry
 
 
@@ -552,9 +689,9 @@ def _summary_prompt(entry: dict[str, Any], skill_resources: dict[str, Any]) -> s
         "problem_excerpt": entry.get("problem_excerpt"),
     }
     return (
-        "You summarize one SWE-Bench Pi-agent trace into one task-scoped stage skill card. "
+        "You summarize one SWE-Bench Pi-agent trace into one task-scoped evidence record. "
         "Return only one valid JSON object. Do not wrap it in markdown. Do not add prose before or after it. "
-        "There are no global skills. For this one task, organize which skills would be usable "
+        "There are no global skills at this level. For this one task, organize public evidence "
         "inside each SWE phase: reproduce, localize, edit, validate, recover. Ground your answer "
         "in the trace evidence and only the skill resources that this trace actually touched. "
         "If those touched skills include Python or shell scripts, distill the script into concise "
@@ -564,15 +701,15 @@ def _summary_prompt(entry: dict[str, Any], skill_resources: dict[str, Any]) -> s
         "leave it empty. The most important output is controllable "
         "flow: during meaningless rollout, failed search, repeated test failure, or debugging drift, "
         "tell the future agent when it should do what next and what evidence moves it to the next phase. "
-        "Return strict JSON with keys: summary, task_stage_skills, harness_hints, avoid, "
-        "retrieval_keywords, confidence. task_stage_skills must be a list of objects with keys "
-        "stage, skills, control_points. stage must be one of reproduce, localize, edit, validate, recover. "
-        "Each skill must have keys name, trigger, actions, evidence_to_collect, stop_condition, "
+        "Return strict JSON with keys: summary, task_evidence, harness_hints, avoid, "
+        "retrieval_keywords, confidence. task_evidence must be a list of objects with keys "
+        "stage, observations, control_points. stage must be one of reproduce, localize, edit, validate, recover. "
+        "Each observation should be represented with keys name, trigger, actions, evidence_to_collect, stop_condition, "
         "source_skill_paths, script_resources, distilled_scripts. script_resources objects have keys "
         "source_path, language, purpose, when_to_use, command_hint, relevant_functions. distilled_scripts "
         "objects have keys filename, language, purpose, content and should be short, safe helper code only. "
         "control_points objects have keys trigger, action, evidence_to_collect, stop_condition. "
-        "Keep lists short and reusable. Do not collapse this into a global multi-task summary. "
+        "Keep lists short and evidence-scoped. Do not collapse this into a global multi-task summary. "
         "Do not include secrets or provider credentials.\n\nTRACE-SELECTED SKILL RESOURCES:\n"
         + json.dumps(skill_resources, ensure_ascii=False, indent=2)
         + "\n\nTRACE EVIDENCE:\n"
@@ -697,6 +834,46 @@ def _normalize_task_stage_skills(value: Any) -> list[dict[str, Any]]:
                 }
             )
     return stages
+
+
+def _normalize_task_evidence(value: Any) -> list[dict[str, Any]]:
+    stages: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return stages
+    for stage_item in value:
+        if not isinstance(stage_item, dict):
+            continue
+        observations = stage_item.get("observations")
+        if observations is None:
+            observations = stage_item.get("skills")
+        normalized = _normalize_task_stage_skills(
+            [
+                {
+                    "stage": stage_item.get("stage"),
+                    "skills": observations or [],
+                    "control_points": stage_item.get("control_points") or [],
+                }
+            ]
+        )
+        for item in normalized:
+            item["observations"] = item.pop("skills", [])
+            stages.append(item)
+    return stages
+
+
+def _task_evidence_to_legacy_stage_items(task_evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stage_items: list[dict[str, Any]] = []
+    for item in task_evidence:
+        if not isinstance(item, dict):
+            continue
+        stage_items.append(
+            {
+                "stage": _stage_name(item.get("stage")),
+                "skills": item.get("observations") or [],
+                "control_points": item.get("control_points") or [],
+            }
+        )
+    return stage_items
 
 
 def _fallback_task_stage_skills(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -903,10 +1080,32 @@ def summarize_with_backbone(
             continue
         entry["summary"] = str(parsed.get("summary") or entry["summary"])
         entry["summary_source"] = "backbone"
-        task_stage_skills = _normalize_task_stage_skills(
-            parsed.get("task_stage_skills") or parsed.get("stage_skills")
+        task_evidence = _normalize_task_evidence(parsed.get("task_evidence"))
+        if not task_evidence:
+            task_evidence = [
+                {
+                    "stage": item.get("stage"),
+                    "observations": item.get("skills") or [],
+                    "control_points": item.get("control_points") or [],
+                }
+                for item in _normalize_task_stage_skills(
+                    parsed.get("task_stage_skills") or parsed.get("stage_skills")
+                )
+                if isinstance(item, dict)
+            ]
+        ensured_stage_items = _ensure_all_stages(
+            _task_evidence_to_legacy_stage_items(task_evidence),
+            entry,
         )
-        entry["task_stage_skills"] = _ensure_all_stages(task_stage_skills, entry)
+        entry["task_evidence"] = [
+            {
+                "stage": item.get("stage"),
+                "observations": item.get("skills") or [],
+                "control_points": item.get("control_points") or [],
+            }
+            for item in ensured_stage_items
+        ]
+        entry["task_stage_skills"] = ensured_stage_items
         entry["harness_hints"] = _string_list(parsed.get("harness_hints"), limit=5)
         entry["avoid"] = _string_list(parsed.get("avoid"), limit=5)
         entry["summary_confidence"] = parsed.get("confidence")
@@ -937,50 +1136,54 @@ def _trial_result_paths(job_dir: Path) -> list[Path]:
     return [path for path in paths if path.parent != job_dir]
 
 
+def _previous_rewards_by_task(job_dirs: list[Path]) -> dict[str, dict[str, Any]]:
+    rewards: dict[str, dict[str, Any]] = {}
+    for job_dir in job_dirs:
+        for trial_result_path in _trial_result_paths(job_dir):
+            result = _load_json(trial_result_path)
+            task_name = result.get("task_name") or result.get("trial_name")
+            task_lookup_key = _task_lookup_key(str(task_name) if task_name is not None else None)
+            if not task_lookup_key:
+                continue
+            verifier_rewards = (
+                result.get("verifier_result", {}).get("rewards")
+                if result.get("verifier_result")
+                else None
+            )
+            exception = result.get("exception_info") or {}
+            rewards[task_lookup_key] = {
+                "reward": _first_reward_value(verifier_rewards),
+                "source_job": job_dir.name,
+                "exception_type": exception.get("exception_type") if exception else None,
+            }
+    return rewards
+
+
 def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
     by_repo: dict[str, Any] = {}
-    by_stage: dict[str, Any] = {}
     repo_entries: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    stage_entries: dict[str, list[dict[str, Any]]] = defaultdict(list)
     rewards = []
     for entry in entries:
         repo_entries[str(entry.get("repo") or "unknown")].append(entry)
-        for stage_item in _entry_task_stage_skills(entry):
-            if not isinstance(stage_item, dict):
-                continue
-            stage_entries[str(stage_item.get("stage") or "unknown")].append(entry)
         if entry.get("reward") is not None:
             rewards.append(float(entry["reward"]))
 
     for repo, repo_items in sorted(repo_entries.items()):
-        stage_skills: dict[str, Counter[str]] = defaultdict(Counter)
         paths = Counter()
+        tests = Counter()
+        signatures = Counter()
         for entry in repo_items:
-            for stage_item in _entry_task_stage_skills(entry):
-                if not isinstance(stage_item, dict):
-                    continue
-                stage = str(stage_item.get("stage") or "unknown")
-                for stage_skill in stage_item.get("skills") or []:
-                    if not isinstance(stage_skill, dict):
-                        continue
-                    stage_skills[stage][str(stage_skill.get("name") or "unknown")] += 1
             paths.update(entry.get("touched_paths") or [])
+            tests.update(entry.get("test_commands") or [])
+            signature = str(entry.get("failure_signature") or "")
+            if signature:
+                signatures[signature] += 1
         by_repo[repo] = {
             "trials": len(repo_items),
             "resolved": sum(1 for entry in repo_items if entry.get("reward") == 1.0),
-            "stage_skills": {
-                stage: dict(counter.most_common())
-                for stage, counter in sorted(stage_skills.items())
-            },
             "common_paths": [path for path, _ in paths.most_common(10)],
-        }
-
-    for stage, stage_items in sorted(stage_entries.items()):
-        repos = Counter(str(entry.get("repo") or "unknown") for entry in stage_items)
-        by_stage[stage] = {
-            "trials": len(stage_items),
-            "resolved": sum(1 for entry in stage_items if entry.get("reward") == 1.0),
-            "repos": dict(repos.most_common()),
+            "common_tests": [command for command, _ in tests.most_common(5)],
+            "failure_signatures": dict(signatures.most_common(8)),
         }
 
     return {
@@ -988,7 +1191,6 @@ def _aggregate(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_reward": statistics.fmean(rewards) if rewards else None,
         "resolved": sum(1 for entry in entries if entry.get("reward") == 1.0),
         "by_repo": by_repo,
-        "by_stage": by_stage,
     }
 
 
@@ -1023,25 +1225,154 @@ def _next_version_id(memory: dict[str, Any]) -> str:
 def build_version(
     *,
     job_dirs: list[Path],
+    previous_job_dirs: list[Path],
+    include_task_names: set[str] | None,
     version_id: str,
     parent_version: str | None,
     max_trials: int | None,
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
+    previous_by_task = _previous_rewards_by_task(previous_job_dirs)
+    previous_job_names = {job_dir.name for job_dir in previous_job_dirs}
     for job_dir in job_dirs:
         for trial_result_path in _trial_result_paths(job_dir):
             if max_trials is not None and len(entries) >= max_trials:
                 break
-            entry = _trial_entry(job_dir, trial_result_path)
+            if include_task_names is not None:
+                result = _load_json(trial_result_path)
+                task_name = result.get("task_name") or result.get("trial_name")
+                if _task_lookup_key(str(task_name) if task_name is not None else None) not in include_task_names:
+                    continue
+            entry = _trial_entry(
+                job_dir,
+                trial_result_path,
+                previous_by_task=previous_by_task,
+                previous_job_names=previous_job_names,
+            )
             if entry is not None:
+                annotate_entry_outcome(entry)
                 entries.append(entry)
     return {
         "version_id": version_id,
         "parent_version": parent_version,
         "created_at": _utc_now(),
         "source_jobs": [str(job_dir.relative_to(ROOT)) for job_dir in job_dirs],
+        "previous_jobs": [str(job_dir.relative_to(ROOT)) for job_dir in previous_job_dirs],
         "entries": entries,
         "aggregates": _aggregate(entries),
+    }
+
+
+def _entry_active_stage_skills(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    active_skills: list[dict[str, Any]] = []
+    for stage_item in _entry_task_stage_skills(entry):
+        if not isinstance(stage_item, dict):
+            continue
+        stage = str(stage_item.get("stage") or "recover")
+        for skill in stage_item.get("skills") or []:
+            if not isinstance(skill, dict):
+                continue
+            quality = skill.get("quality_metadata")
+            if not isinstance(quality, dict):
+                quality = skill_quality_metadata(entry=entry, stage=stage, stage_skill=skill)
+            if not quality.get("active"):
+                continue
+            active_skills.append(
+                {
+                    "entry_id": entry.get("entry_id"),
+                    "task_name": entry.get("task_name"),
+                    "task_lookup_key": entry.get("task_lookup_key"),
+                    "repo": entry.get("repo"),
+                    "stage": stage,
+                    "name": skill.get("name"),
+                    "quality_score": quality.get("quality_score"),
+                    "quality_tier": quality.get("quality_tier"),
+                    "use_policy": quality.get("use_policy"),
+                    "risk_flags": quality.get("risk_flags") or [],
+                    "source": "task_trace",
+                    "transfer_scope": "training_scaffold_only",
+                }
+            )
+    return active_skills
+
+
+def attach_memory_state(version: dict[str, Any]) -> None:
+    entries = [entry for entry in (version.get("entries") or []) if isinstance(entry, dict)]
+    legacy_task_stage_skills: list[dict[str, Any]] = []
+    decision_items: list[dict[str, Any]] = []
+    diagnostic_counter: Counter[str] = Counter()
+    case_counter: Counter[str] = Counter()
+    for entry in entries:
+        annotate_entry_outcome(entry)
+        case_label = str(entry.get("case_label") or "unknown")
+        case_counter[case_label] += 1
+        if entry.get("is_diagnostic"):
+            diagnostic_counter[str(entry.get("diagnostic_reason") or "diagnostic")] += 1
+        legacy_task_stage_skills.extend(_entry_active_stage_skills(entry))
+        decision_items.append(
+            {
+                "created_at": version.get("created_at"),
+                "level": "task",
+                "entry_id": entry.get("entry_id"),
+                "task_name": entry.get("task_name"),
+                "task_lookup_key": entry.get("task_lookup_key"),
+                "repo": entry.get("repo"),
+                "source_job": entry.get("source_job"),
+                "previous_reward": entry.get("previous_reward"),
+                "reward": entry.get("reward"),
+                "exception": entry.get("exception"),
+                "case_label": case_label,
+                "is_diagnostic": entry.get("is_diagnostic"),
+                "diagnostic_reason": entry.get("diagnostic_reason"),
+                "budget": entry.get("update_budget"),
+                "decision": "diagnostic_only" if entry.get("is_diagnostic") else "task_memory_candidate",
+            }
+        )
+
+    version["evidence_memory"] = {
+        "schema_version": 1,
+        "task_entries": entries,
+        "diagnostic_counts": dict(diagnostic_counter),
+        "case_counts": dict(case_counter),
+    }
+    version["skill_state"] = {
+        "schema_version": 1,
+        "task_evidence": {
+            "entries": len(entries),
+            "case_counts": dict(case_counter),
+            "diagnostic_counts": dict(diagnostic_counter),
+        },
+        "legacy_task_stage_skills": legacy_task_stage_skills,
+        "repo_skills": [],
+        "failure_mode_skills": [],
+        "transfer_contract": {
+            "task_evidence": "training_scaffold_only",
+            "legacy_task_stage_skills": "compatibility_only_not_a_method_artifact",
+            "repo_skills": "training_scaffold_only",
+            "failure_mode_skills": "downstream_transferable",
+        },
+    }
+    version["decision_log"] = {
+        "schema_version": 1,
+        "task_decisions": decision_items,
+        "repo_decisions": [],
+        "failure_mode_decisions": [],
+        "validation_gate_decisions": [],
+    }
+    version["policy_state"] = {
+        "schema_version": 1,
+        "writer_policy": {"rules": [], "update_count": 0},
+        "evaluator_policy": {"rules": [], "update_count": 0},
+        "harness_policy": {
+            "fixed_labels": [
+                "strong_positive",
+                "weak_positive",
+                "strong_negative",
+                "weak_negative",
+                "diagnostic",
+            ],
+            "diagnostic_rule": "diagnostic entries update evidence/decision logs only and do not participate in semantic promotion",
+        },
     }
 
 
@@ -1094,8 +1425,9 @@ def write_markdown(memory: dict[str, Any], path: Path) -> None:
                     "",
                     f"- Trials: {stats.get('trials', 0)}",
                     f"- Resolved: {stats.get('resolved', 0)}",
-                    f"- Stage skills: `{json.dumps(stats.get('stage_skills') or {}, ensure_ascii=False)}`",
                     f"- Common paths: {', '.join(stats.get('common_paths') or [])}",
+                    f"- Common tests: {', '.join(stats.get('common_tests') or [])}",
+                    f"- Failure signatures: `{json.dumps(stats.get('failure_signatures') or {}, ensure_ascii=False)}`",
                     "",
                 ]
             )
@@ -1132,7 +1464,7 @@ def write_task_skill_cards(
             "schema_version": 2,
             "version_id": version_id,
             "parent_version": version.get("parent_version"),
-            "kind": "swe_task_stage_skills",
+            "kind": "task_evidence",
             "entry": entry,
         }
         (repo_dir / f"{_safe_card_name(entry)}.json").write_text(
@@ -1557,21 +1889,40 @@ def parse_args() -> argparse.Namespace:
         description="Build a versioned skill/harness memory from Pi trace jobs."
     )
     parser.add_argument("--job-dir", action="append", type=Path, default=None)
+    parser.add_argument("--previous-job-dir", action="append", type=Path, default=None)
+    parser.add_argument("--task-names-file", action="append", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--version-id", default=None)
     parser.add_argument("--parent-version", default=None)
     parser.add_argument("--no-activate", action="store_true")
     parser.add_argument("--max-trials", type=int, default=None)
     parser.add_argument("--md-out", type=Path, default=None)
-    parser.add_argument("--task-skill-dir", type=Path, default=DEFAULT_TASK_SKILL_DIR)
-    parser.add_argument("--no-task-skill-cards", action="store_true")
+    parser.add_argument(
+        "--task-skill-dir",
+        type=Path,
+        default=DEFAULT_TASK_SKILL_DIR,
+        help="Compatibility name for the directory that stores optional task evidence cards.",
+    )
+    parser.add_argument("--write-task-evidence-cards", action="store_true")
     parser.add_argument(
         "--generated-skill-dir",
         type=Path,
         default=DEFAULT_GENERATED_SKILL_DIR,
-        help="Directory for generated task/stage skill folders.",
+        help="Compatibility directory for generated task/stage skill folders.",
     )
-    parser.add_argument("--no-generated-skill-files", action="store_true")
+    parser.add_argument(
+        "--write-generated-task-skill-files",
+        action="store_true",
+        help=(
+            "Compatibility mode: write legacy task-level candidate SKILL.md files. "
+            "The default keeps task traces as evidence only."
+        ),
+    )
+    parser.add_argument(
+        "--no-generated-skill-files",
+        action="store_true",
+        help="Deprecated compatibility flag; task SKILL.md generation is disabled by default.",
+    )
     parser.add_argument(
         "--append-generated-skill-files",
         action="store_true",
@@ -1634,9 +1985,17 @@ def main() -> None:
         for env_file in args.env_file or []:
             load_dotenv(env_file.expanduser(), override=False)
     job_dirs = [path.expanduser().resolve() for path in (args.job_dir or [_latest_job_dir()])]
+    previous_job_dirs = [
+        path.expanduser().resolve()
+        for path in (args.previous_job_dir or [])
+    ]
+    include_task_names = _read_task_names_files(args.task_names_file)
     for job_dir in job_dirs:
         if not (job_dir / "result.json").exists():
             raise SystemExit(f"Missing job result.json: {job_dir / 'result.json'}")
+    for previous_job_dir in previous_job_dirs:
+        if not (previous_job_dir / "result.json").exists():
+            raise SystemExit(f"Missing previous job result.json: {previous_job_dir / 'result.json'}")
 
     out = args.out.expanduser()
     memory = _load_memory(out)
@@ -1649,6 +2008,8 @@ def main() -> None:
 
     version = build_version(
         job_dirs=job_dirs,
+        previous_job_dirs=previous_job_dirs,
+        include_task_names=include_task_names,
         version_id=version_id,
         parent_version=parent_version,
         max_trials=args.max_trials,
@@ -1675,6 +2036,7 @@ def main() -> None:
             "reason": "not_requested",
         }
     annotate_version_skill_quality(version)
+    attach_memory_state(version)
     version["aggregates"] = _aggregate(version["entries"])
     memory["versions"][version_id] = version
     if not args.no_activate:
@@ -1685,14 +2047,14 @@ def main() -> None:
     md_out = args.md_out or out.with_suffix(".md")
     write_markdown(memory, md_out)
     cards_dir = None
-    if not args.no_task_skill_cards:
+    if args.write_task_evidence_cards:
         cards_dir = write_task_skill_cards(
             version,
             output_root=args.task_skill_dir.expanduser(),
             clean=True,
         )
     generated_dir = None
-    if not args.no_generated_skill_files:
+    if args.write_generated_task_skill_files and not args.no_generated_skill_files:
         generated_dir = write_generated_skill_files(
             version,
             output_root=args.generated_skill_dir.expanduser(),
@@ -1701,9 +2063,9 @@ def main() -> None:
     print(f"Wrote {out}")
     print(f"Wrote {md_out}")
     if cards_dir is not None:
-        print(f"Wrote task skill cards under {cards_dir}")
+        print(f"Wrote task evidence cards under {cards_dir}")
     if generated_dir is not None:
-        print(f"Wrote generated task/stage SKILL.md files under {generated_dir}")
+        print(f"Wrote generated legacy task/stage SKILL.md files under {generated_dir}")
     print(
         "version={version} parent={parent} entries={entries} active={active}".format(
             version=version_id,

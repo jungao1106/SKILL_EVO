@@ -1,4 +1,7 @@
 import asyncio
+import fcntl
+import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -7,11 +10,6 @@ from typing import Any
 from dirhash import dirhash
 from dockerfile_parse import DockerfileParser
 from e2b import AsyncSandbox, AsyncTemplate, Template
-from e2b.api import handle_api_exception
-from e2b.api.client.api.templates import get_templates
-from e2b.api.client.models import Error
-from e2b.api.client_async import get_api_client
-from e2b.connection_config import ConnectionConfig
 from e2b.exceptions import (
     BuildException,
     RateLimitException,
@@ -31,6 +29,8 @@ from harbor.models.trial.paths import EnvironmentPaths
 
 _TEMPLATE_BUILD_SEMAPHORE: asyncio.Semaphore | None = None
 _TEMPLATE_BUILD_SEMAPHORE_LIMIT: int | None = None
+_TEMPLATE_LOOKUP_CACHE: dict[tuple[str, tuple[str, ...]], str] = {}
+_TEMPLATE_LOOKUP_LOCKS: dict[tuple[str, tuple[str, ...]], asyncio.Lock] = {}
 
 
 def _template_build_semaphore() -> asyncio.Semaphore:
@@ -50,6 +50,39 @@ def _template_build_semaphore() -> asyncio.Semaphore:
         _TEMPLATE_BUILD_SEMAPHORE_LIMIT = limit
 
     return _TEMPLATE_BUILD_SEMAPHORE
+
+
+class _AsyncFileLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle: Any | None = None
+
+    async def __aenter__(self) -> "_AsyncFileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+", encoding="utf-8")
+        while True:
+            try:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                await asyncio.sleep(0.2)
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        if self._handle is None:
+            return
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+
+
+def _sandbox_create_timeout_sec() -> float:
+    try:
+        timeout = float(os.getenv("E2B_SANDBOX_CREATE_TIMEOUT_SEC", "180"))
+    except ValueError:
+        timeout = 180.0
+    return max(30.0, timeout)
 
 
 def _safe_template_segment(value: str) -> str:
@@ -169,6 +202,61 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         )
         return list(dict.fromkeys(candidates))
 
+    def _template_lookup_cache_key(self) -> tuple[str, tuple[str, ...]]:
+        return (self._template_namespace, tuple(self._candidate_template_names()))
+
+    def _template_lookup_cache_file(self) -> Path:
+        raw_key = "\n".join(self._template_lookup_cache_key()[1])
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
+        return Path(
+            os.getenv("E2B_TEMPLATE_LOOKUP_CACHE_DIR", ".cache/e2b_template_lookup")
+        ) / f"{digest}.json"
+
+    def _template_lookup_lock_file(self) -> Path:
+        return self._template_lookup_cache_file().with_suffix(".lock")
+
+    def _read_template_lookup_file_cache(self) -> str | None:
+        cache_path = self._template_lookup_cache_file()
+        if not cache_path.exists():
+            return None
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        template_name = data.get("template_name")
+        if template_name in self._candidate_template_names():
+            return template_name
+        return None
+
+    def _remember_template_exists(self, template_name: str) -> None:
+        cache_key = self._template_lookup_cache_key()
+        _TEMPLATE_LOOKUP_CACHE[cache_key] = template_name
+        cache_path = self._template_lookup_cache_file()
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "template_name": template_name,
+                        "candidates": self._candidate_template_names(),
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            self.logger.debug("Failed to write E2B template lookup cache", exc_info=True)
+
+    def _forget_template_lookup(self) -> None:
+        _TEMPLATE_LOOKUP_CACHE.pop(self._template_lookup_cache_key(), None)
+        try:
+            self._template_lookup_cache_file().unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.logger.debug("Failed to remove E2B template lookup cache", exc_info=True)
+
     @staticmethod
     def _resolve_sandbox_timeout_sec(value: int | None) -> int:
         raw_value = value if value is not None else os.getenv("E2B_SANDBOX_TIMEOUT_SEC")
@@ -176,7 +264,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             timeout = int(raw_value) if raw_value is not None else 3600
         except (TypeError, ValueError):
             timeout = 3600
-        return max(60, min(timeout, 3600))
+        return max(60, min(timeout, 7200))
 
     def _dockerfile_content_or_path(self) -> str:
         content = self._environment_definition_path.read_text(encoding="utf-8")
@@ -193,29 +281,6 @@ class E2BSwebenchEnvironment(E2BEnvironment):
     def _fallback_template_name(self) -> str:
         legacy_name = f"{self._legacy_template_base()}__{self._environment_hash}"
         return self._qualified_template_name(legacy_name)
-
-    async def _template_exists_exact(self, template_name: str) -> bool:
-        config = ConnectionConfig()
-        api_client = get_api_client(
-            config,
-            require_api_key=True,
-            require_access_token=False,
-        )
-        response = await get_templates.asyncio_detailed(client=api_client)
-        if response.status_code >= 300:
-            raise handle_api_exception(response, TemplateException)
-        if response.parsed is None or isinstance(response.parsed, Error):
-            return False
-        for template in response.parsed:
-            if template_name in template.names:
-                return True
-            if any(
-                self._qualified_template_name(alias) == template_name
-                for alias in template.aliases
-                if "/" not in alias
-            ):
-                return True
-        return False
 
     @retry(
         retry=retry_if_exception_type(
@@ -258,6 +323,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 cpu_count=self.task_env_config.cpus,
                 memory_mb=self.task_env_config.memory_mb,
             )
+        self._remember_template_exists(self._template_name)
         self.logger.info("E2B template build done: template=%s", self._template_name)
         _benchmark_log(
             "E2B_TEMPLATE "
@@ -278,11 +344,14 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         }
 
         try:
-            self._sandbox = await AsyncSandbox.create(
-                template=self._template_name,
-                metadata=metadata,
-                timeout=self._sandbox_timeout_sec,
-                allow_internet_access=self.task_env_config.allow_internet,
+            self._sandbox = await asyncio.wait_for(
+                AsyncSandbox.create(
+                    template=self._template_name,
+                    metadata=metadata,
+                    timeout=self._sandbox_timeout_sec,
+                    allow_internet_access=self.task_env_config.allow_internet,
+                ),
+                timeout=_sandbox_create_timeout_sec(),
             )
         except SandboxException as exc:
             missing_default_tag = "tag 'default' does not exist" in str(exc)
@@ -296,11 +365,14 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                     exc,
                 )
                 await self._create_template()
-                self._sandbox = await AsyncSandbox.create(
-                    template=self._template_name,
-                    metadata=metadata,
-                    timeout=self._sandbox_timeout_sec,
-                    allow_internet_access=self.task_env_config.allow_internet,
+                self._sandbox = await asyncio.wait_for(
+                    AsyncSandbox.create(
+                        template=self._template_name,
+                        metadata=metadata,
+                        timeout=self._sandbox_timeout_sec,
+                        allow_internet_access=self.task_env_config.allow_internet,
+                    ),
+                    timeout=_sandbox_create_timeout_sec(),
                 )
                 return
 
@@ -312,14 +384,31 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 exc,
             )
             self._template_name = fallback_template
-            if not await self._template_exists_exact(fallback_template):
-                await self._create_template()
             try:
-                self._sandbox = await AsyncSandbox.create(
-                    template=self._template_name,
-                    metadata=metadata,
-                    timeout=self._sandbox_timeout_sec,
-                    allow_internet_access=self.task_env_config.allow_internet,
+                self._sandbox = await asyncio.wait_for(
+                    AsyncSandbox.create(
+                        template=self._template_name,
+                        metadata=metadata,
+                        timeout=self._sandbox_timeout_sec,
+                        allow_internet_access=self.task_env_config.allow_internet,
+                    ),
+                    timeout=_sandbox_create_timeout_sec(),
+                )
+                return
+            except SandboxException as fallback_launch_exc:
+                if not self._sandbox_template_missing(fallback_launch_exc):
+                    raise
+                await self._create_template()
+
+            try:
+                self._sandbox = await asyncio.wait_for(
+                    AsyncSandbox.create(
+                        template=self._template_name,
+                        metadata=metadata,
+                        timeout=self._sandbox_timeout_sec,
+                        allow_internet_access=self.task_env_config.allow_internet,
+                    ),
+                    timeout=_sandbox_create_timeout_sec(),
                 )
             except SandboxException as fallback_exc:
                 if "tag 'default' does not exist" not in str(fallback_exc):
@@ -330,39 +419,106 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                     fallback_exc,
                 )
                 await self._create_template()
-                self._sandbox = await AsyncSandbox.create(
-                    template=self._template_name,
-                    metadata=metadata,
-                    timeout=self._sandbox_timeout_sec,
-                    allow_internet_access=self.task_env_config.allow_internet,
+                self._sandbox = await asyncio.wait_for(
+                    AsyncSandbox.create(
+                        template=self._template_name,
+                        metadata=metadata,
+                        timeout=self._sandbox_timeout_sec,
+                        allow_internet_access=self.task_env_config.allow_internet,
+                    ),
+                    timeout=_sandbox_create_timeout_sec(),
                 )
 
-    async def _does_template_exist(self) -> bool:
-        config = ConnectionConfig()
-        api_client = get_api_client(
-            config,
-            require_api_key=True,
-            require_access_token=False,
+    async def _create_sandbox_from_template(self, template_name: str) -> None:
+        metadata = {
+            "environment_name": self.environment_name,
+            "session_id": self.session_id,
+        }
+        self._sandbox = await asyncio.wait_for(
+            AsyncSandbox.create(
+                template=template_name,
+                metadata=metadata,
+                timeout=self._sandbox_timeout_sec,
+                allow_internet_access=self.task_env_config.allow_internet,
+            ),
+            timeout=_sandbox_create_timeout_sec(),
         )
-        response = await get_templates.asyncio_detailed(client=api_client)
-        if response.status_code >= 300:
-            raise handle_api_exception(response, TemplateException)
-        if response.parsed is None or isinstance(response.parsed, Error):
-            return False
-        available_names: set[str] = set()
-        for template in response.parsed:
-            available_names.update(template.names)
-            available_names.update(
-                self._qualified_template_name(alias)
-                for alias in template.aliases
-                if "/" not in alias
-            )
 
-        for candidate in self._candidate_template_names():
-            if candidate in available_names:
-                self._template_name = candidate
-                return True
-        self._template_name = self._pi_template_name() or self._build_template_name()
+    @staticmethod
+    def _sandbox_template_missing(exc: Exception) -> bool:
+        message = str(exc).lower()
+        missing_markers = (
+            "not found",
+            "does not exist",
+            "no such template",
+            "template not found",
+            "tag 'default' does not exist",
+        )
+        return any(marker in message for marker in missing_markers)
+
+    async def _start_existing_candidate_template(self) -> bool:
+        cache_key = self._template_lookup_cache_key()
+        candidates = self._candidate_template_names()
+        cached_template = (
+            _TEMPLATE_LOOKUP_CACHE.get(cache_key)
+            or self._read_template_lookup_file_cache()
+        )
+        if cached_template in candidates:
+            candidates = [
+                cached_template,
+                *(candidate for candidate in candidates if candidate != cached_template),
+            ]
+
+        process_lock = _TEMPLATE_LOOKUP_LOCKS.setdefault(cache_key, asyncio.Lock())
+        async with process_lock:
+            async with _AsyncFileLock(self._template_lookup_lock_file()):
+                return await self._start_existing_candidate_template_locked(candidates)
+
+    async def _start_existing_candidate_template_locked(
+        self, candidates: list[str]
+    ) -> bool:
+        for candidate in candidates:
+            self.logger.info(
+                "E2B template launch probe: template=%s",
+                candidate,
+            )
+            _benchmark_log(
+                "E2B_TEMPLATE "
+                f"task={self.environment_name} "
+                f"status=launch_probe "
+                f"template={candidate}"
+            )
+            try:
+                await self._create_sandbox_from_template(candidate)
+            except SandboxException as exc:
+                if not self._sandbox_template_missing(exc):
+                    raise
+                self.logger.info(
+                    "E2B template candidate unavailable: template=%s error=%s",
+                    candidate,
+                    exc,
+                )
+                _benchmark_log(
+                    "E2B_TEMPLATE "
+                    f"task={self.environment_name} "
+                    f"status=launch_miss "
+                    f"template={candidate}"
+                )
+                continue
+
+            self._template_name = candidate
+            self._remember_template_exists(candidate)
+            self.logger.info(
+                "E2B template hit: launched existing template=%s",
+                self._template_name,
+            )
+            _benchmark_log(
+                "E2B_TEMPLATE "
+                f"task={self.environment_name} "
+                f"status=launch_hit "
+                f"template={self._template_name}"
+            )
+            return True
         return False
 
     def _workdir_from_dockerfile(self) -> str | None:
@@ -416,6 +572,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
 
     async def start(self, force_build: bool):
         if force_build:
+            self._forget_template_lookup()
             self.logger.info(
                 "E2B template check: force_build=true; building template=%s",
                 self._template_name,
@@ -427,30 +584,21 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 f"template={self._template_name}"
             )
             await self._create_template()
+            await self._create_sandbox()
         else:
             candidates = self._candidate_template_names()
             self.logger.info(
-                "E2B template check: candidates=%s",
+                "E2B template launch candidates=%s",
                 ", ".join(candidates),
             )
             _benchmark_log(
                 "E2B_TEMPLATE "
                 f"task={self.environment_name} "
-                "status=check "
+                "status=launch_candidates "
                 f"candidates={','.join(candidates)}"
             )
-            if await self._does_template_exist():
-                self.logger.info(
-                    "E2B template hit: using existing template=%s",
-                    self._template_name,
-                )
-                _benchmark_log(
-                    "E2B_TEMPLATE "
-                    f"task={self.environment_name} "
-                    f"status=hit "
-                    f"template={self._template_name}"
-                )
-            else:
+            if not await self._start_existing_candidate_template():
+                self._template_name = self._pi_template_name() or self._build_template_name()
                 self.logger.info(
                     "E2B template miss: building template=%s",
                     self._template_name,
@@ -461,9 +609,15 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                     f"status=miss "
                     f"template={self._template_name}"
                 )
-                await self._create_template()
-
-        await self._create_sandbox()
+                built_template = False
+                async with _AsyncFileLock(
+                    self._template_lookup_lock_file().with_suffix(".build.lock")
+                ):
+                    if not await self._start_existing_candidate_template():
+                        await self._create_template()
+                        built_template = True
+                if built_template:
+                    await self._create_sandbox()
 
         if not self._sandbox:
             raise RuntimeError(

@@ -20,7 +20,7 @@ from evolution.score import compare_jobs, write_report
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
 DEFAULT_EVO_ROOT = ROOT / "run_logs" / "evolution"
-DEFAULT_SKILL_ROOT = ROOT / "skills" / "tasks"
+DEFAULT_SKILL_ROOT = ROOT / "skills" / "accepted"
 
 
 def log(message: str) -> None:
@@ -253,8 +253,9 @@ def main() -> None:
 
     env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
-    env["PI_TASK_STAGE_SKILLS_ROOT"] = str(skill_pack_root)
-    env["PI_USE_SKILL_HARNESS_MEMORY"] = "true"
+    env["PI_SKILL_PACK_ROOT"] = str(skill_pack_root)
+    env["PI_USE_SKILL_HARNESS_MEMORY"] = "false"
+    env["PI_SKILL_RETRIEVAL_SCOPE"] = "transfer"
     if args.memory_path:
         env["PI_SKILL_HARNESS_MEMORY_PATH"] = str(args.memory_path.expanduser().resolve())
 
@@ -269,6 +270,11 @@ def main() -> None:
         "skill_version_id": args.skill_version_id,
         "skill_pack_root": str(skill_pack_root),
         "memory_path": env.get("PI_SKILL_HARNESS_MEMORY_PATH"),
+        "pi_skill_env": {
+            "PI_SKILL_PACK_ROOT": env["PI_SKILL_PACK_ROOT"],
+            "PI_USE_SKILL_HARNESS_MEMORY": env["PI_USE_SKILL_HARNESS_MEMORY"],
+            "PI_SKILL_RETRIEVAL_SCOPE": env["PI_SKILL_RETRIEVAL_SCOPE"],
+        },
     }
     write_json(run_dir / "manifest.json", manifest)
 

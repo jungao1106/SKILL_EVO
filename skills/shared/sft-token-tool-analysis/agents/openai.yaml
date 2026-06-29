@@ -1,3 +1,0 @@
-display_name: SFT Token Tool Analysis
-short_description: Analyze token, tool-call, and task-overlap statistics for SFT JSONL datasets.
-default_prompt: Compare these SFT JSONL datasets for token counts, tool usage, coverage, extremes, and task-key overlap.

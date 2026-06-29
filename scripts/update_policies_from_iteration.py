@@ -225,7 +225,7 @@ def trial_row(result_path: Path) -> dict[str, Any]:
             metadata = {}
         row["pi_metadata_path"] = str(metadata_path)
         row["skills_count"] = metadata.get("skills_count")
-        row["task_skill_filter"] = metadata.get("task_skill_filter")
+        row["skill_retrieval_filter"] = metadata.get("skill_retrieval_filter") or metadata.get("task_skill_filter")
         memory = metadata.get("skill_harness_memory") or {}
         if isinstance(memory, dict):
             row["memory_reason"] = memory.get("reason")
@@ -540,8 +540,8 @@ def stable_positive_case(
         "allowed_edit_degree": "preserve_only",
         "max_stage_edits": 0,
         "allowed_curator_ops": ["preserve_stage_skill"],
-        "reward_update_goal": "identify stable useful principles without editing task skills",
-        "curator_update_goal": "avoid unnecessary edits to already stable task skills",
+        "reward_update_goal": "identify stable useful principles without editing accepted skills",
+        "curator_update_goal": "avoid unnecessary edits to already stable accepted skills",
     }
     return {
         "task_name": task_name,
@@ -789,7 +789,7 @@ def label_free_reward_judgment(case: dict[str, Any], features: dict[str, Any]) -
     if n_test_commands == 0:
         risks.append("missing_focused_validation")
     if skill_files_seen == 0:
-        risks.append("missing_task_skill_files")
+        risks.append("missing_skill_files")
     useful: list[str] = []
     if n_source_paths:
         useful.append("names_concrete_paths")
@@ -940,7 +940,7 @@ def curator_feedback_for_case(
         skill_action = "keep_memory_only_until_evidence_added"
     elif case_type == "stable_positive":
         target_stages = []
-        rewrite_goal = "preserve as a policy anchor; do not edit task skills"
+        rewrite_goal = "preserve as a policy anchor; do not edit accepted skills"
         skill_action = "preserve"
     else:
         target_stages = ["recover"]
@@ -1284,7 +1284,7 @@ Policy update:
 - For strong negatives, assume the skill harmed a previously solved task. Delete, disable, or rewrite the likely harmful stage first; generic localize/edit advice is the first suspect.
 - For weak negatives, make a small targeted rewrite from the failed behavior. Prefer recover/validate stop conditions and narrower reproduction over broad new search plans.
 - Stable positives are policy-only anchors. They should mostly prevent unnecessary edits.
-- Before editing a task skill, inspect whether current is better than both previous and base. If current is worse than base, prefer narrowing or disabling over preserving.
+- Before editing an accepted skill, inspect whether current is better than both previous and base. If current is worse than base, prefer narrowing or disabling over preserving.
 - Editing strength is fixed by the harness case type and cannot be changed by curator policy text.
 - Timeout-sensitive edits must reduce search breadth and add early stop conditions.
 - Environment/setup failures should only affect recover/validate safeguards unless source-code evidence says otherwise.

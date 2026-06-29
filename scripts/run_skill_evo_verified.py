@@ -22,7 +22,7 @@ from evolution.score import compare_jobs, summarize_job, write_report
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
 DEFAULT_EVO_ROOT = ROOT / "run_logs" / "evolution"
-DEFAULT_SKILL_ARCHIVE_ROOT = ROOT / "skills" / "tasks"
+DEFAULT_SKILL_ARCHIVE_ROOT = ROOT / "skills" / "accepted"
 POLICY_ROOT = ROOT / "evolution" / "policies"
 SKILL_VERSION_INDEX = "VERSIONS.json"
 VERSION_ID_RE = re.compile(r"^v(\d{4,})$")
@@ -130,7 +130,8 @@ def next_skill_version_id(skill_archive_root: Path) -> str:
         for number in (_version_number(version_id) for version_id in archived_skill_versions(skill_archive_root))
         if number is not None
     ]
-    return f"v{(max(numbers) if numbers else 0) + 1:04d}"
+    next_number = max(numbers) + 1 if numbers else 0
+    return f"v{next_number:04d}"
 
 
 def is_full_dataset_selection(args: argparse.Namespace) -> bool:
@@ -222,7 +223,7 @@ def update_memory_command(
     *,
     baseline_job_dir: Path,
     memory_path: Path,
-    task_skill_dir: Path,
+    task_evidence_dir: Path,
     generated_skill_dir: Path,
     version_id: str,
 ) -> list[str]:
@@ -236,7 +237,7 @@ def update_memory_command(
         "--version-id",
         version_id,
         "--task-skill-dir",
-        str(task_skill_dir),
+        str(task_evidence_dir),
         "--generated-skill-dir",
         str(generated_skill_dir),
     ]
@@ -378,7 +379,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run the v2 skill-evolution loop directly on SWE-bench Verified: "
-            "baseline -> train five-stage skills -> eval -> score report."
+            "baseline -> build task evidence and accepted skills -> eval -> score report."
         )
     )
     parser.add_argument("--run-name", default=None)
@@ -406,12 +407,12 @@ def parse_args() -> argparse.Namespace:
         "--skill-archive-root",
         type=Path,
         default=DEFAULT_SKILL_ARCHIVE_ROOT,
-        help="Root directory where generated task/stage SKILL.md files are versioned.",
+        help="Root directory where accepted skill artifacts are versioned.",
     )
     parser.add_argument(
         "--skill-version-id",
         default=None,
-        help="Archive version id such as v0012. Defaults to the next unused skills/tasks version.",
+        help="Archive version id such as v0012. Defaults to the next unused skills/accepted version.",
     )
     parser.add_argument(
         "--overwrite-skill-version",
@@ -422,9 +423,8 @@ def parse_args() -> argparse.Namespace:
         "--append-skill-version",
         action="store_true",
         help=(
-            "Append this shard's task-specific skills into an existing shared "
-            "iteration version directory instead of treating an existing "
-            "version as an error."
+            "Append this shard's accepted artifacts into an existing shared "
+            "iteration version directory instead of treating an existing version as an error."
         ),
     )
     parser.add_argument("--summarize-with-backbone", action="store_true")
@@ -479,7 +479,7 @@ def main() -> None:
         else ROOT / "jobs" / eval_job_name
     )
     memory_path = training_dir / "skill_harness_memory.json"
-    task_skill_dir = training_dir / "task_skill_cards"
+    task_evidence_dir = training_dir / "task_evidence_cards"
     skill_archive_root = args.skill_archive_root.expanduser().resolve()
     generated_skill_dir = skill_archive_root
     version_id = args.skill_version_id or next_skill_version_id(skill_archive_root)
@@ -513,7 +513,7 @@ def main() -> None:
         "baseline_job_dir": str(baseline_job_dir),
         "eval_job_dir": str(eval_job_dir),
         "memory_path": str(memory_path),
-        "task_skill_dir": str(task_skill_dir),
+        "task_evidence_dir": str(task_evidence_dir),
         "skill_archive_root": str(skill_archive_root),
         "generated_skill_dir": str(generated_skill_dir),
         "skill_version_index": str(skill_version_index),
@@ -535,7 +535,7 @@ def main() -> None:
 
     if not args.skip_training:
         if args.dry_run:
-            log("dry-run: would build five-stage skill memory from baseline job")
+            log("dry-run: would build task evidence memory and accepted skill artifacts from baseline job")
         else:
             if not (baseline_job_dir / "result.json").exists():
                 raise SystemExit(f"Missing baseline result: {baseline_job_dir / 'result.json'}")
@@ -544,7 +544,7 @@ def main() -> None:
                 args,
                 baseline_job_dir=baseline_job_dir,
                 memory_path=memory_path,
-                task_skill_dir=task_skill_dir,
+                task_evidence_dir=task_evidence_dir,
                 generated_skill_dir=generated_skill_dir,
                 version_id=version_id,
             ),
@@ -557,8 +557,9 @@ def main() -> None:
         active_version = read_active_version(memory_path)
     skill_pack_root = generated_skill_dir / active_version
     env["PI_SKILL_HARNESS_MEMORY_PATH"] = str(memory_path)
-    env["PI_TASK_STAGE_SKILLS_ROOT"] = str(skill_pack_root)
-    env["PI_USE_SKILL_HARNESS_MEMORY"] = "true"
+    env["PI_SKILL_PACK_ROOT"] = str(skill_pack_root)
+    env["PI_USE_SKILL_HARNESS_MEMORY"] = "false"
+    env["PI_SKILL_RETRIEVAL_SCOPE"] = "transfer"
 
     manifest.update(
         {
@@ -568,8 +569,9 @@ def main() -> None:
             "skill_version_index": str(skill_version_index),
             "eval_env": {
                 "PI_SKILL_HARNESS_MEMORY_PATH": env["PI_SKILL_HARNESS_MEMORY_PATH"],
-                "PI_TASK_STAGE_SKILLS_ROOT": env["PI_TASK_STAGE_SKILLS_ROOT"],
+                "PI_SKILL_PACK_ROOT": env["PI_SKILL_PACK_ROOT"],
                 "PI_USE_SKILL_HARNESS_MEMORY": env["PI_USE_SKILL_HARNESS_MEMORY"],
+                "PI_SKILL_RETRIEVAL_SCOPE": env["PI_SKILL_RETRIEVAL_SCOPE"],
             },
         }
     )

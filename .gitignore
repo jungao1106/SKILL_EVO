@@ -12,10 +12,23 @@ __pycache__/
 
 analysis/
 jobs/
+legacy/
+data/
+figures/
+run_logs/
+wandb/
+skills/tasks/
 logs/*.log
 run_logs/*.out
 run_logs/*.pid
 run_logs/*.session
+configs/_quarantine_401/
+configs/full_swegym_*.json
+configs/skill_evo_*.json
+configs/swegym_*.json
+configs/tb2_*.json
+configs/tbench_*.json
+papers/*.pdf
 
 *.log
 *.out

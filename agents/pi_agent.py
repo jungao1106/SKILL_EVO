@@ -33,7 +33,7 @@ from agents.skill_harness_memory import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PI_TASK_SKILLS_BASE = ROOT / "skills" / "tasks"
+PI_TASK_SKILLS_BASE = ROOT / "skills" / "accepted"
 PI_SANDBOX_SKILLS_DIR = PurePosixPath("/tmp/pi-skills")
 PI_SKILLS_INDEX_PATH = PurePosixPath(EnvironmentPaths.agent_dir / "pi-skills-index.json")
 PI_SKILL_PACK_B64_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz.b64")
@@ -41,6 +41,12 @@ PI_SKILL_PACK_TAR_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz")
 PI_SKILL_PACK_EXCLUDE_DIRS = {"benchmark-sharded-concurrency"}
 PI_SKILL_PACK_CHUNK_SIZE = 24_000
 PI_MAX_PROMPT_SKILLS = 8
+PI_RUNTIME_PATH_COMMAND = (
+    "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+    'for HARBOR_PI_NODE_BIN in "$HOME"/.local/node-v*-linux-*/bin; do '
+    'if [ -d "$HARBOR_PI_NODE_BIN" ]; then export PATH="$HARBOR_PI_NODE_BIN:$PATH"; fi; '
+    "done"
+)
 PI_MIN_ACTIVE_SKILL_QUALITY = float(os.getenv("PI_MIN_ACTIVE_SKILL_QUALITY", "0.58"))
 PI_BLOCKED_SKILL_RISKS = {
     "generic_fallback_skill",
@@ -55,9 +61,11 @@ PI_GENERIC_FALLBACK_SKILL_NAMES = {
     "task-edit-minimal-owner",
     "task-localize-high-signal-paths",
 }
-FORBIDDEN_ASSISTANT_CONTENT_MARKERS = (
+SANITIZED_ASSISTANT_CONTENT_MARKERS = (
     "</think>",
     "<think>",
+)
+FORBIDDEN_ASSISTANT_CONTENT_MARKERS = (
     "<tool_call>",
     "</tool_call>",
     "<arg_key>",
@@ -102,10 +110,109 @@ BENCHMARK ISSUE:
 """
 
 
-PI_TASK_PREFIX_WITH_SKILLS = """Use Pi's available tools to inspect the repository, treat task/stage skill memory as evidence-gated weak hints, make a targeted source-code fix, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.
+PI_TASK_PREFIX_WITH_SKILLS = """Use Pi's available tools to inspect the repository, treat skill memory and task evidence as evidence-gated weak hints, make a targeted source-code fix, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.
 
 BENCHMARK ISSUE:
 """
+
+
+PI_TERMINAL_BENCH_SYSTEM_PROMPT = """You are Pi, a terminal-based agent running inside a Harbor Terminal-Bench 2.0 task sandbox.
+
+Goal:
+- Solve the benchmark task in the current terminal environment.
+- Inspect the provided files, scripts, services, and system state before acting.
+- Make the necessary persistent changes in the sandbox so the verifier can check them after you exit.
+- Run relevant checks when practical.
+- This is not a repository research task. Never answer with an overview,
+  research summary, README summary, or implementation plan as the final result.
+- Continue with concrete tool calls until you have attempted the task.
+
+Operational constraints:
+- You may use Pi's read, write, edit, bash, grep, find, and ls tools.
+- Use the available Pi tools through Pi's native tool interface. Do not print or
+  serialize tool calls as text.
+- Your first assistant action after receiving the benchmark task must inspect
+  the environment with an available tool.
+- When you need task information or need to change files, invoke one appropriate
+  tool rather than describing the action in prose.
+- A plain-text plan before the first tool invocation is invalid. If you are
+  about to explain what you will inspect, invoke the inspection tool instead.
+- Do not ask the user for clarification during benchmark execution.
+- Do not exfiltrate secrets or print environment variables containing API keys.
+- Keep a concise final message summarizing changed files, commands, or checks.
+"""
+
+
+PI_TERMINAL_BENCH_TASK_PREFIX = """Use Pi's available tools to inspect the task environment, solve the Terminal-Bench task, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.
+
+TERMINAL-BENCH TASK:
+"""
+
+
+PI_TERMINAL_BENCH_TASK_PREFIX_WITH_SKILLS = """Use Pi's available tools to inspect the task environment, treat skill memory as evidence-gated weak hints, solve the Terminal-Bench task, and run a relevant verification command when practical. Your first assistant response must invoke an available Pi tool through the native tool interface; do not answer with a plan, repository summary, or serialized tool-call text.
+
+TERMINAL-BENCH TASK:
+"""
+
+
+PI_SWEBENCH_NO_DIFF_RESCUE_PROMPT = """HARNESS CORRECTIVE PROMPT:
+Your previous attempt completed but did not change the repository diff, so it would fail this benchmark. Continue from scratch if needed, but do not conclude that the issue is already fixed or that no change is needed. Passing existing tests without a source-code diff is not sufficient. Inspect the relevant source, make a targeted source-code patch, and run a relevant verification command when practical. This is no-diff rescue attempt $HARBOR_NO_DIFF_RESCUE_ATTEMPT of $HARBOR_NO_DIFF_RESCUE_MAX."""
+
+
+PI_TERMINAL_BENCH_NO_DIFF_RESCUE_PROMPT = """HARNESS CORRECTIVE PROMPT:
+Your previous attempt completed but did not change the git repository diff. If this task requires repository edits, that would fail this benchmark. Continue from the original task, inspect the relevant files or state, make the needed persistent changes, and run a relevant verification command when practical. If the task is not a git-backed code task, focus on the required terminal-side outcome. This is no-diff rescue attempt $HARBOR_NO_DIFF_RESCUE_ATTEMPT of $HARBOR_NO_DIFF_RESCUE_MAX."""
+
+
+def _normalize_benchmark_name(value: str | None) -> str:
+    text = str(value or "").strip().lower().replace("_", "-")
+    if not text:
+        return "swe-bench"
+    aliases = {
+        "swebench": "swe-bench",
+        "swebench-verified": "swe-bench",
+        "swe-bench-verified": "swe-bench",
+        "swegym": "swe-gym",
+        "swe-gym": "swe-gym",
+        "swe-gym-train": "swe-gym",
+        "terminalbench": "terminal-bench",
+        "terminal-bench2": "terminal-bench",
+        "terminal-bench-2": "terminal-bench",
+        "terminalbench2": "terminal-bench",
+        "tb2": "terminal-bench",
+        "tbench": "terminal-bench",
+    }
+    return aliases.get(text, text)
+
+
+def _benchmark_system_prompt(benchmark_name: str | None) -> str:
+    if _normalize_benchmark_name(benchmark_name) == "terminal-bench":
+        return PI_TERMINAL_BENCH_SYSTEM_PROMPT
+    return PI_SYSTEM_PROMPT
+
+
+def _benchmark_task_prefix(benchmark_name: str | None, *, use_skills: bool) -> str:
+    if _normalize_benchmark_name(benchmark_name) == "terminal-bench":
+        return (
+            PI_TERMINAL_BENCH_TASK_PREFIX_WITH_SKILLS
+            if use_skills
+            else PI_TERMINAL_BENCH_TASK_PREFIX
+        )
+    return PI_TASK_PREFIX_WITH_SKILLS if use_skills else PI_TASK_PREFIX
+
+
+def _benchmark_sharegpt_source(benchmark_name: str | None) -> str:
+    normalized = _normalize_benchmark_name(benchmark_name)
+    if normalized == "terminal-bench":
+        return "harbor-terminal-bench-2"
+    if normalized == "swe-gym":
+        return "harbor-swegym"
+    return "harbor-swebench-verified"
+
+
+def _benchmark_no_diff_rescue_prompt(benchmark_name: str | None) -> str:
+    if _normalize_benchmark_name(benchmark_name) == "terminal-bench":
+        return PI_TERMINAL_BENCH_NO_DIFF_RESCUE_PROMPT
+    return PI_SWEBENCH_NO_DIFF_RESCUE_PROMPT
 
 
 def _unquote_yaml_scalar(value: str) -> str:
@@ -190,14 +297,47 @@ def _skill_is_active(metadata: dict[str, Any]) -> bool:
 
 
 def _active_task_skills_root() -> Path:
-    override = os.getenv("PI_TASK_STAGE_SKILLS_ROOT")
-    if override:
-        return Path(override).expanduser()
-    version = active_version(load_memory(memory_path_from_env()))
+    roots = _active_task_skill_roots()
+    return roots[0] if roots else PI_TASK_SKILLS_BASE
+
+
+def _active_task_skill_roots() -> list[Path]:
+    override = os.getenv("PI_SKILL_PACK_ROOT") or os.getenv("PI_TASK_STAGE_SKILLS_ROOT")
+    memory = load_memory(memory_path_from_env())
+    version = active_version(memory)
     version_id = version.get("version_id") if version else None
-    if isinstance(version_id, str) and version_id:
-        return PI_TASK_SKILLS_BASE / version_id
-    return PI_TASK_SKILLS_BASE
+    if override:
+        root = Path(override).expanduser()
+    elif isinstance(version_id, str) and version_id:
+        root = PI_TASK_SKILLS_BASE / version_id
+    else:
+        root = PI_TASK_SKILLS_BASE
+
+    roots = [root]
+    versions = memory.get("versions") if isinstance(memory, dict) else None
+    if not isinstance(versions, dict) or not isinstance(version_id, str):
+        return roots
+
+    archive_root = root.parent if root.name == version_id else PI_TASK_SKILLS_BASE
+    seen_roots = {root.resolve()}
+    seen_versions: set[str] = set()
+    current_id = version_id
+    while current_id and current_id not in seen_versions:
+        seen_versions.add(current_id)
+        current = versions.get(current_id)
+        if not isinstance(current, dict):
+            break
+        parent = current.get("parent_version")
+        if not parent:
+            break
+        parent_id = str(parent)
+        parent_root = archive_root / parent_id
+        resolved_parent = parent_root.resolve()
+        if resolved_parent not in seen_roots:
+            roots.append(parent_root)
+            seen_roots.add(resolved_parent)
+        current_id = parent_id
+    return roots
 
 
 def _discover_pi_skills(skills_root: Path) -> list[dict[str, str]]:
@@ -226,8 +366,22 @@ def _discover_pi_skills(skills_root: Path) -> list[dict[str, str]]:
                 "use_policy": metadata.get("use_policy", "evidence-gated"),
                 "relative_path": relative_path.as_posix(),
                 "path": sandbox_path.as_posix(),
+                "_root": str(skills_root),
             }
         )
+    return skills
+
+
+def _discover_pi_skills_from_roots(skills_roots: list[Path]) -> list[dict[str, str]]:
+    skills: list[dict[str, str]] = []
+    seen_relative_paths: set[str] = set()
+    for skills_root in skills_roots:
+        for skill in _discover_pi_skills(skills_root):
+            relative_path = str(skill.get("relative_path") or "")
+            if not relative_path or relative_path in seen_relative_paths:
+                continue
+            seen_relative_paths.add(relative_path)
+            skills.append(skill)
     return skills
 
 
@@ -245,9 +399,65 @@ def _task_slug_from_instruction(instruction: str) -> str:
 
 def _repo_slug_from_instruction(instruction: str) -> str:
     task_slug = _task_slug_from_instruction(instruction)
-    if "__" in task_slug:
-        return task_slug.split("__", 1)[0]
-    return ""
+    if "__" not in task_slug:
+        return ""
+    org, rest = task_slug.split("__", 1)
+    repo = rest.rsplit("-", 1)[0]
+    if repo:
+        return f"{org}__{repo}"
+    return org
+
+
+def _repo_org_from_slug(repo_slug: str) -> str:
+    if "__" in repo_slug:
+        return repo_slug.split("__", 1)[0]
+    return repo_slug
+
+
+def _skill_retrieval_scopes() -> set[str]:
+    raw = os.getenv("PI_SKILL_RETRIEVAL_SCOPE", "task")
+    scopes = {
+        item.strip().lower()
+        for item in re.split(r"[,:\s]+", raw)
+        if item.strip()
+    }
+    if "transfer" in scopes:
+        scopes.update({"general", "failure"})
+    if "all" in scopes:
+        scopes.update({"general", "failure", "repo", "task"})
+    return scopes or {"task"}
+
+
+def _allow_exact_task_memory() -> bool:
+    scopes = _skill_retrieval_scopes()
+    return "task" in scopes
+
+
+def _skill_scope_rank(skill: dict[str, str], task_slug: str, repo_slug: str) -> int | None:
+    relative_path = str(skill.get("relative_path") or "")
+    normalized = relative_path.strip("/")
+    scopes = _skill_retrieval_scopes()
+
+    if "task" in scopes and task_slug and task_slug in normalized:
+        return 0
+
+    if "repo" in scopes and repo_slug:
+        repo_org = _repo_org_from_slug(repo_slug)
+        repo_prefixes = (
+            f"_repos/{repo_slug}/",
+            f"repos/{repo_slug}/",
+            f"_repos/{repo_org}/",
+            f"repos/{repo_org}/",
+        )
+        if normalized.startswith(repo_prefixes):
+            return 1
+
+    if "failure" in scopes and normalized.startswith(("_failure_modes/", "failure_modes/")):
+        return 2
+
+    if "general" in scopes and normalized.startswith(("_general/", "general/")):
+        return 3
+    return None
 
 
 def _filter_task_specific_skills(
@@ -257,15 +467,16 @@ def _filter_task_specific_skills(
     if not skills:
         return []
     task_slug = _task_slug_from_instruction(instruction)
-    if not task_slug:
-        return []
+    repo_slug = _repo_slug_from_instruction(instruction)
 
-    exact = [
-        skill
-        for skill in skills
-        if task_slug in skill.get("relative_path", "")
-    ]
-    return exact[:PI_MAX_PROMPT_SKILLS]
+    ranked: list[tuple[int, str, dict[str, str]]] = []
+    for skill in skills:
+        rank = _skill_scope_rank(skill, task_slug, repo_slug)
+        if rank is None:
+            continue
+        ranked.append((rank, str(skill.get("relative_path") or ""), skill))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [skill for _, _, skill in ranked[:PI_MAX_PROMPT_SKILLS]]
 
 
 def _iter_pi_skill_pack_files(skills_root: Path) -> list[Path]:
@@ -288,39 +499,44 @@ def _iter_pi_skill_pack_files(skills_root: Path) -> list[Path]:
 
 
 def _iter_pi_skill_pack_files_for_skills(
-    skills_root: Path,
     skills: list[dict[str, str]],
-) -> list[Path]:
-    if not skills_root.exists() or not skills:
+) -> list[tuple[Path, Path]]:
+    if not skills:
         return []
 
-    selected_dirs: list[Path] = []
+    selected_dirs: list[tuple[Path, Path]] = []
     for skill in skills:
         relative_path = skill.get("relative_path")
-        if not relative_path:
+        root = skill.get("_root")
+        if not relative_path or not root:
             continue
-        selected_dirs.append(Path(relative_path).parent)
+        selected_dirs.append((Path(root), Path(relative_path).parent))
 
-    files: list[Path] = []
-    for path in _iter_pi_skill_pack_files(skills_root):
-        relative_path = path.relative_to(skills_root)
-        if any(
-            relative_path == selected_dir
-            or relative_path.is_relative_to(selected_dir)
-            for selected_dir in selected_dirs
-        ):
-            files.append(path)
+    files: list[tuple[Path, Path]] = []
+    seen_relative_paths: set[str] = set()
+    for skills_root, selected_dir in selected_dirs:
+        for path in _iter_pi_skill_pack_files(skills_root):
+            relative_path = path.relative_to(skills_root)
+            if not (
+                relative_path == selected_dir
+                or relative_path.is_relative_to(selected_dir)
+            ):
+                continue
+            relative_key = relative_path.as_posix()
+            if relative_key in seen_relative_paths:
+                continue
+            seen_relative_paths.add(relative_key)
+            files.append((path, relative_path))
     return files
 
 
 def _pi_skill_pack(instruction: str) -> tuple[list[dict[str, str]], str, str, int, dict[str, str]]:
-    skills_root = _active_task_skills_root()
-    all_skills = _discover_pi_skills(skills_root)
+    skills_roots = _active_task_skill_roots()
+    all_skills = _discover_pi_skills_from_roots(skills_roots)
     skills = _filter_task_specific_skills(all_skills, instruction)
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for path in _iter_pi_skill_pack_files_for_skills(skills_root, skills):
-            relative_path = path.relative_to(skills_root)
+        for path, relative_path in _iter_pi_skill_pack_files_for_skills(skills):
             info = archive.gettarinfo(str(path), arcname=relative_path.as_posix())
             info.uid = 0
             info.gid = 0
@@ -336,7 +552,13 @@ def _pi_skill_pack(instruction: str) -> tuple[list[dict[str, str]], str, str, in
         "repo_slug": _repo_slug_from_instruction(instruction),
         "max_prompt_skills": str(PI_MAX_PROMPT_SKILLS),
     }
-    return skills, wrapped, str(skills_root), len(all_skills), task_filter
+    return (
+        skills,
+        wrapped,
+        os.pathsep.join(str(root) for root in skills_roots),
+        len(all_skills),
+        task_filter,
+    )
 
 
 def _task_filter_text(instruction: str, environment: BaseEnvironment) -> str:
@@ -354,17 +576,17 @@ def _pi_skills_prompt(skills: list[dict[str, str]]) -> str:
 
     lines = [
         "",
-        "Task/stage skill pack:",
-        f"- Read-only task-specific stage skill files are available under {PI_SANDBOX_SKILLS_DIR}.",
+        "Skill pack:",
+        f"- Read-only skill files are available under {PI_SANDBOX_SKILLS_DIR}.",
         f"- The skill index is saved at {PI_SKILLS_INDEX_PATH}.",
-        "- These are previous task skills from evolution memory, not a global skill catalog.",
+        "- These skills can include task-stage, repo-level, failure-mode, or general SWE process skills depending on the configured retrieval scope.",
         "- First inspect the current repository evidence. Read a listed SKILL.md only if that first inspection matches its applicability, owner path, error signal, or validation command.",
         "- You may read zero skills. If no listed skill matches concrete repository evidence, continue with the normal no-skill workflow.",
         "- If a skill's first concrete check does not match the current repository, ignore that skill and do not force its patch shape.",
         "- Read at most two skill files before the first edit; prefer the highest-quality evidence-gated skill over multiple generic hints.",
         "- Load referenced scripts, assets, or reference files only when they are directly useful.",
         "",
-        "Available task/stage skills:",
+        "Available skills:",
     ]
     for skill in skills:
         quality = skill.get("quality_score")
@@ -388,9 +610,13 @@ def _pi_skills_metadata(skills: list[dict[str, str]]) -> list[dict[str, str]]:
     ]
 
 
-def _pi_system_prompt(skills: list[dict[str, str]], memory_prompt: str = "") -> str:
+def _pi_system_prompt(
+    skills: list[dict[str, str]],
+    memory_prompt: str = "",
+    base_prompt: str | None = None,
+) -> str:
     return (
-        PI_SYSTEM_PROMPT.rstrip()
+        (base_prompt or PI_SYSTEM_PROMPT).rstrip()
         + "\n"
         + _pi_skills_prompt(skills)
         + memory_prompt
@@ -545,6 +771,36 @@ def _message_text(message: dict[str, Any] | None) -> str:
     return str(text) if text is not None else ""
 
 
+def _sanitize_assistant_content_text(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r"(?is)<think>\s*.*?</think>\s*", "", text)
+    text = re.sub(r"(?i)</?think>", "", text)
+    return text
+
+
+def _sanitize_message_content(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_assistant_content_text(value)
+    if isinstance(value, list):
+        sanitized_items: list[Any] = []
+        for item in value:
+            if isinstance(item, str):
+                sanitized_items.append(_sanitize_assistant_content_text(item))
+            elif isinstance(item, dict):
+                sanitized_item = dict(item)
+                for key in ("text", "content", "output", "value"):
+                    if isinstance(sanitized_item.get(key), str):
+                        sanitized_item[key] = _sanitize_assistant_content_text(
+                            sanitized_item[key]
+                        )
+                sanitized_items.append(sanitized_item)
+            else:
+                sanitized_items.append(item)
+        return sanitized_items
+    return value
+
+
 def _forbidden_assistant_content_event_hits(
     events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -581,6 +837,22 @@ def _sanitize_pi_event(event: dict[str, Any]) -> dict[str, Any]:
     """
 
     event_type = event.get("type")
+    if event_type == "message_end":
+        message = event.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            sanitized = dict(event)
+            sanitized_message = dict(message)
+            if "content" in sanitized_message:
+                sanitized_message["content"] = _sanitize_message_content(
+                    sanitized_message["content"]
+                )
+            if isinstance(sanitized_message.get("text"), str):
+                sanitized_message["text"] = _sanitize_assistant_content_text(
+                    sanitized_message["text"]
+                )
+            sanitized["message"] = sanitized_message
+            return sanitized
+
     if event_type != "message_update":
         return event
 
@@ -618,16 +890,50 @@ def _sanitize_pi_event(event: dict[str, Any]) -> dict[str, Any]:
 
 def _sanitize_pi_jsonl_command(jsonl_path: PurePosixPath) -> str:
     python_path = json.dumps(str(jsonl_path))
-    return f"""python - <<'HARBOR_PI_SANITIZE_JSONL'
+    sanitized_markers_json = json.dumps(SANITIZED_ASSISTANT_CONTENT_MARKERS)
+    return f"""${{HARBOR_PYTHON_BIN:-python3}} - <<'HARBOR_PI_SANITIZE_JSONL'
 import json
 import os
+import re
 import tempfile
 
 path = {python_path}
+sanitized_markers = tuple({sanitized_markers_json})
 if not os.path.exists(path):
     raise SystemExit(0)
 
-fd, temp_path = tempfile.mkstemp(prefix="harbor_pi_events_", suffix=".jsonl")
+def sanitize_assistant_text(text):
+    if not isinstance(text, str) or not text:
+        return text
+    text = re.sub(r"(?is)<think>\\s*.*?</think>\\s*", "", text)
+    text = re.sub(r"(?i)</?think>", "", text)
+    return text
+
+def sanitize_content(value):
+    if isinstance(value, str):
+        return sanitize_assistant_text(value)
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, str):
+                out.append(sanitize_assistant_text(item))
+            elif isinstance(item, dict):
+                clean = dict(item)
+                for key in ("text", "content", "output", "value"):
+                    if isinstance(clean.get(key), str):
+                        clean[key] = sanitize_assistant_text(clean[key])
+                out.append(clean)
+            else:
+                out.append(item)
+        return out
+    return value
+
+temp_dir = os.path.dirname(path) or "."
+fd, temp_path = tempfile.mkstemp(
+    prefix="harbor_pi_events_",
+    suffix=".jsonl",
+    dir=temp_dir,
+)
 os.close(fd)
 
 try:
@@ -644,6 +950,22 @@ try:
             except ValueError:
                 dst.write(line + "\\n")
                 continue
+
+            if (
+                event.get("type") == "message_end"
+                and isinstance(event.get("message"), dict)
+                and event["message"].get("role") == "assistant"
+            ):
+                message = dict(event["message"])
+                content = message.get("content")
+                text = message.get("text")
+                if any(marker in str(content) or marker in str(text) for marker in sanitized_markers):
+                    if "content" in message:
+                        message["content"] = sanitize_content(message["content"])
+                    if isinstance(message.get("text"), str):
+                        message["text"] = sanitize_assistant_text(message["text"])
+                    event = dict(event)
+                    event["message"] = message
 
             if (
                 event.get("type") == "message_update"
@@ -685,7 +1007,7 @@ HARBOR_PI_SANITIZE_JSONL
 
 def _no_tool_call_guard_command(jsonl_path: PurePosixPath) -> str:
     python_path = json.dumps(str(jsonl_path))
-    return f"""python - <<'HARBOR_MACARON_EMPTY_RESPONSE_GUARD'
+    return f"""${{HARBOR_PYTHON_BIN:-python3}} - <<'HARBOR_MACARON_EMPTY_RESPONSE_GUARD'
 import json
 import sys
 
@@ -778,7 +1100,7 @@ HARBOR_MACARON_EMPTY_RESPONSE_GUARD
 def _forbidden_assistant_content_guard_command(jsonl_path: PurePosixPath) -> str:
     python_path = json.dumps(str(jsonl_path))
     markers_json = json.dumps(FORBIDDEN_ASSISTANT_CONTENT_MARKERS)
-    return f"""python - <<'HARBOR_MACARON_ASSISTANT_CONTENT_GUARD'
+    return f"""${{HARBOR_PYTHON_BIN:-python3}} - <<'HARBOR_MACARON_ASSISTANT_CONTENT_GUARD'
 import json
 import sys
 
@@ -892,7 +1214,7 @@ def _no_diff_metadata_update_function_command(metadata_path: PurePosixPath) -> s
   HARBOR_NO_DIFF_ATTEMPTS_VALUE="${{2:-0}}" \\
   HARBOR_NO_DIFF_FAILED_VALUE="${{3:-false}}" \\
   HARBOR_NO_DIFF_MAX_ATTEMPTS_VALUE="${{HARBOR_NO_DIFF_RESCUE_MAX:-2}}" \\
-  python - <<'HARBOR_NO_DIFF_METADATA'
+  ${{HARBOR_PYTHON_BIN:-python3}} - <<'HARBOR_NO_DIFF_METADATA'
 import json
 import os
 from pathlib import Path
@@ -973,6 +1295,7 @@ def _no_diff_rescue_loop_command(
     sanitize_jsonl_command: str,
     forbidden_assistant_content_guard_command: str,
     no_tool_call_guard_command: str,
+    rescue_prompt: str,
 ) -> str:
     jsonl_path_q = shlex.quote(str(jsonl_path))
     stderr_path_q = shlex.quote(str(stderr_path))
@@ -1004,8 +1327,7 @@ while true; do
   echo "[harbor] Pi produced no repository diff; starting no-diff rescue attempt $HARBOR_NO_DIFF_RESCUE_ATTEMPT/$HARBOR_NO_DIFF_RESCUE_MAX" >&2
   PROMPT="${{HARBOR_PI_ORIGINAL_PROMPT}}
 
-HARNESS CORRECTIVE PROMPT:
-Your previous attempt completed but did not change the repository diff, so it would fail this benchmark. Continue from scratch if needed, but do not conclude that the issue is already fixed or that no change is needed. Passing existing tests without a source-code diff is not sufficient. Inspect the relevant source, make a targeted source-code patch, and run a relevant verification command when practical. This is no-diff rescue attempt $HARBOR_NO_DIFF_RESCUE_ATTEMPT of $HARBOR_NO_DIFF_RESCUE_MAX."
+{rescue_prompt}"
 done
 """
 
@@ -1023,6 +1345,7 @@ class PiAgent(BaseInstalledAgent):
     _MODELS_FILENAME = "models.json"
     _SYSTEM_PROMPT_FILENAME = "pi-system-prompt.md"
     _INSTRUCTION_FILENAME = "problem_statement.md"
+    _TRACE_GUARD_FILENAME = "pi-trace-guard.json"
 
     def __init__(
         self,
@@ -1042,6 +1365,8 @@ class PiAgent(BaseInstalledAgent):
         default_api_key: str | None = None,
         result_only: bool = False,
         use_skills: bool = False,
+        benchmark_name: str = "swe-bench",
+        require_workspace_change: bool = True,
         *args: Any,
         **kwargs: Any,
     ):
@@ -1061,6 +1386,8 @@ class PiAgent(BaseInstalledAgent):
         self.default_api_key = default_api_key
         self.result_only = result_only
         self.use_skills = use_skills
+        self.benchmark_name = _normalize_benchmark_name(benchmark_name)
+        self.require_workspace_change = require_workspace_change
 
     @staticmethod
     def name() -> str:
@@ -1071,18 +1398,77 @@ class PiAgent(BaseInstalledAgent):
         return PurePosixPath(EnvironmentPaths.agent_dir / self._TRAJECTORY_FILENAME)
 
     def get_version_command(self) -> str | None:
-        return "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; pi --version"
+        return PI_RUNTIME_PATH_COMMAND + "; pi --version"
 
-    def parse_version(self, stdout: str) -> str:
+    def parse_version(self, stdout: str | None) -> str:
+        if not stdout:
+            return ""
         for line in stdout.strip().splitlines():
             if line.strip():
                 return line.strip()
         return stdout.strip()
 
+    def _install_system_dependencies_command(self) -> str:
+        if self.benchmark_name == "terminal-bench":
+            return "true"
+        return (
+            "if command -v apt-get >/dev/null 2>&1; then "
+            "apt-get update && apt-get install -y curl ca-certificates git jq ripgrep; "
+            "elif command -v apk >/dev/null 2>&1; then "
+            "apk add --no-cache curl ca-certificates git jq ripgrep nodejs npm bash; "
+            "elif command -v yum >/dev/null 2>&1; then "
+            "yum install -y curl ca-certificates git jq ripgrep; "
+            "fi"
+        )
+
+    def _install_node_and_pi_command(self, version_spec: str) -> str:
+        return (
+            "set -euo pipefail; "
+            f"{PI_RUNTIME_PATH_COMMAND}; "
+            "NODE_MAJOR=$(node -p 'process.versions.node.split(\".\")[0]' 2>/dev/null || echo 0); "
+            "if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 || [ \"$NODE_MAJOR\" -lt 22 ]; then "
+            "  NODE_VERSION=${HARBOR_PI_NODE_VERSION:-22.19.0}; "
+            "  NODE_ARCH=$(uname -m); "
+            "  case \"$NODE_ARCH\" in "
+            "    x86_64|amd64) NODE_ARCH=x64 ;; "
+            "    aarch64|arm64) NODE_ARCH=arm64 ;; "
+            "    *) echo \"unsupported node arch: $NODE_ARCH\" >&2; exit 1 ;; "
+            "  esac; "
+            "  NODE_DIR=\"$HOME/.local/node-v$NODE_VERSION-linux-$NODE_ARCH\"; "
+            "  if [ ! -x \"$NODE_DIR/bin/node\" ]; then "
+            "    mkdir -p \"$HOME/.local\"; "
+            "    NODE_TGZ=\"/tmp/node-v$NODE_VERSION-linux-$NODE_ARCH.tar.gz\"; "
+            "    NODE_URL=\"https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-$NODE_ARCH.tar.gz\"; "
+            "    if command -v curl >/dev/null 2>&1; then "
+            "      curl -fsSL \"$NODE_URL\" -o \"$NODE_TGZ\"; "
+            "    else "
+            "      NODE_URL=\"$NODE_URL\" NODE_TGZ=\"$NODE_TGZ\" python3 - <<'HARBOR_PI_DOWNLOAD_NODE'\n"
+            "import os\n"
+            "import urllib.request\n"
+            "urllib.request.urlretrieve(os.environ['NODE_URL'], os.environ['NODE_TGZ'])\n"
+            "HARBOR_PI_DOWNLOAD_NODE\n"
+            "    fi; "
+            "    rm -rf \"$NODE_DIR\"; "
+            "    NODE_TGZ=\"$NODE_TGZ\" NODE_HOME=\"$HOME/.local\" python3 - <<'HARBOR_PI_EXTRACT_NODE'\n"
+            "import os\n"
+            "import tarfile\n"
+            "with tarfile.open(os.environ['NODE_TGZ'], 'r:gz') as archive:\n"
+            "    archive.extractall(os.environ['NODE_HOME'])\n"
+            "HARBOR_PI_EXTRACT_NODE\n"
+            "    rm -f \"$NODE_TGZ\"; "
+            "  fi; "
+            "  export PATH=\"$NODE_DIR/bin:$PATH\"; "
+            "fi; "
+            "npm install -g @earendil-works/pi-coding-agent"
+            f"{version_spec}; "
+            "pi --version"
+        )
+
     async def install(self, environment: BaseEnvironment) -> None:
         pi_check = await environment.exec(
             command=(
-                "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+                PI_RUNTIME_PATH_COMMAND
+                + "; "
                 "command -v pi >/dev/null 2>&1 && pi --version"
             )
         )
@@ -1090,50 +1476,30 @@ class PiAgent(BaseInstalledAgent):
             parsed_version = self.parse_version(pi_check.stdout)
             if parsed_version:
                 self._version = parsed_version
-            await self.exec_as_root(
-                environment,
-                command=(
-                    "set -e; "
-                    "for bin in node npm npx pi; do "
-                    '  BIN_PATH="$(command -v "$bin" 2>/dev/null || true)"; '
-                    '  if [ -n "$BIN_PATH" ] && [ "$BIN_PATH" != "/usr/local/bin/$bin" ]; then '
-                    '    ln -sf "$BIN_PATH" "/usr/local/bin/$bin"; '
-                    "  fi; "
-                    "done"
-                ),
-            )
-            return
+                await self.exec_as_root(
+                    environment,
+                    command=(
+                        "set -e; "
+                        "for bin in node npm npx pi; do "
+                        '  BIN_PATH="$(command -v "$bin" 2>/dev/null || true)"; '
+                        '  if [ -n "$BIN_PATH" ] && [ "$BIN_PATH" != "/usr/local/bin/$bin" ]; then '
+                        '    ln -sf "$BIN_PATH" "/usr/local/bin/$bin"; '
+                        "  fi; "
+                        "done"
+                    ),
+                )
+                return
 
         await self.exec_as_root(
             environment,
-            command=(
-                "if command -v apt-get >/dev/null 2>&1; then "
-                "apt-get update && apt-get install -y curl ca-certificates git jq ripgrep; "
-                "elif command -v apk >/dev/null 2>&1; then "
-                "apk add --no-cache curl ca-certificates git jq ripgrep nodejs npm bash; "
-                "elif command -v yum >/dev/null 2>&1; then "
-                "yum install -y curl ca-certificates git jq ripgrep; "
-                "fi"
-            ),
+            command=self._install_system_dependencies_command(),
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
 
         version_spec = f"@{self._version}" if self._version else "@latest"
         await self.exec_as_agent(
             environment,
-            command=(
-                "set -euo pipefail; "
-                "if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then "
-                "  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash; "
-                '  export NVM_DIR="$HOME/.nvm"; '
-                '  . "$NVM_DIR/nvm.sh"; '
-                "  nvm install 22; "
-                "  nvm alias default 22; "
-                "fi; "
-                "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-                f"npm install -g @earendil-works/pi-coding-agent{version_spec}; "
-                "pi --version"
-            ),
+            command=self._install_node_and_pi_command(version_spec),
         )
 
         await self.exec_as_root(
@@ -1211,7 +1577,7 @@ class PiAgent(BaseInstalledAgent):
     def _effective_instruction(self, instruction: str, *, use_skills: bool = False) -> str:
         # Keep provider behavior aligned: Pi receives the same task prompt shape
         # for Novita, Tinker, and other OpenAI-compatible backends.
-        prefix = PI_TASK_PREFIX_WITH_SKILLS if use_skills else PI_TASK_PREFIX
+        prefix = _benchmark_task_prefix(self.benchmark_name, use_skills=use_skills)
         return prefix + instruction
 
     @with_prompt_template
@@ -1233,14 +1599,14 @@ class PiAgent(BaseInstalledAgent):
                 pi_skill_pack_b64,
                 pi_skill_source_root,
                 all_pi_skills_count,
-                task_skill_filter,
+                skill_retrieval_filter,
             ) = _pi_skill_pack(task_filter_text)
         else:
             pi_skills = []
             pi_skill_pack_b64 = ""
             pi_skill_source_root = ""
             all_pi_skills_count = 0
-            task_skill_filter = {
+            skill_retrieval_filter = {
                 "task_slug": "",
                 "repo_slug": "",
                 "max_prompt_skills": str(PI_MAX_PROMPT_SKILLS),
@@ -1252,14 +1618,20 @@ class PiAgent(BaseInstalledAgent):
             "prompt": "",
             "selected_entries": [],
         }
-        if self.use_skills and _env_bool("PI_USE_SKILL_HARNESS_MEMORY", True):
+        if (
+            self.use_skills
+            and _env_bool("PI_USE_SKILL_HARNESS_MEMORY", True)
+            and _allow_exact_task_memory()
+        ):
             skill_harness_memory = retrieve_task_memory(task_filter_text)
         effective_use_skills = self.use_skills and (
             has_skill_pack or bool(skill_harness_memory.get("prompt"))
         )
+        base_system_prompt = _benchmark_system_prompt(self.benchmark_name)
         pi_system_prompt = _pi_system_prompt(
             pi_skills,
             str(skill_harness_memory.get("prompt") or ""),
+            base_prompt=base_system_prompt,
         )
         pi_skills_metadata = _pi_skills_metadata(pi_skills)
         pi_skills_setup_commands = (
@@ -1279,6 +1651,8 @@ class PiAgent(BaseInstalledAgent):
             "provider_model": provider_model,
             "provider_base_url": provider_base_url,
             "provider_api": self.provider_api,
+            "benchmark_name": self.benchmark_name,
+            "require_workspace_change": self.require_workspace_change,
             "api_key_env": self.api_key_env,
             "base_url_env": self.base_url_env,
             "model_env": self.model_env,
@@ -1293,7 +1667,7 @@ class PiAgent(BaseInstalledAgent):
             "use_skills": effective_use_skills,
             "skills_count": len(pi_skills),
             "all_skills_count": all_pi_skills_count,
-            "task_skill_filter": task_skill_filter,
+            "skill_retrieval_filter": skill_retrieval_filter,
             "skills": pi_skills_metadata,
             "skill_harness_memory": {
                 key: value
@@ -1343,6 +1717,7 @@ class PiAgent(BaseInstalledAgent):
             f"--tools {shlex.quote(self.tools)} "
             f"--provider {shlex.quote(self.provider_name)} "
             f"--model {shlex.quote(model)} "
+            f"--api-key \"${{{self.api_key_env}}}\" "
             f"--thinking {shlex.quote(self.thinking)} "
             "--system-prompt "
             f"{shlex.quote(pi_system_prompt)} "
@@ -1361,12 +1736,28 @@ class PiAgent(BaseInstalledAgent):
             sanitize_jsonl_command,
             forbidden_assistant_content_guard_command,
             no_tool_call_guard_command,
+            _benchmark_no_diff_rescue_prompt(self.benchmark_name),
         )
+        run_pi_command = no_diff_rescue_loop_command
+        if not self.require_workspace_change:
+            run_pi_command = (
+                "harbor_run_pi_with_provider_retry || exit \"$?\"\n"
+                "if [ -n \"$HARBOR_PYTHON_BIN\" ]; then\n"
+                f"{sanitize_jsonl_command}"
+                f"{forbidden_assistant_content_guard_command}"
+                f"{no_tool_call_guard_command}"
+                "  harbor_update_no_diff_metadata false 0 false\n"
+                "else\n"
+                "  echo '[harbor] python3/python unavailable; skipping Pi trace post-run guards' >&2\n"
+                "fi\n"
+            )
         command = (
             "set -euo pipefail\n"
+            "HARBOR_PYTHON_BIN=\"$(command -v python3 || command -v python || true)\"\n"
+            "export HARBOR_PYTHON_BIN\n"
             "mkdir -p /logs/agent ~/.pi/agent\n"
             f"{'' if has_skill_pack else _pi_no_skills_cleanup_command()}"
-            "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi\n"
+            f"{PI_RUNTIME_PATH_COMMAND}\n"
             f"cat > {shlex.quote(str(instruction_path))} <<'{heredoc}'\n"
             f"{effective_instruction}\n"
             f"{heredoc}\n"
@@ -1383,7 +1774,7 @@ class PiAgent(BaseInstalledAgent):
             f"{workspace_change_check_function_command}"
             f"{no_diff_metadata_update_function_command}"
             f"{pi_retry_command}"
-            f"{no_diff_rescue_loop_command}"
+            f"{run_pi_command}"
             f"{cleanup_transient_logs_command}"
         )
 
@@ -1602,7 +1993,10 @@ class PiAgent(BaseInstalledAgent):
         trajectory: Trajectory | None,
     ) -> dict[str, Any]:
         conversations: list[dict[str, str]] = []
-        system_prompt = str(metadata.get("system_prompt") or PI_SYSTEM_PROMPT)
+        benchmark_name = str(metadata.get("benchmark_name") or self.benchmark_name)
+        system_prompt = str(
+            metadata.get("system_prompt") or _benchmark_system_prompt(benchmark_name)
+        )
         conversations.append({"from": "system", "value": system_prompt})
 
         instruction = self._instruction_text()
@@ -1651,11 +2045,12 @@ class PiAgent(BaseInstalledAgent):
         trace_chars = sum(len(item["value"]) for item in conversations)
         return {
             "id": trajectory.session_id if trajectory else "pi-session",
-            "source": "harbor-swebench-verified",
+            "source": _benchmark_sharegpt_source(benchmark_name),
             "model": metadata.get("model") or self.model_name,
             "conversations": conversations,
             "metadata": {
                 "agent": self.name(),
+                "benchmark_name": _normalize_benchmark_name(benchmark_name),
                 "provider": metadata.get("provider"),
                 "provider_model": metadata.get("provider_model"),
                 "trace_messages": len(conversations),
@@ -1677,14 +2072,37 @@ class PiAgent(BaseInstalledAgent):
         events = self._jsonl_events()
         metadata = self._metadata()
         forbidden_hits = _forbidden_assistant_content_event_hits(events)
+        trace_guard_metadata: dict[str, Any] = {}
         if forbidden_hits:
             preview = "; ".join(
                 f"event {item['event_index']}: {', '.join(item['markers'])}"
                 for item in forbidden_hits[:5]
             )
-            raise RuntimeError(
-                "Pi trace contains forbidden assistant.content markers: " + preview
-            )
+            guard_payload = {
+                "pi_trace_rejected": True,
+                "reason": "forbidden_assistant_content_markers",
+                "preview": preview,
+                "hits": forbidden_hits,
+            }
+            guard_path = self.logs_dir / self._TRACE_GUARD_FILENAME
+            guard_path.write_text(json.dumps(guard_payload, ensure_ascii=False, indent=2))
+            trace_guard_metadata = {
+                "pi_trace_rejected": True,
+                "pi_trace_reject_reason": "forbidden_assistant_content_markers",
+                "pi_trace_reject_preview": preview,
+                "pi_trace_guard_path": str(guard_path),
+                "pi_forbidden_assistant_content_hit_count": len(forbidden_hits),
+            }
+            context.metadata = {
+                **trace_guard_metadata,
+                "pi_system_prompt": metadata.get("system_prompt")
+                or _benchmark_system_prompt(
+                    metadata.get("benchmark_name") or self.benchmark_name
+                ),
+                "benchmark_name": metadata.get("benchmark_name") or self.benchmark_name,
+                "pi_json_event_count": len(events),
+            }
+            return
         trajectory = self._convert_to_trajectory(events, metadata)
 
         if trajectory is not None:
@@ -1706,9 +2124,12 @@ class PiAgent(BaseInstalledAgent):
         context.metadata = {
             "sharegpt_path": str(self.logs_dir / self._SHAREGPT_FILENAME),
             "trajectory_path": str(self.logs_dir / self._TRAJECTORY_FILENAME),
-            "pi_system_prompt": metadata.get("system_prompt") or PI_SYSTEM_PROMPT,
+            "pi_system_prompt": metadata.get("system_prompt")
+            or _benchmark_system_prompt(metadata.get("benchmark_name") or self.benchmark_name),
+            "benchmark_name": metadata.get("benchmark_name") or self.benchmark_name,
             "pi_tool_call_rounds": sharegpt["metadata"]["tool_call_rounds"],
             "pi_json_event_count": len(events),
             "sharegpt_trace_messages": sharegpt["metadata"]["trace_messages"],
             "sharegpt_trace_chars": sharegpt["metadata"]["trace_chars"],
+            **trace_guard_metadata,
         }

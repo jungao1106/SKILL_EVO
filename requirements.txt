@@ -4,3 +4,4 @@ dirhash>=0.5.0
 dockerfile-parse>=2.0.1
 e2b>=1.0.0
 tenacity>=8.2.0
+wandb>=0.17.0
