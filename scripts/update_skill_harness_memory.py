@@ -1935,8 +1935,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--summarize-with-backbone",
+        dest="summarize_with_backbone",
         action="store_true",
-        help="Ask the same provider/model recorded in the trace metadata to produce compact memory summaries.",
+        default=True,
+        help="Ask the same provider/model recorded in the trace metadata to produce compact memory summaries. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-summarize-with-backbone",
+        dest="summarize_with_backbone",
+        action="store_false",
+        help="Disable model summarization and use heuristic task evidence extraction only.",
     )
     parser.add_argument(
         "--llm-max-entries",

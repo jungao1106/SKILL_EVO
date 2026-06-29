@@ -2023,7 +2023,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--result-only", action="store_true")
     parser.add_argument("--force-build", action="store_true")
     parser.add_argument("--keep-sandboxes", action="store_true")
-    parser.add_argument("--summarize-with-backbone", action="store_true")
+    parser.add_argument(
+        "--summarize-with-backbone",
+        dest="summarize_with_backbone",
+        action="store_true",
+        default=True,
+        help="Use the trace-recorded provider/model to summarize task evidence. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-summarize-with-backbone",
+        dest="summarize_with_backbone",
+        action="store_false",
+        help="Disable model summarization and use heuristic task evidence extraction only.",
+    )
     parser.add_argument("--llm-max-tokens", type=int, default=2600)
     parser.add_argument("--skill-resource-max-chars", type=int, default=1200)
     parser.add_argument("--skill-resource-max-total-chars", type=int, default=18000)

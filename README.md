@@ -133,14 +133,14 @@ Higher-level training artifacts are written under
 ```bash
 set -a; . .env; set +a
 python scripts/update_skill_harness_memory.py \
-  --job-dir jobs/smoke_skills_evo_novita_glm51_openai_compat_skills \
-  --summarize-with-backbone
+  --job-dir jobs/smoke_skills_evo_novita_glm51_openai_compat_skills
 ```
 
-The backbone summarizer uses the provider/model recorded in each trace metadata.
+Model summarization is enabled by default. The backbone summarizer uses the provider/model recorded in each trace metadata.
 For each task, it receives a bounded trace digest plus trace-selected
 skill/script resources: task excerpt, tool sequence, touched/edited paths,
 tests, reward, selected SKILL.md excerpts, and selected `*.py`/`*.sh` excerpts.
+Pass `--no-summarize-with-backbone` only for deterministic heuristic extraction.
 The primary output is task evidence; legacy task/stage SKILL.md generation is
 available only through an explicit compatibility flag.
 Set
@@ -168,8 +168,7 @@ python scripts/run_skill_evo_verified.py \
   --dataset swe-bench/swe-bench-verified@2 \
   --provider openai \
   --all-verified \
-  --concurrency 2 \
-  --summarize-with-backbone
+  --concurrency 2
 ```
 
 Small round:
@@ -248,8 +247,7 @@ python scripts/run_swegym_skill_evo_loop.py \
   --provider-base-url https://api.novita.ai/v3/openai \
   --provider-model zai-org/glm-5.1 \
   --provider-api openai-completions \
-  --concurrency 1 \
-  --summarize-with-backbone
+  --concurrency 1
 ```
 
 Artifacts are written under `run_logs/swegym_skill_evo/<run-name>/`. W&B logging
