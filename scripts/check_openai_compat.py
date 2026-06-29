@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from providers import ensure_macaron_attribution_header
 
 
 def _request(path: str, payload: dict) -> dict:
@@ -19,6 +23,9 @@ def _request(path: str, payload: dict) -> dict:
         raise SystemExit("Missing OPENAI_COMPAT_API_KEY")
     if not base_url:
         raise SystemExit("Missing OPENAI_COMPAT_BASE_URL")
+    ensure_macaron_attribution_header(base_url)
+    if "macaron" in base_url.lower() and path.endswith("/chat/completions"):
+        payload.setdefault("reasoning_effort", "none")
 
     request = Request(
         f"{base_url}{path}",
@@ -35,7 +42,7 @@ def _request(path: str, payload: dict) -> dict:
 
 
 def main() -> int:
-    load_dotenv(ROOT / ".env", override=False)
+    load_dotenv(ROOT / ".env", override=True)
     model = os.getenv("OPENAI_COMPAT_MODEL", "")
     provider_api = os.getenv("OPENAI_COMPAT_API", "openai-completions")
     if not model:

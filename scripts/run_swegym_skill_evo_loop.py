@@ -34,6 +34,7 @@ from scripts.run_skill_evo_verified import (
     next_skill_version_id,
     read_active_version,
 )
+from providers import ensure_macaron_attribution_header
 
 
 DEFAULT_SWEGYM_DATASET = ROOT / "data" / "harbor_swegym_500_uniform"
@@ -2245,6 +2246,7 @@ def main() -> None:
         env["OPENAI_COMPAT_MODEL" if args.provider == "openai" else "TINKER_MODEL"] = args.provider_model
     if args.provider_api:
         env["OPENAI_COMPAT_API" if args.provider == "openai" else "TINKER_API"] = args.provider_api
+    ensure_macaron_attribution_header(args.provider_base_url, env)
 
     train_job_name = f"{run_name}_swegym_train_noskills"
     default_train_job_dir = ROOT / "jobs" / train_job_name

@@ -1,6 +1,25 @@
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, MutableMapping
+
+
+MACARON_ATTRIBUTION_HEADER_ENV = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+MACARON_ATTRIBUTION_HEADER_VALUE = "0"
+
+
+def is_macaron_base_url(base_url: str | None) -> bool:
+    return "macaron" in str(base_url or "").lower()
+
+
+def ensure_macaron_attribution_header(
+    base_url: str | None,
+    env: MutableMapping[str, str] | None = None,
+) -> bool:
+    if not is_macaron_base_url(base_url):
+        return False
+    target = os.environ if env is None else env
+    target.setdefault(MACARON_ATTRIBUTION_HEADER_ENV, MACARON_ATTRIBUTION_HEADER_VALUE)
+    return True
 
 
 @dataclass(frozen=True)
@@ -45,12 +64,19 @@ class ProviderSpec:
         return required
 
     def env_mapping(self) -> dict[str, str]:
+        include_macaron_env = ensure_macaron_attribution_header(
+            os.getenv(self.base_url_env)
+        )
         mapping = {
             self.base_url_env: f"${{{self.base_url_env}}}",
             self.model_env: f"${{{self.model_env}}}",
         }
         if self.default_api_key is None or os.environ.get(self.api_key_env):
             mapping[self.api_key_env] = f"${{{self.api_key_env}}}"
+        if include_macaron_env:
+            mapping[MACARON_ATTRIBUTION_HEADER_ENV] = (
+                f"${{{MACARON_ATTRIBUTION_HEADER_ENV}}}"
+            )
         return mapping
 
 
@@ -81,11 +107,21 @@ def _openai_compat_from_env(prefix: str) -> dict[str, Any]:
     compat = _base_openai_compat()
     thinking_as_text_env = f"{prefix}_THINKING_AS_TEXT"
     thinking_format_env = f"{prefix}_THINKING_FORMAT"
+    reasoning_effort_env = f"{prefix}_REASONING_EFFORT"
     if thinking_as_text_env in os.environ:
         compat["requiresThinkingAsText"] = _bool_env(thinking_as_text_env)
     thinking_format = os.getenv(thinking_format_env)
     if thinking_format:
         compat["thinkingFormat"] = thinking_format
+    reasoning_effort = os.getenv(reasoning_effort_env)
+    if reasoning_effort:
+        compat["supportsReasoningEffort"] = True
+        compat["reasoningEffort"] = reasoning_effort
+        compat["defaultReasoningEffort"] = reasoning_effort
+    elif is_macaron_base_url(os.getenv(f"{prefix}_BASE_URL")):
+        compat["supportsReasoningEffort"] = True
+        compat["reasoningEffort"] = "none"
+        compat["defaultReasoningEffort"] = "none"
     return compat
 
 

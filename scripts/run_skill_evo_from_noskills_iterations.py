@@ -35,6 +35,9 @@ def env_prefix(env_file: str) -> str:
         "export OPENAI_COMPAT_API=openai-completions; "
         'export OPENAI_COMPAT_CONTEXT_WINDOW="${NOVITA_CONTEXT_WINDOW:-128000}"; '
         'export OPENAI_COMPAT_MAX_TOKENS="${NOVITA_MAX_TOKENS:-32000}"; '
+        'case "$OPENAI_COMPAT_BASE_URL" in *macaron*) '
+        'export CLAUDE_CODE_ATTRIBUTION_HEADER="${CLAUDE_CODE_ATTRIBUTION_HEADER:-0}";; '
+        "esac; "
     )
 
 

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import statistics
+import sys
 import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
@@ -19,6 +20,11 @@ except ImportError:  # pragma: no cover - local env convenience only
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from providers import ensure_macaron_attribution_header
+
 DEFAULT_OUT = ROOT / "analysis" / "skill_harness_memory.json"
 DEFAULT_TASK_SKILL_DIR = ROOT / "analysis" / "task_evidence"
 DEFAULT_GENERATED_SKILL_DIR = ROOT / "skills" / "accepted"
@@ -636,6 +642,7 @@ def _call_openai_compatible(
     max_tokens: int,
 ) -> str:
     base_url = base_url.rstrip("/")
+    ensure_macaron_attribution_header(base_url)
     if provider_api == "openai-responses":
         payload = {
             "model": model,
@@ -651,6 +658,8 @@ def _call_openai_compatible(
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
+        if "macaron" in base_url.lower():
+            payload["reasoning_effort"] = "none"
         path = "/chat/completions"
     request = urllib.request.Request(
         base_url + path,

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from providers import ProviderSpec, resolve_provider
+from providers import ProviderSpec, ensure_macaron_attribution_header, resolve_provider
 from scripts.run_benchmark import _trial_reward_summary
 from scripts.tbench_runtime import ensure_docker_compose, patch_terminal_bench_runtime
 
@@ -523,6 +523,7 @@ def _apply_provider_overrides(args: argparse.Namespace) -> None:
         os.environ[provider.provider_api_env] = args.provider_api
     if provider.default_api_key and not os.environ.get(provider.api_key_env):
         os.environ[provider.api_key_env] = provider.default_api_key
+    ensure_macaron_attribution_header(os.getenv(provider.base_url_env))
 
 
 def main() -> None:

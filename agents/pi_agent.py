@@ -30,6 +30,12 @@ from agents.skill_harness_memory import (
     memory_path_from_env,
     retrieve_task_memory,
 )
+from providers import (
+    MACARON_ATTRIBUTION_HEADER_ENV,
+    MACARON_ATTRIBUTION_HEADER_VALUE,
+    ensure_macaron_attribution_header,
+    is_macaron_base_url,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +47,7 @@ PI_SKILL_PACK_TAR_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz")
 PI_SKILL_PACK_EXCLUDE_DIRS = {"benchmark-sharded-concurrency"}
 PI_SKILL_PACK_CHUNK_SIZE = 24_000
 PI_MAX_PROMPT_SKILLS = 8
+PI_MACARON_PROXY_PORT = 18080
 PI_RUNTIME_PATH_COMMAND = (
     "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
     'for HARBOR_PI_NODE_BIN in "$HOME"/.local/node-v*-linux-*/bin; do '
@@ -826,6 +833,222 @@ def _safe_shell_json(value: dict[str, Any]) -> str:
     return shlex.quote(json.dumps(value, ensure_ascii=False, indent=2))
 
 
+def _macaron_proxy_base_url(base_url: str) -> str:
+    match = re.match(
+        r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+(?P<path>/.*)?$",
+        base_url.rstrip(),
+    )
+    path = (match.group("path") if match else "") or ""
+    return f"http://127.0.0.1:{PI_MACARON_PROXY_PORT}{path.rstrip('/')}"
+
+
+def _macaron_reasoning_proxy_command(base_url: str, api_key_env: str) -> str:
+    proxy_script = r'''
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("HARBOR_MACARON_PROXY_PORT", "18080"))
+UPSTREAM_BASE = os.environ["HARBOR_MACARON_UPSTREAM_BASE"].rstrip("/")
+UPSTREAM_API_KEY = os.environ.get("HARBOR_MACARON_UPSTREAM_API_KEY", "")
+ATTRIBUTION_HEADER = os.environ.get("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
+UPSTREAM_PATH_PREFIX = urllib.parse.urlsplit(UPSTREAM_BASE).path.rstrip("/")
+HOP_BY_HOP_HEADERS = {
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+def upstream_url(request_path: str) -> str:
+    parsed = urllib.parse.urlsplit(request_path)
+    path = parsed.path or "/"
+    if UPSTREAM_PATH_PREFIX and (
+        path == UPSTREAM_PATH_PREFIX or path.startswith(UPSTREAM_PATH_PREFIX + "/")
+    ):
+        path = path[len(UPSTREAM_PATH_PREFIX):] or "/"
+    url = UPSTREAM_BASE + path
+    if parsed.query:
+        url += "?" + parsed.query
+    return url
+
+
+def rewrite_body(path: str, body: bytes, content_type: str):
+    if not path.endswith("/chat/completions"):
+        return body, False
+    if "application/json" not in content_type.lower():
+        return body, False
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return body, False
+    if isinstance(payload, dict):
+        payload["reasoning_effort"] = "none"
+        body = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return body, True
+    return body, False
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[harbor-macaron-proxy] " + (fmt % args) + "\n")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "authorization,content-type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.end_headers()
+
+    def do_GET(self):
+        self._proxy()
+
+    def do_POST(self):
+        self._proxy()
+
+    def _proxy(self):
+        body = b""
+        injected_reasoning_effort = False
+        if self.command in {"POST", "PUT", "PATCH"}:
+            try:
+                length = int(self.headers.get("content-length") or "0")
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length) if length else b""
+            body, injected_reasoning_effort = rewrite_body(
+                urllib.parse.urlsplit(self.path).path,
+                body,
+                self.headers.get("content-type", ""),
+            )
+
+        headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in HOP_BY_HOP_HEADERS
+        }
+        if UPSTREAM_API_KEY:
+            headers["Authorization"] = "Bearer " + UPSTREAM_API_KEY
+        headers["CLAUDE_CODE_ATTRIBUTION_HEADER"] = ATTRIBUTION_HEADER
+        if body:
+            headers["Content-Length"] = str(len(body))
+
+        request = urllib.request.Request(
+            upstream_url(self.path),
+            data=body if self.command in {"POST", "PUT", "PATCH"} else None,
+            headers=headers,
+            method=self.command,
+        )
+        sys.stderr.write(
+            "[harbor-macaron-proxy] "
+            f"{self.command} {urllib.parse.urlsplit(self.path).path} "
+            f"reasoning_effort_none={str(injected_reasoning_effort).lower()}\n"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=900) as response:
+                self.send_response(response.status)
+                content_type = response.headers.get("content-type", "")
+                for key, value in response.headers.items():
+                    if key.lower() in HOP_BY_HOP_HEADERS:
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                if "text/event-stream" in content_type.lower():
+                    while True:
+                        line = response.readline()
+                        if not line:
+                            break
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                else:
+                    while True:
+                        chunk = response.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            self.send_response(exc.code)
+            for key, value in exc.headers.items():
+                if key.lower() in HOP_BY_HOP_HEADERS:
+                    continue
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as exc:
+            payload = json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8")
+            self.send_response(502)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+
+server = ThreadingHTTPServer((HOST, PORT), Handler)
+sys.stderr.write(
+    f"[harbor-macaron-proxy] listening on {HOST}:{PORT}, upstream={UPSTREAM_BASE}\n"
+)
+server.serve_forever()
+'''.strip()
+    return (
+        "cat > /tmp/harbor-macaron-openai-proxy.py <<'HARBOR_MACARON_PROXY_PY'\n"
+        f"{proxy_script}\n"
+        "HARBOR_MACARON_PROXY_PY\n"
+        f"export HARBOR_MACARON_UPSTREAM_BASE={shlex.quote(base_url.rstrip('/'))}\n"
+        f"export HARBOR_MACARON_UPSTREAM_API_KEY=\"${{{api_key_env}}}\"\n"
+        f"export HARBOR_MACARON_PROXY_PORT={PI_MACARON_PROXY_PORT}\n"
+        f"export {MACARON_ATTRIBUTION_HEADER_ENV}="
+        f"{shlex.quote(MACARON_ATTRIBUTION_HEADER_VALUE)}\n"
+        'if [ -z "${HARBOR_PYTHON_BIN:-}" ]; then\n'
+        "  echo '[harbor] python3/python unavailable; Macaron reasoning proxy cannot start' >&2\n"
+        "  exit 98\n"
+        "fi\n"
+        '"$HARBOR_PYTHON_BIN" /tmp/harbor-macaron-openai-proxy.py '
+        "> /tmp/harbor-macaron-openai-proxy.log 2>&1 &\n"
+        "HARBOR_MACARON_PROXY_PID=$!\n"
+        "export HARBOR_MACARON_PROXY_PID\n"
+        "trap 'cp /tmp/harbor-macaron-openai-proxy.log "
+        "/logs/agent/macaron-openai-proxy.log 2>/dev/null || true; "
+        "kill \"${HARBOR_MACARON_PROXY_PID:-}\" 2>/dev/null || true' EXIT\n"
+        "HARBOR_MACARON_PROXY_READY=0\n"
+        "for HARBOR_MACARON_PROXY_WAIT in $(seq 1 100); do\n"
+        "  if \"$HARBOR_PYTHON_BIN\" - <<'HARBOR_MACARON_PROXY_READY_PY'\n"
+        "import os, socket\n"
+        "with socket.create_connection(('127.0.0.1', int(os.environ['HARBOR_MACARON_PROXY_PORT'])), timeout=0.2):\n"
+        "    pass\n"
+        "HARBOR_MACARON_PROXY_READY_PY\n"
+        "  then HARBOR_MACARON_PROXY_READY=1; break; fi\n"
+        "  if ! kill -0 \"$HARBOR_MACARON_PROXY_PID\" 2>/dev/null; then\n"
+        "    cat /tmp/harbor-macaron-openai-proxy.log >&2 || true\n"
+        "    exit 98\n"
+        "  fi\n"
+        "  sleep 0.1\n"
+        "done\n"
+        "if [ \"$HARBOR_MACARON_PROXY_READY\" != \"1\" ]; then\n"
+        "  cat /tmp/harbor-macaron-openai-proxy.log >&2 || true\n"
+        "  exit 98\n"
+        "fi\n"
+    )
+
+
 def _sanitize_pi_event(event: dict[str, Any]) -> dict[str, Any]:
     """Drop high-volume transient fields from Pi JSONL without changing semantics.
 
@@ -1527,6 +1750,7 @@ class PiAgent(BaseInstalledAgent):
             )
         env = {name: os.environ[name] for name in required}
         env[self.api_key_env] = os.environ.get(self.api_key_env) or self.default_api_key or ""
+        ensure_macaron_attribution_header(env[self.base_url_env], env)
         return env
 
     def _models_config(self, env: dict[str, str]) -> dict[str, Any]:
@@ -1590,8 +1814,16 @@ class PiAgent(BaseInstalledAgent):
         env = self._required_env()
         provider_model = env[self.model_env]
         provider_base_url = env[self.base_url_env]
+        use_macaron_proxy = is_macaron_base_url(provider_base_url)
+        effective_provider_base_url = (
+            _macaron_proxy_base_url(provider_base_url)
+            if use_macaron_proxy
+            else provider_base_url
+        )
+        models_env = dict(env)
+        models_env[self.base_url_env] = effective_provider_base_url
         model = self.model_name or f"{self.provider_name}/{provider_model}"
-        models_config = self._models_config(env)
+        models_config = self._models_config(models_env)
         task_filter_text = _task_filter_text(instruction, environment)
         if self.use_skills:
             (
@@ -1650,7 +1882,9 @@ class PiAgent(BaseInstalledAgent):
             "model": model,
             "provider_model": provider_model,
             "provider_base_url": provider_base_url,
+            "effective_provider_base_url": effective_provider_base_url,
             "provider_api": self.provider_api,
+            "macaron_reasoning_proxy": use_macaron_proxy,
             "benchmark_name": self.benchmark_name,
             "require_workspace_change": self.require_workspace_change,
             "api_key_env": self.api_key_env,
@@ -1700,6 +1934,11 @@ class PiAgent(BaseInstalledAgent):
         )
         no_diff_metadata_update_function_command = (
             _no_diff_metadata_update_function_command(metadata_path)
+        )
+        macaron_proxy_command = (
+            _macaron_reasoning_proxy_command(provider_base_url, self.api_key_env)
+            if use_macaron_proxy
+            else ""
         )
         cleanup_transient_logs_command = ""
         if self.result_only:
@@ -1756,6 +1995,7 @@ class PiAgent(BaseInstalledAgent):
             "HARBOR_PYTHON_BIN=\"$(command -v python3 || command -v python || true)\"\n"
             "export HARBOR_PYTHON_BIN\n"
             "mkdir -p /logs/agent ~/.pi/agent\n"
+            f"{macaron_proxy_command}"
             f"{'' if has_skill_pack else _pi_no_skills_cleanup_command()}"
             f"{PI_RUNTIME_PATH_COMMAND}\n"
             f"cat > {shlex.quote(str(instruction_path))} <<'{heredoc}'\n"
