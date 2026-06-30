@@ -11,6 +11,14 @@ def is_macaron_base_url(base_url: str | None) -> bool:
     return "macaron" in str(base_url or "").lower()
 
 
+def is_novita_base_url(base_url: str | None) -> bool:
+    return "novita" in str(base_url or "").lower()
+
+
+def requires_reasoning_effort_none(base_url: str | None) -> bool:
+    return is_macaron_base_url(base_url) or is_novita_base_url(base_url)
+
+
 def ensure_macaron_attribution_header(
     base_url: str | None,
     env: MutableMapping[str, str] | None = None,
@@ -19,6 +27,20 @@ def ensure_macaron_attribution_header(
         return False
     target = os.environ if env is None else env
     target.setdefault(MACARON_ATTRIBUTION_HEADER_ENV, MACARON_ATTRIBUTION_HEADER_VALUE)
+    return True
+
+
+def ensure_reasoning_effort_none(
+    base_url: str | None,
+    env: MutableMapping[str, str] | None = None,
+    *,
+    env_prefix: str = "OPENAI_COMPAT",
+) -> bool:
+    if not requires_reasoning_effort_none(base_url):
+        return False
+    target = os.environ if env is None else env
+    target.setdefault(f"{env_prefix}_REASONING_EFFORT", "none")
+    target.setdefault(f"{env_prefix}_ENABLE_THINKING", "false")
     return True
 
 
@@ -108,20 +130,26 @@ def _openai_compat_from_env(prefix: str) -> dict[str, Any]:
     thinking_as_text_env = f"{prefix}_THINKING_AS_TEXT"
     thinking_format_env = f"{prefix}_THINKING_FORMAT"
     reasoning_effort_env = f"{prefix}_REASONING_EFFORT"
+    enable_thinking_env = f"{prefix}_ENABLE_THINKING"
     if thinking_as_text_env in os.environ:
         compat["requiresThinkingAsText"] = _bool_env(thinking_as_text_env)
     thinking_format = os.getenv(thinking_format_env)
     if thinking_format:
         compat["thinkingFormat"] = thinking_format
     reasoning_effort = os.getenv(reasoning_effort_env)
+    enable_thinking = os.getenv(enable_thinking_env)
     if reasoning_effort:
         compat["supportsReasoningEffort"] = True
         compat["reasoningEffort"] = reasoning_effort
         compat["defaultReasoningEffort"] = reasoning_effort
-    elif is_macaron_base_url(os.getenv(f"{prefix}_BASE_URL")):
+    elif requires_reasoning_effort_none(os.getenv(f"{prefix}_BASE_URL")):
         compat["supportsReasoningEffort"] = True
         compat["reasoningEffort"] = "none"
         compat["defaultReasoningEffort"] = "none"
+    if enable_thinking is not None:
+        compat["enableThinking"] = _bool_env(enable_thinking_env)
+    elif requires_reasoning_effort_none(os.getenv(f"{prefix}_BASE_URL")):
+        compat["enableThinking"] = False
     return compat
 
 

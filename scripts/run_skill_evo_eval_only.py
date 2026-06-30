@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import compare_jobs, write_report
-from providers import ensure_macaron_attribution_header
+from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
 
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
@@ -258,6 +258,11 @@ def main() -> None:
     env["PI_USE_SKILL_HARNESS_MEMORY"] = "false"
     env["PI_SKILL_RETRIEVAL_SCOPE"] = "transfer"
     ensure_macaron_attribution_header(args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"), env)
+    ensure_reasoning_effort_none(
+        args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"),
+        env,
+        env_prefix="OPENAI_COMPAT",
+    )
     if args.memory_path:
         env["PI_SKILL_HARNESS_MEMORY_PATH"] = str(args.memory_path.expanduser().resolve())
 

@@ -1,0 +1,585 @@
+\documentclass{article}
+
+\usepackage{iclr2026_conference,times}
+
+\input{math_commands.tex}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\newcommand{\method}{HSE}
+\newcommand{\skillrepo}{SkillRepo}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\tbd}{\textcolor{red}{TBD}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+\title{Verifier-Grounded Hierarchical Skill Evolution\\for Software Engineering Agents}
+
+% Anonymous submission. Uncomment \iclrfinalcopy only for camera-ready.
+\author{Anonymous authors}
+
+% \iclrfinalcopy
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Software-engineering agents leave behind rich traces: issue interpretations, file
+searches, edits, tests, failures, and recoveries. Turning these traces into
+reusable knowledge is attractive, but raw trace retrieval risks task leakage and
+one-shot summaries can introduce harmful or over-specific instructions. We
+propose \method{}, a verifier-grounded framework that evolves external textual
+skills for frozen coding agents. \method{} separates single-task evidence from
+reusable skills, promotes evidence through a hierarchy of repo-level and
+cross-repo failure-mode skills, and trains separate Skill Writer and Skill
+Evaluator policies under a fixed harness policy. During SWEGym training, the
+official verifier is used only for outcome supervision, evaluator calibration,
+and validation gates. During downstream evaluation, verifier labels are not
+available for updating memory. We describe a strict no-exact-transfer protocol
+and an online test-time evolution protocol over a $2{\times}2$ executor matrix:
+GLM-5.2 and GPT-5.5, each run in Pi and Claude-style agent harnesses. This
+matrix lets us test model transfer, harness transfer, and joint model+harness
+transfer. Final resolved rates and ablations are intentionally left blank in
+this draft pending the full experimental run.
+\end{abstract}
+
+\section{Introduction}
+
+Large language model agents can now repair real software bugs by reading a
+repository, editing code, and running tests. Yet each successful or failed
+attempt produces information that is usually discarded after the benchmark
+trial. A natural next step is to convert agent trajectories into external
+skills: compact textual procedures that tell future agents how to localize,
+edit, validate, or recover on similar software tasks.
+
+This conversion is not straightforward. A raw trajectory can contain
+task-specific paths, accidental patch shapes, transient environment errors, and
+implicit information about the benchmark instance. If such details are injected
+into a future prompt, the system may improve by memorization rather than by
+transfer. Conversely, a generic summary such as ``run focused tests'' is often
+too weak to change behavior. The central question of this paper is therefore:
+\emph{how can a coding-agent system learn reusable software-engineering skills
+from training-time verifier feedback without using test-time verifier feedback
+or leaking task-specific solutions?}
+
+We propose \method{}: \textbf{hierarchical skill evolution}. The key design
+choice is to not call every trace artifact a skill. A task attempt first becomes
+\emph{task evidence}: a structured record of public signals such as touched
+paths, edited files, tests, diagnostics, selected skills, failure signatures,
+and verifier outcomes. A Skill Writer policy then drafts candidate repo-level
+skills only from multiple task evidence records in the same repository. A
+candidate failure-mode skill is drafted only from repeated patterns across
+repositories, such as localization drift, weak validation, no-diff exits, or
+timeout recovery. A Skill Evaluator policy scores each candidate for utility,
+support, and risk, and decides whether to accept, reject, revise, or keep it as
+memory-only evidence.
+
+The framework is built around a hard information boundary. SWEGym verifiers are
+available during training, so we use them to label outcomes, calibrate the
+evaluator, and gate candidate skill states on held-out validation tasks. On
+SWE-Bench Verified and other downstream benchmarks, no official verifier label,
+hidden test result, gold patch, or future task outcome may influence skill
+updates. This makes the resulting protocol suitable for testing whether
+SWEGym-trained skills and writer/evaluator policies transfer to new software
+tasks.
+
+Our contributions are:
+\begin{itemize}
+    \item We formulate software-agent skill evolution as a hierarchical
+    evidence-gated process that separates task evidence, repo-level skills,
+    cross-repo failure-mode skills, and writer/evaluator policies.
+    \item We introduce a verifier-boundary protocol: training may use SWEGym
+    verifier outcomes, while downstream test-time evolution is gated only by a
+    frozen evaluator over public trace signals.
+    \item We give an implementation for the Pi coding-agent harness with an
+    OpenAI-compatible model interface, Harbor/E2B execution, versioned skill
+    archives, promotion logs, validation gates, and deterministic evaluator
+    shells that can be replaced by learned policies.
+    \item We specify the ICLR experimental protocol for GLM-5.2 and GPT-5.5 in
+    both Pi and Claude-style harnesses, including model-transfer and
+    harness-transfer tests, with exact-task memory reported only as an
+    upper-bound adaptation setting.
+\end{itemize}
+
+\section{Problem Setting}
+
+\paragraph{Tasks and agents.}
+Let $x$ be a software-engineering task consisting of a natural-language issue,
+a repository snapshot, and a public execution environment. A frozen coding
+agent $M$ interacts with a harness $H$ by issuing file reads, searches, edits,
+shell commands, and final answers. A trajectory $\tau$ contains the observable
+history: prompts, tool calls, outputs, diffs, public tests, and runtime
+diagnostics.
+
+\paragraph{Training-time verifier.}
+During SWEGym training we have a verifier $V$ that maps a completed trial to a
+reward $r \in \{0,1\}$ or a diagnostic outcome. We use $V$ as supervision for
+training-time labels and validation gates, but not as a writer of skills and not
+as a provider of hidden solutions. At downstream test time, $V$ is unavailable
+for memory updates. It is used only after the protocol completes to report final
+benchmark scores.
+
+\paragraph{Skill state.}
+The external state $S$ contains structured evidence and accepted skills. We use
+four deployed categories:
+\begin{itemize}
+    \item \textbf{Task evidence} records what happened on one task. It is not a
+    reusable skill.
+    \item \textbf{Repo skills} summarize repeated, evidence-gated procedures
+    within a repository.
+    \item \textbf{Failure-mode skills} summarize cross-repo recovery strategies
+    for repeated agent failures.
+    \item \textbf{General seed skills} provide weak process priors for common
+    stages such as reproduce, localize, edit, validate, and recover.
+\end{itemize}
+The writer policy $\pi_w$ drafts evidence summaries and candidate skills. The
+evaluator policy $\pi_e$ assigns decisions, proxy rewards, confidence, and risk
+flags.
+
+\section{Hierarchical Skill Evolution}
+
+\subsection{State Hierarchy}
+
+\method{} uses different update clocks for different abstraction levels. Lower
+levels can change quickly because they affect only local evidence. Higher levels
+change slowly because they can influence future tasks.
+
+\begin{table}[t]
+\caption{Skill-evolution objects and update clocks. Main experiments freeze all
+training-derived transferable state before downstream evaluation.}
+\label{tab:levels}
+\begin{center}
+\begin{tabular}{L{0.12\linewidth} L{0.25\linewidth} L{0.23\linewidth} L{0.25\linewidth}}
+\toprule
+Level & Object & Update clock & Evidence requirement \\
+\midrule
+L0 & Rollout trace & Every task attempt & Public trajectory and runtime outputs \\
+L1 & Task evidence & Every task attempt & One task trace; verifier label during training only \\
+L2 & Repo skill candidate & Same-repo batch & Multiple task evidence records from one repo \\
+L3 & Failure-mode skill candidate & Cross-repo trigger & Repeated repo-level summaries across repos \\
+L4 & Skill Writer policy & Slow policy window & Aggregated accepted/rejected histories \\
+L5 & Skill Evaluator policy & Slow policy window & Verifier-calibrated false accepts/rejects \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+Task evidence stores public fields such as task id, repo, problem summary,
+reward, previous reward, case label, exception type, selected skills, touched
+paths, edited paths, public test commands, failure signature, and diagnostic
+signals. It may feed higher-level aggregation, but it is not rendered as a
+reusable \texttt{SKILL.md} artifact by default.
+
+\subsection{Writer and Evaluator}
+
+The writer policy produces structured candidates. For a repo candidate, the
+writer receives a cluster of same-repo task evidence and emits the fields
+name, trigger, evidence gate, actions, validation hint, abort condition, and
+support summary. For a failure-mode candidate, it receives a cross-repo cluster
+and emits a process-level recovery skill with a failure signature, trigger,
+actions, stop condition, and support summary.
+\[
+c_{\mathrm{repo}} = f_w(E_{\mathrm{repo}}), \qquad
+c_{\mathrm{fail}} = f_w(E_{\mathrm{cross\text{-}repo}}).
+\]
+Both candidate types are deliberately structured so the evaluator can inspect
+their triggers, evidence support, actions, and risks before deployment.
+
+The evaluator implements the boundary between candidate generation and deployed
+skills:
+\[
+\pi_e(c, E) \rightarrow
+(d, \hat r, \rho, z),
+\]
+where $d \in \{\textsc{accept}, \textsc{reject}, \textsc{revise},
+\textsc{memory-only}\}$, $\hat r$ is a proxy reward, $\rho$ is confidence, and
+$z$ is a set of risk flags. Hard safety risks include hidden verifier details,
+oracle patches, exact patches, task-id memorization, and private sandbox paths.
+Repo candidates require repeated same-repo support; failure-mode candidates
+require support from multiple distinct repositories.
+
+Our current implementation uses a deterministic evaluator shell with explicit
+thresholds and risk checks. This is a deliberate interface choice: it makes the
+contract auditable now, while allowing the same function call to be replaced by
+a learned evaluator policy trained on SWEGym calibration events.
+
+\begin{figure}[t]
+\begin{center}
+\fbox{\begin{minipage}{0.93\linewidth}
+\small
+\textbf{Agent trace}
+$\rightarrow$ \textbf{Task evidence}
+$\rightarrow$ \textbf{Repo candidate}
+$\rightarrow$ \textbf{Failure-mode skill}.
+The trace contains tool calls, edits, tests, and diagnostics. Task evidence is
+a public structured record, not a deployed transferable skill. Repo candidates
+summarize same-repo repeated paths, tests, and failure signals. Failure-mode
+skills summarize cross-repo recovery rules with triggers and stop conditions.
+\vspace{0.5em}
+\textbf{Evaluator gate:} each promotion step must pass support thresholds,
+risk checks, and validation constraints before it becomes active in the
+\skillrepo{}.
+\end{minipage}}
+\end{center}
+\caption{\textbf{AI-friendly caption:} A left-to-right pipeline showing how a
+software-engineering agent trace is converted into task evidence, then into a
+repo-level candidate, then into a cross-repo failure-mode skill. The visual
+should emphasize that task evidence is not directly deployed as a transferable
+skill; every upward arrow is guarded by an evaluator gate that checks support,
+risk, and validation.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Fixed Harness Policy}
+
+The learned writer and evaluator are not allowed to invent their own reward
+labels, update clocks, or promotion budgets. A fixed harness policy maps
+verifier transitions and runtime diagnostics to case labels:
+\begin{itemize}
+    \item \textbf{Strong positive}: previous attempt failed and current attempt
+    passed.
+    \item \textbf{Weak positive}: current attempt passed without a paired
+    improvement, or a previously passing attempt remains passing.
+    \item \textbf{Strong negative}: previous attempt passed and current attempt
+    failed.
+    \item \textbf{Weak negative}: current attempt failed without a paired
+    regression.
+    \item \textbf{Diagnostic}: missing reward, timeout, setup error, verifier
+    error, sandbox failure, or provider/runtime failure.
+\end{itemize}
+
+Cold-start solved traces are weak positives; unsolved traces are weak
+negatives unless a diagnostic is present. Strong positives can increase support
+for a candidate, but cannot directly create a global skill. Strong negatives
+prioritize rollback, trigger narrowing, and evaluator false-accept penalties.
+Diagnostics are kept out of semantic edit skills and are used only for runtime
+or recover/validate safeguards.
+
+\subsection{Training Loop}
+
+The training loop alternates between rollouts, evidence extraction, candidate
+generation, evaluator gating, and validation.
+
+\begin{figure}[t]
+\begin{center}
+\fbox{\begin{minipage}{0.94\linewidth}
+\small
+\textbf{Training on SWEGym:}
+\[
+\text{rollout} \rightarrow \text{task evidence} \rightarrow
+\text{repo/failure candidates} \rightarrow
+\pi_e\text{ gate} \rightarrow
+\text{validation gate}.
+\]
+The SWEGym verifier labels outcomes and validates candidate skill states.
+
+\vspace{0.5em}
+\textbf{Downstream evaluation:}
+\[
+\text{frozen }(\pi_w,\pi_e,\text{general/failure skills})
+\rightarrow \text{agent rollout} \rightarrow
+\text{public evidence only}.
+\]
+No official downstream verifier label, hidden test, gold patch, or future task
+outcome is used for updating skills.
+\end{minipage}}
+\end{center}
+\caption{\textbf{AI-friendly caption:} A two-lane diagram contrasting training
+and downstream evaluation. The top lane is SWEGym training, where verifier
+labels supervise case labels, evaluator calibration, and validation gates. The
+bottom lane is downstream testing, where the writer, evaluator, and transferable
+skills are frozen and only public trace signals can be used. The verifier icon
+must appear only in the training lane and final reporting, not in the update
+path for downstream tests.}
+\label{fig:verifier-boundary}
+\end{figure}
+
+\noindent\textbf{Default update hyperparameters.}
+Unless otherwise stated, repo updates use same-repo batches of 5 task evidence
+events, failure-mode updates trigger every 4 repo updates, failure-mode
+promotion requires at least 3 supporting repositories, and policy updates are
+limited to at most 3 bullet edits per policy window. Each repo batch emits at
+most one repo candidate by default; each failure-mode trigger promotes at most
+two accepted failure-mode skills. These values match the current harness
+defaults and are treated as fixed protocol hyperparameters.
+
+\subsection{Validation Gate}
+
+Candidate skill states are evaluated on a repo-isolated SWEGym validation set.
+We compute:
+\[
+\mathrm{effective\_resolved\_rate}
+=
+\frac{\mathrm{resolved\ valid\ trials}}{\mathrm{effective\ valid\ trials}},
+\quad
+\mathrm{diagnostic\_rate}
+=
+\frac{\mathrm{diagnostic\ trials}}{\mathrm{total\ trials}}.
+\]
+A candidate state is accepted only if it has enough effective validation trials,
+does not exceed the diagnostic-rate threshold, and does not regress relative to
+the current accepted state beyond a fixed tolerance. Otherwise, the candidate
+version is rejected or rolled back, and the decision is logged.
+
+\section{Experiments}
+
+This section specifies the experiment settings. Numeric results are reserved
+until the full ICLR run finishes.
+
+\subsection{Datasets}
+
+\paragraph{SWEGym training and validation.}
+We use a 500-task SWEGym subset as the evolution source. The split is
+repo-isolated: repositories selected for validation are held out from the
+training split, with the validation size chosen closest to 5\% of the subset.
+In the planned main run this yields 474 training tasks and 26 validation tasks.
+The SWEGym verifier is available only in this phase.
+
+\paragraph{SWE-Bench Verified final evaluation.}
+The primary downstream benchmark is SWE-Bench Verified. No exact SWE-Bench task
+trajectory, official verifier label, hidden test output, or gold patch is used
+to update skills during the evaluated run. The official verifier is invoked
+only after the run to report resolved count and resolved rate.
+
+\paragraph{Optional out-of-distribution evaluation.}
+We will also report transfer on SWE-Bench Pro and Terminal-Bench 2.0 when the
+runs are complete. Terminal-Bench uses the same Harbor/E2B execution wrapper
+but a terminal-task prompt.
+
+\subsection{Models and Harnesses}
+
+\paragraph{Executor matrix.}
+We evaluate two executor models, GLM-5.2 (\texttt{glm52}) and GPT-5.5, each
+under two agent harnesses: Pi Coding Agent and a Claude-style coding-agent
+harness. All four cells use the same Harbor/E2B sandbox interface, benchmark
+task selection, task ordering, timeout budget, validation gate, and
+no-test-verifier update rule. Where model APIs differ, we use the same
+OpenAI-compatible provider abstraction and record the endpoint type in the run
+config.
+
+\paragraph{Model and harness transfer.}
+The $2{\times}2$ matrix lets us distinguish three transfer questions. First,
+\textbf{model transfer}: skills and writer/evaluator policies trained with one
+model are evaluated with the other model under the same harness
+(GLM-5.2$\rightarrow$GPT-5.5 and GPT-5.5$\rightarrow$GLM-5.2). Second,
+\textbf{harness transfer}: skills trained under one harness are evaluated under
+the other harness with the same model (Pi$\rightarrow$Claude-style and
+Claude-style$\rightarrow$Pi). Third, \textbf{joint transfer}: both the model and
+harness change between evolution and evaluation. We report these separately
+from within-cell evolution, where train and test use the same model/harness
+cell.
+
+\paragraph{Tools and controls.}
+The agent tool surface is fixed within each harness family and exposes the same
+software-engineering operations: read, write, edit, bash, grep, find, and ls.
+Prompts may differ between Pi and Claude-style harnesses, but task order,
+sandbox resources, retry policy, and acceptance rules are held fixed. Each run
+logs the active skill version, source model/harness cell, target model/harness
+cell, selected skills, runtime diagnostics, verifier reports, and score
+reports.
+
+\paragraph{Execution controls.}
+All compared settings use the same dataset version, task order, sandbox
+resources, agent timeout, retry policy, and concurrency within a model/harness
+pair. We log job directories, configs, active skill versions, selected skills,
+tool traces, runtime diagnostics, verifier reports, and score reports.
+
+\subsection{Protocols}
+
+\begin{table}[t]
+\caption{Main evaluation protocols. Exact-task skills are reported only as an
+adaptation upper bound and are not used to support transfer claims.}
+\label{tab:protocols}
+\begin{center}
+\begin{tabular}{L{0.25\linewidth} C{0.15\linewidth} C{0.16\linewidth} L{0.32\linewidth}}
+\toprule
+Setting & Uses exact task memory? & Updates during test? & Purpose \\
+\midrule
+No Skills & No & No & Frozen-agent baseline \\
+Public SWE Skills & No & No & Static public skill baseline \\
+Raw Trace Retrieval & No & No & Tests whether raw trajectory memory is enough \\
+One-shot StageSkill & No & No & Tests ungated trace-to-skill summarization \\
+Frozen Failure Skills & No & No & Tests SWEGym-trained transferable failure-mode skills \\
+Frozen Writer/Evaluator + Online Repo Skills & No & Yes, public evidence only & Tests verifier-free online evolution \\
+Same-budget Retry & No & No structured skills & Controls for extra attempts or compute \\
+Exact Task Skills & Yes & Optional & Upper bound/adaptation only \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Metrics}
+
+The primary metric is resolved rate. We also report resolved-count deltas,
+paired transition counts ($0{\rightarrow}1$, $1{\rightarrow}0$,
+$1{\rightarrow}1$, $0{\rightarrow}0$), diagnostic rate, no-diff rate, timeout
+rate, weak-validation rate, localization-drift rate, selected-skill read rate,
+trigger-match rate, retrieval false-positive rate, tool-call count, token count,
+wall-clock time, and validation-command count. These metrics are required
+because a skill system can improve pass rate while increasing regressions,
+latency, or prompt cost.
+
+\subsection{Result Tables to Fill}
+
+\begin{table}[h]
+\caption{Primary SWE-Bench Verified within-cell results. Values are
+intentionally blank until the full GLM-5.2/GPT-5.5 by Pi/Claude-harness matrix
+finishes.}
+\label{tab:main-results}
+\begin{center}
+\begin{tabular}{L{0.27\linewidth} C{0.10\linewidth} C{0.10\linewidth} C{0.11\linewidth} C{0.11\linewidth} C{0.11\linewidth}}
+\toprule
+Model/Harness/Setting & Resolved & Rate & $0{\rightarrow}1$ & $1{\rightarrow}0$ & Diag. \\
+\midrule
+GLM-5.2 / Pi / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GLM-5.2 / Pi / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GLM-5.2 / Claude harness / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GLM-5.2 / Claude harness / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GPT-5.5 / Pi / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GPT-5.5 / Pi / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GPT-5.5 / Claude harness / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GPT-5.5 / Claude harness / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{table}[h]
+\caption{Transfer matrix to fill after the full run. Source denotes the
+model/harness cell used for skill evolution; target denotes the cell used for
+SWE-Bench Verified evaluation.}
+\label{tab:transfer}
+\begin{center}
+\begin{tabular}{L{0.25\linewidth} L{0.25\linewidth} L{0.20\linewidth} C{0.13\linewidth}}
+\toprule
+Source cell & Target cell & Transfer type & Resolved delta \\
+\midrule
+GLM-5.2 / Pi & GPT-5.5 / Pi & Model transfer & \tbd \\
+GPT-5.5 / Pi & GLM-5.2 / Pi & Model transfer & \tbd \\
+GLM-5.2 / Claude harness & GPT-5.5 / Claude harness & Model transfer & \tbd \\
+GPT-5.5 / Claude harness & GLM-5.2 / Claude harness & Model transfer & \tbd \\
+GLM-5.2 / Pi & GLM-5.2 / Claude harness & Harness transfer & \tbd \\
+GLM-5.2 / Claude harness & GLM-5.2 / Pi & Harness transfer & \tbd \\
+GPT-5.5 / Pi & GPT-5.5 / Claude harness & Harness transfer & \tbd \\
+GPT-5.5 / Claude harness & GPT-5.5 / Pi & Harness transfer & \tbd \\
+GLM-5.2 / Pi & GPT-5.5 / Claude harness & Joint transfer & \tbd \\
+GPT-5.5 / Claude harness & GLM-5.2 / Pi & Joint transfer & \tbd \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{table}[h]
+\caption{Ablation plan. Each row removes one mechanism while keeping model,
+harness, task order, and budget fixed.}
+\label{tab:ablations}
+\begin{center}
+\begin{tabular}{L{0.30\linewidth} L{0.42\linewidth} C{0.18\linewidth}}
+\toprule
+Ablation & Question & Resolved delta \\
+\midrule
+Without evaluator gate & Do ungated candidates introduce harmful skills? & \tbd \\
+Without validation gate & Does repo-isolated validation prevent regressions? & \tbd \\
+Without failure-mode skills & Are cross-repo recovery rules useful? & \tbd \\
+Without repo skills & Are same-repo procedures useful in online evolution? & \tbd \\
+Without policy update windows & Do slow clocks reduce drift and prompt bloat? & \tbd \\
+Raw trace retrieval only & Is structured skill abstraction necessary? & \tbd \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\section{Related Work}
+
+\paragraph{Software-engineering benchmarks.}
+SWE-Bench introduced real GitHub issue resolution as a benchmark for language
+models and coding agents \citep{swebench2024}. SWE-Bench Verified refines the
+benchmark with human-verified tasks and evaluation criteria
+\citep{swebenchverified2024}. SWEGym provides executable training environments
+for software-engineering agents and is the source of verifier-supervised skill
+evolution in our work \citep{swegym2025}. Terminal-Bench studies broader
+terminal workflows beyond repository patching \citep{terminalbench2025}.
+
+\paragraph{Language-agent memory and reflection.}
+Prior language-agent systems use verbal feedback, self-reflection, or memory to
+improve future behavior \citep{react2023,reflexion2023,voyager2023}. \method{}
+differs by enforcing a benchmark-verifier boundary and by separating
+task-local evidence from transferable repo and failure-mode skills.
+
+\paragraph{Skill extraction and text-space optimization.}
+Recent systems distill trajectories into textual skills, optimize external
+instructions, or maintain skill repositories for agents
+\citep{trace2skill2024,skillopt2024,skillos2025,autoskill2023}. Our focus is
+the software-engineering setting, where executable verifiers are available
+during training but not during test-time memory updates, and where exact task
+leakage is a central evaluation risk.
+
+\section{Limitations}
+
+This draft intentionally leaves experimental results blank. The method also has
+several substantive limitations. First, verifier-grounded training is only as
+good as the verifier and validation split; incomplete public tests can still
+miscalibrate evaluator decisions. Second, failure-mode skills may be too broad
+if failure signatures are noisy. Third, online test-time evolution is order
+sensitive, so we must report original-order and random-order robustness. Fourth,
+the current evaluator implementation is deterministic and rule-based; a learned
+evaluator must be tested against false accepts, false rejects, and prompt bloat.
+Finally, the full $2{\times}2$ transfer matrix is a planned setting. Within-cell
+results, model-transfer results, harness-transfer results, and joint-transfer
+results must be reported separately because they answer different questions.
+
+\section{Conclusion}
+
+We presented \method{}, a verifier-grounded approach for evolving external
+software-engineering skills for frozen coding agents. The framework promotes
+public task evidence through repo-level and cross-repo failure-mode gates,
+separates writer and evaluator policies, and freezes transferable state before
+downstream evaluation. The resulting protocol is designed to answer whether
+SWEGym can train reusable skill-writing and skill-selection behavior that
+transfers to SWE-Bench Verified, SWE-Bench Pro, and Terminal-Bench without
+test-time verifier feedback.
+
+\bibliographystyle{iclr2026_conference}
+\bibliography{references}
+
+\appendix
+\section{Implementation Notes}
+
+The implementation stores accepted skills under versioned directories
+\texttt{skills/accepted/vXXXX/}. Repo skills are written under
+\texttt{\_repos/}, failure-mode skills under \texttt{\_failure\_modes/}, and
+general SWE seeds under \texttt{\_general/swe/}. Training artifacts include
+\texttt{task\_events.jsonl}, \texttt{repo\_clusters.jsonl},
+\texttt{failure\_clusters.jsonl}, \texttt{evaluator\_decisions.jsonl},
+\texttt{evaluator\_calibration.jsonl}, \texttt{promotion\_decisions.jsonl},
+\texttt{harness\_policy.md}, \texttt{generator\_policy.md}, and
+\texttt{evaluator\_policy.md}.
+
+\section{Command Skeletons}
+
+\begin{verbatim}
+# SWEGym transfer loop, one source cell.
+python scripts/run_swegym_skill_evo_loop.py \
+  --run-name swegym_<model>_<harness>_hse_main \
+  --provider openai \
+  --provider-model <model-id> \
+  --provider-api openai-completions \
+  --concurrency <N>
+
+# SWE-Bench Verified target-cell evaluation with accepted skills.
+python scripts/run_skill_evo_verified.py \
+  --run-name verified_<source>_to_<target>_hse_final \
+  --dataset swe-bench/swe-bench-verified@2 \
+  --provider openai \
+  --provider-model <target-model-id> \
+  --all-verified \
+  --concurrency <N>
+\end{verbatim}
+
+\end{document}

@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import compare_jobs, summarize_job, write_report
-from providers import ensure_macaron_attribution_header
+from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
 
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
@@ -479,6 +479,11 @@ def main() -> None:
     env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
     ensure_macaron_attribution_header(args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"), env)
+    ensure_reasoning_effort_none(
+        args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"),
+        env,
+        env_prefix="OPENAI_COMPAT",
+    )
 
     baseline_job_name = f"{run_name}_baseline_noskills"
     eval_job_name = f"{run_name}_eval_skills"

@@ -429,6 +429,11 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                     timeout=_sandbox_create_timeout_sec(),
                 )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     async def _create_sandbox_from_template(self, template_name: str) -> None:
         metadata = {
             "environment_name": self.environment_name,

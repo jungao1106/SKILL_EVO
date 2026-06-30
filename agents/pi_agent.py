@@ -5,11 +5,16 @@ import os
 import re
 import shlex
 import tarfile
+import tempfile
 import textwrap
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    NonZeroAgentExitCodeError,
+    with_prompt_template,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.trajectories import (
@@ -33,8 +38,10 @@ from agents.skill_harness_memory import (
 from providers import (
     MACARON_ATTRIBUTION_HEADER_ENV,
     MACARON_ATTRIBUTION_HEADER_VALUE,
+    ensure_reasoning_effort_none,
     ensure_macaron_attribution_header,
     is_macaron_base_url,
+    requires_reasoning_effort_none,
 )
 
 
@@ -48,6 +55,7 @@ PI_SKILL_PACK_EXCLUDE_DIRS = {"benchmark-sharded-concurrency"}
 PI_SKILL_PACK_CHUNK_SIZE = 24_000
 PI_MAX_PROMPT_SKILLS = 8
 PI_MACARON_PROXY_PORT = 18080
+PI_REASONING_PROXY_PORT = PI_MACARON_PROXY_PORT
 PI_RUNTIME_PATH_COMMAND = (
     "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
     'for HARBOR_PI_NODE_BIN in "$HOME"/.local/node-v*-linux-*/bin; do '
@@ -80,6 +88,10 @@ FORBIDDEN_ASSISTANT_CONTENT_MARKERS = (
     "<arg_value>",
     "</arg_value>",
 )
+
+
+class ProviderTransientAgentError(RuntimeError):
+    """Raised when Pi exits because the upstream model provider stayed unavailable."""
 
 
 PI_SYSTEM_PROMPT = """You are Pi, a terminal-based software engineering agent running inside a Harbor SWE-Bench task sandbox.
@@ -833,16 +845,31 @@ def _safe_shell_json(value: dict[str, Any]) -> str:
     return shlex.quote(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def _macaron_proxy_base_url(base_url: str) -> str:
+def _local_script_file(content: str, *, prefix: str) -> Path:
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix=prefix,
+        suffix=".sh",
+        delete=False,
+    )
+    with handle:
+        handle.write(content)
+        if not content.endswith("\n"):
+            handle.write("\n")
+    return Path(handle.name)
+
+
+def _reasoning_proxy_base_url(base_url: str) -> str:
     match = re.match(
         r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+(?P<path>/.*)?$",
         base_url.rstrip(),
     )
     path = (match.group("path") if match else "") or ""
-    return f"http://127.0.0.1:{PI_MACARON_PROXY_PORT}{path.rstrip('/')}"
+    return f"http://127.0.0.1:{PI_REASONING_PROXY_PORT}{path.rstrip('/')}"
 
 
-def _macaron_reasoning_proxy_command(base_url: str, api_key_env: str) -> str:
+def _reasoning_effort_none_proxy_command(base_url: str, api_key_env: str) -> str:
     proxy_script = r'''
 import json
 import os
@@ -854,10 +881,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("HARBOR_MACARON_PROXY_PORT", "18080"))
-UPSTREAM_BASE = os.environ["HARBOR_MACARON_UPSTREAM_BASE"].rstrip("/")
-UPSTREAM_API_KEY = os.environ.get("HARBOR_MACARON_UPSTREAM_API_KEY", "")
+PORT = int(os.environ.get("HARBOR_REASONING_PROXY_PORT", "18080"))
+UPSTREAM_BASE = os.environ["HARBOR_REASONING_UPSTREAM_BASE"].rstrip("/")
+UPSTREAM_API_KEY = os.environ.get("HARBOR_REASONING_UPSTREAM_API_KEY", "")
 ATTRIBUTION_HEADER = os.environ.get("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
+SEND_ATTRIBUTION_HEADER = os.environ.get("HARBOR_REASONING_PROXY_SEND_ATTRIBUTION", "") == "1"
 UPSTREAM_PATH_PREFIX = urllib.parse.urlsplit(UPSTREAM_BASE).path.rstrip("/")
 HOP_BY_HOP_HEADERS = {
     "accept-encoding",
@@ -898,6 +926,7 @@ def rewrite_body(path: str, body: bytes, content_type: str):
         return body, False
     if isinstance(payload, dict):
         payload["reasoning_effort"] = "none"
+        payload["enable_thinking"] = False
         body = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
@@ -909,7 +938,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[harbor-macaron-proxy] " + (fmt % args) + "\n")
+        sys.stderr.write("[harbor-reasoning-proxy] " + (fmt % args) + "\n")
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -946,7 +975,8 @@ class Handler(BaseHTTPRequestHandler):
         }
         if UPSTREAM_API_KEY:
             headers["Authorization"] = "Bearer " + UPSTREAM_API_KEY
-        headers["CLAUDE_CODE_ATTRIBUTION_HEADER"] = ATTRIBUTION_HEADER
+        if SEND_ATTRIBUTION_HEADER:
+            headers["CLAUDE_CODE_ATTRIBUTION_HEADER"] = ATTRIBUTION_HEADER
         if body:
             headers["Content-Length"] = str(len(body))
 
@@ -957,7 +987,7 @@ class Handler(BaseHTTPRequestHandler):
             method=self.command,
         )
         sys.stderr.write(
-            "[harbor-macaron-proxy] "
+            "[harbor-reasoning-proxy] "
             f"{self.command} {urllib.parse.urlsplit(self.path).path} "
             f"reasoning_effort_none={str(injected_reasoning_effort).lower()}\n"
         )
@@ -1004,49 +1034,61 @@ class Handler(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer((HOST, PORT), Handler)
 sys.stderr.write(
-    f"[harbor-macaron-proxy] listening on {HOST}:{PORT}, upstream={UPSTREAM_BASE}\n"
+    f"[harbor-reasoning-proxy] listening on {HOST}:{PORT}, upstream={UPSTREAM_BASE}\n"
 )
 server.serve_forever()
 '''.strip()
-    return (
-        "cat > /tmp/harbor-macaron-openai-proxy.py <<'HARBOR_MACARON_PROXY_PY'\n"
+    proxy_log = "/tmp/harbor-openai-reasoning-proxy.log"
+    send_attribution = "1" if is_macaron_base_url(base_url) else "0"
+    parts = [
+        "cat > /tmp/harbor-openai-reasoning-proxy.py <<'HARBOR_REASONING_PROXY_PY'\n"
         f"{proxy_script}\n"
-        "HARBOR_MACARON_PROXY_PY\n"
-        f"export HARBOR_MACARON_UPSTREAM_BASE={shlex.quote(base_url.rstrip('/'))}\n"
-        f"export HARBOR_MACARON_UPSTREAM_API_KEY=\"${{{api_key_env}}}\"\n"
-        f"export HARBOR_MACARON_PROXY_PORT={PI_MACARON_PROXY_PORT}\n"
-        f"export {MACARON_ATTRIBUTION_HEADER_ENV}="
-        f"{shlex.quote(MACARON_ATTRIBUTION_HEADER_VALUE)}\n"
+        "HARBOR_REASONING_PROXY_PY\n",
+        f"export HARBOR_REASONING_UPSTREAM_BASE={shlex.quote(base_url.rstrip('/'))}\n",
+        f"export HARBOR_REASONING_UPSTREAM_API_KEY=\"${{{api_key_env}}}\"\n",
+        f"export HARBOR_REASONING_PROXY_PORT={PI_REASONING_PROXY_PORT}\n",
+        f"export HARBOR_REASONING_PROXY_SEND_ATTRIBUTION={send_attribution}\n",
+    ]
+    if is_macaron_base_url(base_url):
+        parts.append(
+            f"export {MACARON_ATTRIBUTION_HEADER_ENV}="
+            f"{shlex.quote(MACARON_ATTRIBUTION_HEADER_VALUE)}\n"
+        )
+    parts.extend(
+        [
         'if [ -z "${HARBOR_PYTHON_BIN:-}" ]; then\n'
-        "  echo '[harbor] python3/python unavailable; Macaron reasoning proxy cannot start' >&2\n"
+        "  echo '[harbor] python3/python unavailable; reasoning proxy cannot start' >&2\n"
         "  exit 98\n"
-        "fi\n"
-        '"$HARBOR_PYTHON_BIN" /tmp/harbor-macaron-openai-proxy.py '
-        "> /tmp/harbor-macaron-openai-proxy.log 2>&1 &\n"
-        "HARBOR_MACARON_PROXY_PID=$!\n"
-        "export HARBOR_MACARON_PROXY_PID\n"
-        "trap 'cp /tmp/harbor-macaron-openai-proxy.log "
-        "/logs/agent/macaron-openai-proxy.log 2>/dev/null || true; "
-        "kill \"${HARBOR_MACARON_PROXY_PID:-}\" 2>/dev/null || true' EXIT\n"
-        "HARBOR_MACARON_PROXY_READY=0\n"
-        "for HARBOR_MACARON_PROXY_WAIT in $(seq 1 100); do\n"
-        "  if \"$HARBOR_PYTHON_BIN\" - <<'HARBOR_MACARON_PROXY_READY_PY'\n"
-        "import os, socket\n"
-        "with socket.create_connection(('127.0.0.1', int(os.environ['HARBOR_MACARON_PROXY_PORT'])), timeout=0.2):\n"
-        "    pass\n"
-        "HARBOR_MACARON_PROXY_READY_PY\n"
-        "  then HARBOR_MACARON_PROXY_READY=1; break; fi\n"
-        "  if ! kill -0 \"$HARBOR_MACARON_PROXY_PID\" 2>/dev/null; then\n"
-        "    cat /tmp/harbor-macaron-openai-proxy.log >&2 || true\n"
-        "    exit 98\n"
-        "  fi\n"
-        "  sleep 0.1\n"
-        "done\n"
-        "if [ \"$HARBOR_MACARON_PROXY_READY\" != \"1\" ]; then\n"
-        "  cat /tmp/harbor-macaron-openai-proxy.log >&2 || true\n"
-        "  exit 98\n"
-        "fi\n"
+        "fi\n",
+        '"$HARBOR_PYTHON_BIN" /tmp/harbor-openai-reasoning-proxy.py '
+        f"> {proxy_log} 2>&1 &\n",
+        "HARBOR_REASONING_PROXY_PID=$!\n",
+        "export HARBOR_REASONING_PROXY_PID\n",
+        "trap 'cp "
+        f"{proxy_log} "
+        "/logs/agent/openai-reasoning-proxy.log 2>/dev/null || true; "
+        "kill \"${HARBOR_REASONING_PROXY_PID:-}\" 2>/dev/null || true' EXIT\n",
+        "HARBOR_REASONING_PROXY_READY=0\n",
+        "for HARBOR_REASONING_PROXY_WAIT in $(seq 1 100); do\n",
+        "  if \"$HARBOR_PYTHON_BIN\" - <<'HARBOR_REASONING_PROXY_READY_PY'\n",
+        "import os, socket\n",
+        "with socket.create_connection(('127.0.0.1', int(os.environ['HARBOR_REASONING_PROXY_PORT'])), timeout=0.2):\n",
+        "    pass\n",
+        "HARBOR_REASONING_PROXY_READY_PY\n",
+        "  then HARBOR_REASONING_PROXY_READY=1; break; fi\n",
+        "  if ! kill -0 \"$HARBOR_REASONING_PROXY_PID\" 2>/dev/null; then\n",
+        f"    cat {proxy_log} >&2 || true\n",
+        "    exit 98\n",
+        "  fi\n",
+        "  sleep 0.1\n",
+        "done\n",
+        "if [ \"$HARBOR_REASONING_PROXY_READY\" != \"1\" ]; then\n",
+        f"  cat {proxy_log} >&2 || true\n",
+        "  exit 98\n",
+        "fi\n",
+        ]
     )
+    return "".join(parts)
 
 
 def _sanitize_pi_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -1481,8 +1523,50 @@ def _pi_retry_wrapper_command(
 ) -> str:
     script = f"""harbor_run_pi_with_provider_retry() {{
 set +e
-HARBOR_PI_ATTEMPTS="${{HARBOR_PI_ATTEMPTS:-5}}"
-HARBOR_PI_RETRY_DELAY="${{HARBOR_PI_RETRY_DELAY:-20}}"
+harbor_pi_provider_error_seen() {{
+  ${{HARBOR_PYTHON_BIN:-python3}} - "$1" "$2" <<'HARBOR_PI_PROVIDER_ERROR_CHECK'
+import json
+import re
+import sys
+
+jsonl_path, stderr_path = sys.argv[1:3]
+patterns = re.compile(
+    r"Connection error|provider error|401 status code|429|rate limit|too many requests|"
+    r"Response 5[0-9][0-9]|status code 5[0-9][0-9]|\\b50[0-9]\\b|timeout|"
+    r"timed out|ECONNRESET|connection reset|temporarily unavailable|upstream",
+    re.I,
+)
+
+try:
+    with open(jsonl_path, "rb") as handle:
+        for raw_line in handle:
+            try:
+                event = json.loads(raw_line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            error = message.get("errorMessage") or message.get("error")
+            if message.get("stopReason") == "error":
+                raise SystemExit(0)
+            if error and patterns.search(json.dumps(error, ensure_ascii=False)):
+                raise SystemExit(0)
+except FileNotFoundError:
+    pass
+
+try:
+    with open(stderr_path, "r", encoding="utf-8", errors="replace") as handle:
+        stderr_text = handle.read()
+except FileNotFoundError:
+    stderr_text = ""
+if patterns.search(stderr_text):
+    raise SystemExit(0)
+raise SystemExit(1)
+HARBOR_PI_PROVIDER_ERROR_CHECK
+}}
+HARBOR_PI_ATTEMPTS="${{HARBOR_PI_ATTEMPTS:-8}}"
+HARBOR_PI_RETRY_DELAY="${{HARBOR_PI_RETRY_DELAY:-45}}"
 HARBOR_PI_STATUS=1
 HARBOR_PI_ATTEMPT=1
 while [ "$HARBOR_PI_ATTEMPT" -le "$HARBOR_PI_ATTEMPTS" ]; do
@@ -1494,10 +1578,13 @@ while [ "$HARBOR_PI_ATTEMPT" -le "$HARBOR_PI_ATTEMPTS" ]; do
   : > {shlex.quote(str(stderr_path))}
   {pi_command}
   HARBOR_PI_STATUS=$?
+  if [ "$HARBOR_PI_STATUS" -eq 0 ] && harbor_pi_provider_error_seen {shlex.quote(str(jsonl_path))} {shlex.quote(str(stderr_path))}; then
+    HARBOR_PI_STATUS=86
+  fi
   if [ "$HARBOR_PI_STATUS" -eq 0 ]; then
     break
   fi
-  if ! grep -Eiq '429|rate limit|too many requests|Response 5[0-9][0-9]|status code 5[0-9][0-9]|\\b50[0-9]\\b|timeout|timed out|ECONNRESET|connection reset|temporarily unavailable|upstream' {shlex.quote(str(jsonl_path))} {shlex.quote(str(stderr_path))} 2>/dev/null; then
+  if ! harbor_pi_provider_error_seen {shlex.quote(str(jsonl_path))} {shlex.quote(str(stderr_path))}; then
     break
   fi
   HARBOR_PI_ATTEMPT=$((HARBOR_PI_ATTEMPT + 1))
@@ -1634,15 +1721,28 @@ class PiAgent(BaseInstalledAgent):
     def _install_system_dependencies_command(self) -> str:
         if self.benchmark_name == "terminal-bench":
             return "true"
-        return (
-            "if command -v apt-get >/dev/null 2>&1; then "
-            "apt-get update && apt-get install -y curl ca-certificates git jq ripgrep; "
-            "elif command -v apk >/dev/null 2>&1; then "
-            "apk add --no-cache curl ca-certificates git jq ripgrep nodejs npm bash; "
-            "elif command -v yum >/dev/null 2>&1; then "
-            "yum install -y curl ca-certificates git jq ripgrep; "
-            "fi"
-        )
+        return """
+set -euo pipefail
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
+  for HARBOR_APT_ATTEMPT in $(seq 1 24); do
+    if apt-get -o DPkg::Lock::Timeout=300 update \
+      && apt-get -o DPkg::Lock::Timeout=300 install -y curl ca-certificates git jq ripgrep; then
+      exit 0
+    fi
+    HARBOR_APT_STATUS=$?
+    if [ "$HARBOR_APT_ATTEMPT" -ge 24 ]; then
+      exit "$HARBOR_APT_STATUS"
+    fi
+    echo "[harbor] apt-get install failed or dpkg lock is busy; retrying $HARBOR_APT_ATTEMPT/24" >&2
+    sleep 5
+  done
+elif command -v apk >/dev/null 2>&1; then
+  apk add --no-cache curl ca-certificates git jq ripgrep nodejs npm bash
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y curl ca-certificates git jq ripgrep
+fi
+""".strip()
 
     def _install_node_and_pi_command(self, version_spec: str) -> str:
         return (
@@ -1751,6 +1851,16 @@ class PiAgent(BaseInstalledAgent):
         env = {name: os.environ[name] for name in required}
         env[self.api_key_env] = os.environ.get(self.api_key_env) or self.default_api_key or ""
         ensure_macaron_attribution_header(env[self.base_url_env], env)
+        env_prefix = (
+            self.model_env[: -len("_MODEL")]
+            if self.model_env.endswith("_MODEL")
+            else "OPENAI_COMPAT"
+        )
+        ensure_reasoning_effort_none(
+            env[self.base_url_env],
+            env,
+            env_prefix=env_prefix,
+        )
         return env
 
     def _models_config(self, env: dict[str, str]) -> dict[str, Any]:
@@ -1814,10 +1924,10 @@ class PiAgent(BaseInstalledAgent):
         env = self._required_env()
         provider_model = env[self.model_env]
         provider_base_url = env[self.base_url_env]
-        use_macaron_proxy = is_macaron_base_url(provider_base_url)
+        use_reasoning_proxy = requires_reasoning_effort_none(provider_base_url)
         effective_provider_base_url = (
-            _macaron_proxy_base_url(provider_base_url)
-            if use_macaron_proxy
+            _reasoning_proxy_base_url(provider_base_url)
+            if use_reasoning_proxy
             else provider_base_url
         )
         models_env = dict(env)
@@ -1884,7 +1994,11 @@ class PiAgent(BaseInstalledAgent):
             "provider_base_url": provider_base_url,
             "effective_provider_base_url": effective_provider_base_url,
             "provider_api": self.provider_api,
-            "macaron_reasoning_proxy": use_macaron_proxy,
+            "reasoning_effort_none_proxy": use_reasoning_proxy,
+            "enable_thinking_false_proxy": use_reasoning_proxy,
+            "macaron_reasoning_proxy": (
+                use_reasoning_proxy and is_macaron_base_url(provider_base_url)
+            ),
             "benchmark_name": self.benchmark_name,
             "require_workspace_change": self.require_workspace_change,
             "api_key_env": self.api_key_env,
@@ -1935,9 +2049,9 @@ class PiAgent(BaseInstalledAgent):
         no_diff_metadata_update_function_command = (
             _no_diff_metadata_update_function_command(metadata_path)
         )
-        macaron_proxy_command = (
-            _macaron_reasoning_proxy_command(provider_base_url, self.api_key_env)
-            if use_macaron_proxy
+        reasoning_proxy_command = (
+            _reasoning_effort_none_proxy_command(provider_base_url, self.api_key_env)
+            if use_reasoning_proxy
             else ""
         )
         cleanup_transient_logs_command = ""
@@ -1995,7 +2109,7 @@ class PiAgent(BaseInstalledAgent):
             "HARBOR_PYTHON_BIN=\"$(command -v python3 || command -v python || true)\"\n"
             "export HARBOR_PYTHON_BIN\n"
             "mkdir -p /logs/agent ~/.pi/agent\n"
-            f"{macaron_proxy_command}"
+            f"{reasoning_proxy_command}"
             f"{'' if has_skill_pack else _pi_no_skills_cleanup_command()}"
             f"{PI_RUNTIME_PATH_COMMAND}\n"
             f"cat > {shlex.quote(str(instruction_path))} <<'{heredoc}'\n"
@@ -2018,13 +2132,45 @@ class PiAgent(BaseInstalledAgent):
             f"{cleanup_transient_logs_command}"
         )
 
-        for setup_command in pi_skills_setup_commands:
-            await self.exec_as_agent(
-                environment,
-                command="set -euo pipefail\nmkdir -p /logs/agent ~/.pi/agent\n" + setup_command,
-                env=env,
-            )
-        await self.exec_as_agent(environment, command=command, env=env)
+        uploaded_scripts: list[Path] = []
+        try:
+            for index, setup_command in enumerate(pi_skills_setup_commands):
+                setup_script = _local_script_file(
+                    "set -euo pipefail\nmkdir -p /logs/agent ~/.pi/agent\n"
+                    + setup_command,
+                    prefix=f"harbor-pi-skills-{index}-",
+                )
+                uploaded_scripts.append(setup_script)
+                sandbox_setup_path = f"/tmp/{setup_script.name}"
+                await environment.upload_file(setup_script, sandbox_setup_path)
+                await self.exec_as_agent(
+                    environment,
+                    command=f"bash {shlex.quote(sandbox_setup_path)}",
+                    env=env,
+                )
+
+            run_script = _local_script_file(command, prefix="harbor-pi-run-")
+            uploaded_scripts.append(run_script)
+            sandbox_run_path = f"/tmp/{run_script.name}"
+            await environment.upload_file(run_script, sandbox_run_path)
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=f"bash {shlex.quote(sandbox_run_path)}",
+                    env=env,
+                )
+            except NonZeroAgentExitCodeError as exc:
+                if "exit 86" in str(exc) or "exit code 86" in str(exc):
+                    raise ProviderTransientAgentError(
+                        "Pi failed after exhausting transient provider retries"
+                    ) from exc
+                raise
+        finally:
+            for script_path in uploaded_scripts:
+                try:
+                    script_path.unlink()
+                except OSError:
+                    pass
 
     def _jsonl_events(self) -> list[dict[str, Any]]:
         path = self.logs_dir / self._JSONL_FILENAME

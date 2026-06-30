@@ -34,7 +34,7 @@ from scripts.run_skill_evo_verified import (
     next_skill_version_id,
     read_active_version,
 )
-from providers import ensure_macaron_attribution_header
+from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
 
 
 DEFAULT_SWEGYM_DATASET = ROOT / "data" / "harbor_swegym_500_uniform"
@@ -50,6 +50,7 @@ DEFAULT_TRANSIENT_RETRY_EXCEPTIONS = [
     "RemoteProtocolError",
     "ConnectException",
     "SandboxException",
+    "ProviderTransientAgentError",
 ]
 SWE_STAGES = ("reproduce", "localize", "edit", "validate", "recover")
 
@@ -131,6 +132,10 @@ def job_result_is_complete(job_dir: Path) -> bool:
     except json.JSONDecodeError:
         return False
     return result.get("finished_at") is not None and "trial_results" not in result
+
+
+def job_has_trial_results(job_dir: Path) -> bool:
+    return any(trial_result_paths(job_dir))
 
 
 def version_id_with_offset(base_version_id: str, offset: int) -> str:
@@ -1992,7 +1997,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider-api-key", default=os.getenv("PROVIDER_API_KEY"))
     parser.add_argument("--provider-api", default=os.getenv("PROVIDER_API"))
     parser.add_argument("--concurrency", type=int, default=int(os.getenv("E2B_CONCURRENCY", "1")))
-    parser.add_argument("--max-retries", type=int, default=int(os.getenv("HARBOR_MAX_RETRIES", "0")))
+    parser.add_argument("--max-retries", type=int, default=int(os.getenv("HARBOR_MAX_RETRIES", "1")))
     parser.add_argument("--retry-min-wait-sec", type=float, default=float(os.getenv("HARBOR_RETRY_MIN_WAIT_SEC", "5")))
     parser.add_argument("--retry-max-wait-sec", type=float, default=float(os.getenv("HARBOR_RETRY_MAX_WAIT_SEC", "60")))
     parser.add_argument(
@@ -2247,6 +2252,12 @@ def main() -> None:
     if args.provider_api:
         env["OPENAI_COMPAT_API" if args.provider == "openai" else "TINKER_API"] = args.provider_api
     ensure_macaron_attribution_header(args.provider_base_url, env)
+    if args.provider == "openai":
+        ensure_reasoning_effort_none(
+            args.provider_base_url,
+            env,
+            env_prefix="OPENAI_COMPAT",
+        )
 
     train_job_name = f"{run_name}_swegym_train_noskills"
     default_train_job_dir = ROOT / "jobs" / train_job_name
@@ -2257,7 +2268,12 @@ def main() -> None:
     )
     train_job_dir = default_train_job_dir
     train_job_complete = not args.dry_run and job_result_is_complete(train_job_dir)
-    if not train_job_complete and provided_train_job_dir and job_result_is_complete(provided_train_job_dir):
+    if (
+        not train_job_complete
+        and provided_train_job_dir
+        and (provided_train_job_dir / "result.json").exists()
+        and job_has_trial_results(provided_train_job_dir)
+    ):
         train_job_dir = provided_train_job_dir
         train_job_complete = True
 
@@ -2366,7 +2382,7 @@ def main() -> None:
         train_task_evidence_dir = train_dir / "task_evidence_cards"
 
         if train_job_complete:
-            log(f"using existing complete no-skills baseline job: {train_job_dir}")
+            log(f"using existing no-skills baseline trial results: {train_job_dir}")
         else:
             run_command(
                 benchmark_command(

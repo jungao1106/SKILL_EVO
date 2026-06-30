@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from providers import ProviderSpec, ensure_macaron_attribution_header, resolve_provider
+from providers import (
+    ProviderSpec,
+    ensure_macaron_attribution_header,
+    ensure_reasoning_effort_none,
+    resolve_provider,
+)
 
 
 DEFAULT_DATASET_NAME = "swe-bench/swe-bench-verified"
@@ -551,6 +556,10 @@ def _apply_provider_overrides(args: argparse.Namespace) -> None:
     if provider.default_api_key and not os.environ.get(provider.api_key_env):
         os.environ[provider.api_key_env] = provider.default_api_key
     ensure_macaron_attribution_header(os.getenv(provider.base_url_env))
+    ensure_reasoning_effort_none(
+        os.getenv(provider.base_url_env),
+        env_prefix=provider.env_prefix,
+    )
 
 
 def main() -> None:

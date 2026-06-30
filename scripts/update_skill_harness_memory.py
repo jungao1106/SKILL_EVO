@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from providers import ensure_macaron_attribution_header
+from providers import ensure_macaron_attribution_header, requires_reasoning_effort_none
 
 DEFAULT_OUT = ROOT / "analysis" / "skill_harness_memory.json"
 DEFAULT_TASK_SKILL_DIR = ROOT / "analysis" / "task_evidence"
@@ -658,8 +658,9 @@ def _call_openai_compatible(
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
-        if "macaron" in base_url.lower():
+        if requires_reasoning_effort_none(base_url):
             payload["reasoning_effort"] = "none"
+            payload["enable_thinking"] = False
         path = "/chat/completions"
     request = urllib.request.Request(
         base_url + path,

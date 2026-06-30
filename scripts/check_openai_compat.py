@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from providers import ensure_macaron_attribution_header
+from providers import ensure_macaron_attribution_header, requires_reasoning_effort_none
 
 
 def _request(path: str, payload: dict) -> dict:
@@ -24,8 +24,9 @@ def _request(path: str, payload: dict) -> dict:
     if not base_url:
         raise SystemExit("Missing OPENAI_COMPAT_BASE_URL")
     ensure_macaron_attribution_header(base_url)
-    if "macaron" in base_url.lower() and path.endswith("/chat/completions"):
+    if requires_reasoning_effort_none(base_url) and path.endswith("/chat/completions"):
         payload.setdefault("reasoning_effort", "none")
+        payload.setdefault("enable_thinking", False)
 
     request = Request(
         f"{base_url}{path}",
