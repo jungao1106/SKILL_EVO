@@ -14,6 +14,9 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
 DEFAULT_TASK_FILE_GLOB = (
     "run_logs/skill_evo_shards/"
@@ -143,7 +146,36 @@ def build_baseline_command(
     ]
 
 
-def build_eval_command(
+def build_direct_eval_command(
+    *,
+    args: argparse.Namespace,
+    shard: Path,
+    job_name: str,
+) -> list[str]:
+    return [
+        args.python,
+        "scripts/run_benchmark.py",
+        "--dataset",
+        args.dataset,
+        "--provider",
+        "openai",
+        "--job-name",
+        job_name,
+        "--task-names-file",
+        str(shard),
+        "--concurrency",
+        str(args.concurrency_per_shard),
+        "--agent-timeout-sec",
+        str(args.agent_timeout_sec),
+        "--agent-setup-timeout-sec",
+        str(args.agent_setup_timeout_sec),
+        "--e2b-sandbox-timeout-sec",
+        str(args.e2b_sandbox_timeout_sec),
+        "--use-skills",
+    ]
+
+
+def build_eval_only_command(
     *,
     args: argparse.Namespace,
     shard: Path,
@@ -200,6 +232,45 @@ def build_eval_command(
     return command
 
 
+def render_direct_shard_script(
+    *,
+    args: argparse.Namespace,
+    shard: Path,
+    log_path: Path,
+    eval_job_name: str,
+    skill_pack_root: Path,
+) -> str:
+    eval_job_dir = ROOT / "jobs" / eval_job_name
+    eval_command = build_direct_eval_command(
+        args=args,
+        shard=shard,
+        job_name=eval_job_name,
+    )
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"cd {shlex.quote(str(ROOT))}",
+        f"mkdir -p {shlex.quote(str(log_path.parent))}",
+        f"exec >> {shlex.quote(str(log_path))} 2>&1",
+        'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] direct skills shard start"',
+        *source_env_block(args.env_file),
+        f"export E2B_CONCURRENCY={shlex.quote(str(args.concurrency_per_shard))}",
+        f"export PI_SKILL_PACK_ROOT={shlex.quote(str(skill_pack_root))}",
+        "export PI_USE_SKILL_HARNESS_MEMORY=false",
+        "export PI_SKILL_RETRIEVAL_SCOPE=transfer",
+        f'echo "eval_job={eval_job_name}"',
+        f'echo "skill_pack_root={skill_pack_root}"',
+        f'echo "task_file={shard}"',
+        f"if [ -f {shlex.quote(str(eval_job_dir / 'result.json'))} ]; then",
+        '  echo "eval result exists; skipping direct skills run"',
+        "else",
+        f"  {shell_join(eval_command)}",
+        "fi",
+        'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] direct skills shard done"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render_shard_script(
     *,
     args: argparse.Namespace,
@@ -216,14 +287,14 @@ def render_shard_script(
         shard=shard,
         baseline_job_name=baseline_job_name,
     )
-    eval_command = build_eval_command(
+    eval_command = build_eval_only_command(
         args=args,
         shard=shard,
         eval_run_name=eval_run_name,
         baseline_job_dir=baseline_job_dir,
         eval_job_dir=None,
     )
-    eval_report_command = build_eval_command(
+    eval_report_command = build_eval_only_command(
         args=args,
         shard=shard,
         eval_run_name=eval_run_name,
@@ -262,8 +333,8 @@ def render_shard_script(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch SWE-bench Verified no-skill baselines and frozen-library skill evals "
-            "as fixed shards. Each shard runs one baseline job followed by one skill job."
+            "Launch SWE-bench Verified direct frozen-library skill evals as fixed shards. "
+            "By default this does not run a no-skill baseline."
         )
     )
     parser.add_argument(
@@ -290,6 +361,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frozen-max-failure-skills", type=int, default=8)
     parser.add_argument("--frozen-include-support-1-failures", action="store_true")
     parser.add_argument("--frozen-exclude-general", action="store_true")
+    parser.add_argument(
+        "--with-baseline",
+        action="store_true",
+        help="Legacy mode: run a no-skill baseline before each skill eval and compare them.",
+    )
+    parser.add_argument(
+        "--materialize-only",
+        action="store_true",
+        help="Materialize the frozen skill library and write the manifest without launching tmux jobs.",
+    )
     parser.add_argument("--agent-timeout-sec", type=float, default=3600)
     parser.add_argument("--agent-setup-timeout-sec", type=float, default=1200)
     parser.add_argument("--e2b-sandbox-timeout-sec", type=int, default=7200)
@@ -319,27 +400,65 @@ def main() -> None:
             f"Expected {args.num_shards} task shard files from {args.task_file_glob!r}, found {len(task_files)}"
         )
 
+    from evolution.frozen_library import materialize_frozen_skill_library_from_files
+
     run_id = safe_name(args.run_id or f"{args.run_prefix}_{utc_tag()}")
     run_dir = ROOT / "run_logs" / "swebench_verified_frozen_shards" / run_id
+    skill_pack_root = args.frozen_library_root / run_id / args.skill_version_id
+    frozen_manifest = None
+    if args.dry_run:
+        frozen_manifest = {
+            "dry_run": True,
+            "output_root": str(skill_pack_root),
+        }
+    else:
+        frozen_manifest = materialize_frozen_skill_library_from_files(
+            source_skill_root=source_skill_root,
+            output_root=skill_pack_root,
+            promotion_decisions_path=args.promotion_decisions,
+            run_name=run_id,
+            min_success_repo_support=args.frozen_min_success_repo_support,
+            min_success_positive_support=args.frozen_min_success_positive_support,
+            max_success_skills=args.frozen_max_success_skills,
+            require_accepted_success=not args.frozen_include_memory_only_success,
+            min_failure_repo_support=args.frozen_min_failure_repo_support,
+            max_failure_skills=args.frozen_max_failure_skills,
+            include_support_1_failures=args.frozen_include_support_1_failures,
+            include_general=not args.frozen_exclude_general,
+            clean=True,
+        )
     session_prefix = safe_name(f"swv_{run_id}", limit=70)
     manifest_rows: list[dict[str, Any]] = []
 
     for index, shard in enumerate(task_files, start=1):
         label = range_label(shard, index)
-        baseline_job_name = safe_name(f"{run_id}_{label}_baseline_noskills")
+        baseline_job_name = safe_name(f"{run_id}_{label}_baseline_noskills") if args.with_baseline else None
         eval_run_name = safe_name(f"{run_id}_{label}_frozen")
-        eval_job_name = safe_name(f"{eval_run_name}_eval_skills")
+        eval_job_name = (
+            safe_name(f"{eval_run_name}_eval_skills")
+            if args.with_baseline
+            else safe_name(f"{run_id}_{label}_skills")
+        )
         session = safe_name(f"{session_prefix}_s{index:02d}", limit=90)
         log_path = run_dir / f"{label}.log"
         script_path = run_dir / f"{label}.sh"
-        script_text = render_shard_script(
-            args=args,
-            shard=shard,
-            log_path=log_path,
-            baseline_job_name=baseline_job_name,
-            eval_run_name=eval_run_name,
-            eval_job_name=eval_job_name,
-        )
+        if args.with_baseline:
+            script_text = render_shard_script(
+                args=args,
+                shard=shard,
+                log_path=log_path,
+                baseline_job_name=str(baseline_job_name),
+                eval_run_name=eval_run_name,
+                eval_job_name=eval_job_name,
+            )
+        else:
+            script_text = render_direct_shard_script(
+                args=args,
+                shard=shard,
+                log_path=log_path,
+                eval_job_name=eval_job_name,
+                skill_pack_root=skill_pack_root,
+            )
         manifest_rows.append(
             {
                 "index": index,
@@ -350,11 +469,11 @@ def main() -> None:
                 "log_path": str(log_path),
                 "script_path": str(script_path),
                 "baseline_job_name": baseline_job_name,
-                "baseline_job_dir": str(ROOT / "jobs" / baseline_job_name),
+                "baseline_job_dir": str(ROOT / "jobs" / str(baseline_job_name)) if baseline_job_name else None,
                 "eval_run_name": eval_run_name,
                 "eval_job_name": eval_job_name,
                 "eval_job_dir": str(ROOT / "jobs" / eval_job_name),
-                "evolution_run_dir": str(ROOT / "run_logs" / "evolution" / eval_run_name),
+                "evolution_run_dir": str(ROOT / "run_logs" / "evolution" / eval_run_name) if args.with_baseline else None,
             }
         )
         if not args.dry_run:
@@ -367,7 +486,11 @@ def main() -> None:
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dataset": args.dataset,
-        "mode": "swebench_verified_frozen_library_sharded_eval",
+        "mode": (
+            "swebench_verified_frozen_library_sharded_eval_with_baseline"
+            if args.with_baseline
+            else "swebench_verified_frozen_library_direct_skills_eval"
+        ),
         "num_shards": len(manifest_rows),
         "concurrency_per_shard": args.concurrency_per_shard,
         "total_requested_concurrency": args.concurrency_per_shard * len(manifest_rows),
@@ -375,6 +498,9 @@ def main() -> None:
         "source_skill_root": str(source_skill_root),
         "promotion_decisions": str(args.promotion_decisions),
         "frozen_library_root": str(args.frozen_library_root),
+        "skill_pack_root": str(skill_pack_root),
+        "frozen_library_manifest": frozen_manifest,
+        "with_baseline": args.with_baseline,
         "selection": {
             "frozen_min_success_repo_support": args.frozen_min_success_repo_support,
             "frozen_min_success_positive_support": args.frozen_min_success_positive_support,
@@ -392,6 +518,10 @@ def main() -> None:
         return
 
     write_json(run_dir / "manifest.json", manifest)
+    if args.materialize_only:
+        print(f"[swebench-verified-frozen] materialized skill library: {skill_pack_root}", flush=True)
+        print(f"[swebench-verified-frozen] manifest: {run_dir / 'manifest.json'}", flush=True)
+        return
     for row in manifest_rows:
         session = row["session"]
         if tmux_session_exists(session):

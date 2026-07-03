@@ -135,7 +135,6 @@ def compare_combined(
 
 def render_markdown(report: dict[str, Any]) -> str:
     completeness = report["completeness"]
-    baseline = report["baseline"]
     evaluation = report["evaluation"]
     lines = [
         "# SWE-bench Verified Frozen Skill Shard Report",
@@ -146,30 +145,25 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Complete: `{report['complete']}`",
         f"- Dataset: `{report.get('dataset')}`",
         f"- Expected trials: `{completeness['expected_trials']}`",
-        f"- Baseline completed trials: `{baseline['n_trials']}`",
         f"- Eval completed trials: `{evaluation['n_trials']}`",
-        f"- Mean reward delta: `{report.get('mean_delta')}`",
-        f"- Resolved delta: `{report.get('resolved_delta')}`",
+        f"- Eval resolved: `{evaluation['resolved']}`",
+        f"- Eval mean reward: `{evaluation['mean_reward']}`",
         "",
-        "| Phase | Trials | Errors | Resolved | Mean Reward |",
-        "| --- | ---: | ---: | ---: | ---: |",
-        f"| baseline | {baseline['n_trials']} | {baseline['n_errors']} | {baseline['resolved']} | {baseline['mean_reward']} |",
-        f"| eval | {evaluation['n_trials']} | {evaluation['n_errors']} | {evaluation['resolved']} | {evaluation['mean_reward']} |",
+        "| Trials | Errors | Resolved | Mean Reward |",
+        "| ---: | ---: | ---: | ---: |",
+        f"| {evaluation['n_trials']} | {evaluation['n_errors']} | {evaluation['resolved']} | {evaluation['mean_reward']} |",
         "",
         "## Shards",
         "",
-        "| Shard | Baseline Trials | Baseline Complete | Eval Trials | Eval Complete |",
-        "| --- | ---: | --- | ---: | --- |",
+        "| Shard | Eval Trials | Eval Complete |",
+        "| --- | ---: | --- |",
     ]
     for row in completeness["shards"]:
-        baseline_status = row["baseline"]
         eval_status = row["evaluation"]
         lines.append(
-            "| {label} | {bt}/{expected} | {bc} | {et}/{expected} | {ec} |".format(
+            "| {label} | {et}/{expected} | {ec} |".format(
                 label=row["label"],
-                bt=baseline_status["trial_result_files"],
                 expected=row["expected_trials"],
-                bc=baseline_status["complete"],
                 et=eval_status["trial_result_files"],
                 ec=eval_status["complete"],
             )
@@ -179,19 +173,17 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "## Per Task",
             "",
-            "| Task | Baseline | Eval | Delta | Baseline Exception | Eval Exception |",
-            "| --- | ---: | ---: | ---: | --- | --- |",
+            "| Task | Eval | Eval Exception | Source Job |",
+            "| --- | ---: | --- | --- |",
         ]
     )
-    for row in report["tasks"]:
+    for row in evaluation["tasks"]:
         lines.append(
-            "| {task} | {before} | {after} | {delta} | {before_exc} | {after_exc} |".format(
+            "| {task} | {reward} | {exc} | {source} |".format(
                 task=row.get("task_name") or "",
-                before=row.get("baseline_reward"),
-                after=row.get("eval_reward"),
-                delta=row.get("delta"),
-                before_exc=row.get("baseline_exception") or "",
-                after_exc=row.get("eval_exception") or "",
+                reward=row.get("reward"),
+                exc=row.get("exception_type") or "",
+                source=row.get("source_job") or "",
             )
         )
     return "\n".join(lines) + "\n"
@@ -207,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-incomplete",
         action="store_true",
-        help="Write a progress report even when some baseline/eval shards are still running.",
+        help="Write a progress report even when some eval shards are still running.",
     )
     return parser.parse_args()
 
@@ -229,16 +221,25 @@ def main() -> None:
     )
 
     shard_rows: list[dict[str, Any]] = []
-    baseline_summaries: list[dict[str, Any]] = []
     eval_summaries: list[dict[str, Any]] = []
     incomplete: list[str] = []
     expected_total = 0
+    with_baseline = bool(manifest.get("with_baseline"))
+    baseline_summaries: list[dict[str, Any]] = []
     for row in manifest.get("shards") or []:
         expected = int(row.get("task_count") or 0)
         expected_total += expected
-        baseline_dir = Path(row["baseline_job_dir"]).expanduser().resolve()
+        baseline_dir = (
+            Path(row["baseline_job_dir"]).expanduser().resolve()
+            if row.get("baseline_job_dir")
+            else None
+        )
         eval_dir = Path(row["eval_job_dir"]).expanduser().resolve()
-        baseline_status = job_status(baseline_dir, expected_trials=expected)
+        baseline_status = (
+            job_status(baseline_dir, expected_trials=expected)
+            if baseline_dir is not None
+            else None
+        )
         eval_status = job_status(eval_dir, expected_trials=expected)
         shard_rows.append(
             {
@@ -248,20 +249,29 @@ def main() -> None:
                 "evaluation": eval_status,
             }
         )
-        if not baseline_status["complete"]:
+        if with_baseline and baseline_status is not None and not baseline_status["complete"]:
             incomplete.append(f"{row.get('label')}: baseline incomplete")
         if not eval_status["complete"]:
             incomplete.append(f"{row.get('label')}: eval incomplete")
-        baseline_summaries.append(summarize_if_present(baseline_dir))
+        if baseline_dir is not None:
+            baseline_summaries.append(summarize_if_present(baseline_dir))
         eval_summaries.append(summarize_if_present(eval_dir))
 
     if incomplete and not args.allow_incomplete:
         lines = "\n".join(f"- {item}" for item in incomplete)
         raise SystemExit(f"Shard eval is incomplete; rerun with --allow-incomplete for progress.\n{lines}")
 
-    baseline = combine_summaries(label=f"{args.run_id}_baseline_all_shards", summaries=baseline_summaries)
     evaluation = combine_summaries(label=f"{args.run_id}_eval_all_shards", summaries=eval_summaries)
-    report = compare_combined(baseline, evaluation)
+    if with_baseline:
+        baseline = combine_summaries(label=f"{args.run_id}_baseline_all_shards", summaries=baseline_summaries)
+        report = compare_combined(baseline, evaluation)
+    else:
+        report = {
+            "evaluation": evaluation,
+            "tasks": evaluation["tasks"],
+            "mean_delta": None,
+            "resolved_delta": None,
+        }
     report.update(
         {
             "schema_version": 1,
@@ -270,6 +280,9 @@ def main() -> None:
             "manifest_path": str(manifest_path),
             "dataset": manifest.get("dataset"),
             "skill_version_id": manifest.get("skill_version_id"),
+            "skill_pack_root": manifest.get("skill_pack_root"),
+            "mode": manifest.get("mode"),
+            "with_baseline": with_baseline,
             "complete": not incomplete,
             "completeness": {
                 "expected_trials": expected_total,
@@ -285,10 +298,9 @@ def main() -> None:
     print(json.dumps(
         {
             "complete": report["complete"],
-            "baseline_trials": baseline["n_trials"],
             "eval_trials": evaluation["n_trials"],
-            "baseline_resolved": baseline["resolved"],
             "eval_resolved": evaluation["resolved"],
+            "eval_mean_reward": evaluation["mean_reward"],
             "mean_delta": report["mean_delta"],
             "resolved_delta": report["resolved_delta"],
             "out_json": str(out_json),
