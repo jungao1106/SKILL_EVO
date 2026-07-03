@@ -76,6 +76,29 @@ def tmux_session_exists(session: str) -> bool:
     return proc.returncode == 0
 
 
+def verify_python_runtime(python: str) -> None:
+    command = [
+        python,
+        "-c",
+        "import dotenv, harbor; import sys; print(sys.executable)",
+    ]
+    proc = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            "Python runtime cannot import required benchmark dependencies "
+            f"(dotenv, harbor): {python}\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+
+
 def source_env_block(env_file: Path) -> list[str]:
     lines = [
         "set -a",
@@ -282,7 +305,8 @@ def main() -> None:
     args.skill_root = args.skill_root.expanduser().resolve()
     args.promotion_decisions = args.promotion_decisions.expanduser().resolve()
     args.frozen_library_root = args.frozen_library_root.expanduser().resolve()
-    args.python = str(Path(args.python).expanduser().resolve()) if "/" in args.python else args.python
+    args.python = str(Path(args.python).expanduser()) if "/" in args.python else args.python
+    verify_python_runtime(args.python)
 
     source_skill_root = args.skill_root / args.skill_version_id
     if not source_skill_root.exists():
