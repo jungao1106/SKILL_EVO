@@ -876,11 +876,12 @@ def _reasoning_effort_none_proxy_command(base_url: str, api_key_env: str) -> str
     proxy_script = r'''
 import json
 import os
+import socketserver
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 HOST = "127.0.0.1"
@@ -903,6 +904,10 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
 def upstream_url(request_path: str) -> str:
