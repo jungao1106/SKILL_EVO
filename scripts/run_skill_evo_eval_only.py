@@ -20,6 +20,7 @@ from evolution.candidate_pack import (
     materialize_failure_candidate_augmented_pack,
     read_jsonl,
 )
+from evolution.frozen_library import materialize_frozen_skill_library
 from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
 
 
@@ -27,6 +28,7 @@ DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
 DEFAULT_EVO_ROOT = ROOT / "run_logs" / "evolution"
 DEFAULT_SKILL_ROOT = ROOT / "skills" / "accepted"
 DEFAULT_EVAL_PACK_ROOT = ROOT / "skills" / "eval_candidate_augmented"
+DEFAULT_FROZEN_LIBRARY_ROOT = ROOT / "skills" / "downstream"
 
 
 def log(message: str) -> None:
@@ -270,6 +272,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reuse an existing candidate-augmented eval pack directory instead of rebuilding it.",
     )
+    parser.add_argument(
+        "--frozen-library-promotion-decisions",
+        type=Path,
+        default=None,
+        help=(
+            "Optional training/promotion_decisions.jsonl. When set, build a frozen downstream "
+            "library containing general seeds, success-pattern skills, and support-qualified "
+            "failure-mode skills from training-only evidence."
+        ),
+    )
+    parser.add_argument(
+        "--frozen-library-root",
+        type=Path,
+        default=DEFAULT_FROZEN_LIBRARY_ROOT,
+        help="Root under which frozen downstream libraries are materialized.",
+    )
+    parser.add_argument("--frozen-min-success-repo-support", type=int, default=2)
+    parser.add_argument("--frozen-min-success-positive-support", type=int, default=2)
+    parser.add_argument("--frozen-max-success-skills", type=int, default=8)
+    parser.add_argument("--frozen-include-memory-only-success", action="store_true")
+    parser.add_argument("--frozen-min-failure-repo-support", type=int, default=2)
+    parser.add_argument("--frozen-max-failure-skills", type=int, default=8)
+    parser.add_argument("--frozen-include-support-1-failures", action="store_true")
+    parser.add_argument("--frozen-exclude-general", action="store_true")
+    parser.add_argument("--reuse-frozen-library", action="store_true")
     parser.add_argument("--memory-path", type=Path, default=None)
     parser.add_argument("--task-names-file", action="append", type=Path, default=None)
     parser.add_argument("--include-task-name", action="append", default=None)
@@ -309,6 +336,69 @@ def main() -> None:
         raise SystemExit(f"Missing skill pack root: {skill_pack_root}")
     base_skill_pack_root = skill_pack_root
     candidate_pack_manifest: dict[str, Any] | None = None
+    frozen_library_manifest: dict[str, Any] | None = None
+    if args.frozen_library_promotion_decisions and args.candidate_promotion_decisions:
+        raise SystemExit(
+            "Use either --frozen-library-promotion-decisions for main frozen-library eval "
+            "or --candidate-promotion-decisions for candidate-augmented ablation, not both."
+        )
+    if args.frozen_library_promotion_decisions:
+        promotion_decisions_path = args.frozen_library_promotion_decisions.expanduser().resolve()
+        if not args.dry_run and not promotion_decisions_path.exists():
+            raise SystemExit(f"Missing frozen-library promotion decisions: {promotion_decisions_path}")
+        frozen_library_root = (
+            args.frozen_library_root.expanduser().resolve()
+            / args.run_name
+            / args.skill_version_id
+        )
+        if args.reuse_frozen_library and frozen_library_root.exists():
+            manifest_path = frozen_library_root / "frozen_library_manifest.json"
+            if manifest_path.exists():
+                frozen_library_manifest = json.loads(manifest_path.read_text(errors="replace"))
+            else:
+                frozen_library_manifest = {
+                    "schema_version": 1,
+                    "kind": "frozen_training_distilled_skill_library",
+                    "output_root": str(frozen_library_root),
+                    "reused_without_manifest": True,
+                }
+        elif args.dry_run:
+            frozen_library_root.mkdir(parents=True, exist_ok=True)
+            frozen_library_manifest = {
+                "schema_version": 1,
+                "kind": "frozen_training_distilled_skill_library",
+                "dry_run": True,
+                "source_skill_root": str(base_skill_pack_root),
+                "output_root": str(frozen_library_root),
+                "promotion_decisions_path": str(promotion_decisions_path),
+                "selection": {
+                    "min_success_repo_support": args.frozen_min_success_repo_support,
+                    "min_success_positive_support": args.frozen_min_success_positive_support,
+                    "max_success_skills": args.frozen_max_success_skills,
+                    "require_accepted_success": not args.frozen_include_memory_only_success,
+                    "min_failure_repo_support": args.frozen_min_failure_repo_support,
+                    "max_failure_skills": args.frozen_max_failure_skills,
+                    "include_support_1_failures": args.frozen_include_support_1_failures,
+                    "include_general": not args.frozen_exclude_general,
+                },
+            }
+        else:
+            frozen_library_manifest = materialize_frozen_skill_library(
+                source_skill_root=base_skill_pack_root,
+                output_root=frozen_library_root,
+                promotion_decisions=read_jsonl(promotion_decisions_path),
+                run_name=args.run_name,
+                min_success_repo_support=args.frozen_min_success_repo_support,
+                min_success_positive_support=args.frozen_min_success_positive_support,
+                max_success_skills=args.frozen_max_success_skills,
+                require_accepted_success=not args.frozen_include_memory_only_success,
+                min_failure_repo_support=args.frozen_min_failure_repo_support,
+                max_failure_skills=args.frozen_max_failure_skills,
+                include_support_1_failures=args.frozen_include_support_1_failures,
+                include_general=not args.frozen_exclude_general,
+                clean=not args.reuse_frozen_library,
+            )
+        skill_pack_root = frozen_library_root
     if args.candidate_promotion_decisions:
         promotion_decisions_path = args.candidate_promotion_decisions.expanduser().resolve()
         if not args.dry_run and not promotion_decisions_path.exists():
@@ -388,6 +478,7 @@ def main() -> None:
         "skill_pack_root": str(skill_pack_root),
         "base_skill_pack_root": str(base_skill_pack_root),
         "candidate_augmented_eval": candidate_pack_manifest,
+        "frozen_library_eval": frozen_library_manifest,
         "memory_path": env.get("PI_SKILL_HARNESS_MEMORY_PATH"),
         "pi_skill_env": {
             "PI_SKILL_PACK_ROOT": env["PI_SKILL_PACK_ROOT"],
@@ -399,6 +490,8 @@ def main() -> None:
 
     if args.skip_eval:
         log(f"skip-eval: wrote manifest to {run_dir / 'manifest.json'}")
+        if frozen_library_manifest:
+            log(f"skip-eval: wrote frozen downstream library to {skill_pack_root}")
         if candidate_pack_manifest:
             log(f"skip-eval: wrote candidate-augmented pack to {skill_pack_root}")
         return

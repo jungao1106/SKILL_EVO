@@ -441,9 +441,9 @@ def _skill_retrieval_scopes() -> set[str]:
         if item.strip()
     }
     if "transfer" in scopes:
-        scopes.update({"general", "failure"})
+        scopes.update({"general", "success", "failure"})
     if "all" in scopes:
-        scopes.update({"general", "failure", "repo", "task"})
+        scopes.update({"general", "success", "failure", "repo", "task"})
     return scopes or {"task"}
 
 
@@ -474,8 +474,11 @@ def _skill_scope_rank(skill: dict[str, str], task_slug: str, repo_slug: str) -> 
     if "failure" in scopes and normalized.startswith(("_failure_modes/", "failure_modes/")):
         return 2
 
-    if "general" in scopes and normalized.startswith(("_general/", "general/")):
+    if "success" in scopes and normalized.startswith(("_success_patterns/", "success_patterns/")):
         return 3
+
+    if "general" in scopes and normalized.startswith(("_general/", "general/")):
+        return 4
     return None
 
 
@@ -598,7 +601,7 @@ def _pi_skills_prompt(skills: list[dict[str, str]]) -> str:
         "Skill pack:",
         f"- Read-only skill files are available under {PI_SANDBOX_SKILLS_DIR}.",
         f"- The skill index is saved at {PI_SKILLS_INDEX_PATH}.",
-        "- These skills can include task-stage, repo-level, failure-mode, or general SWE process skills depending on the configured retrieval scope.",
+        "- These skills can include task-stage, repo-level, success-pattern, failure-mode, or general SWE process skills depending on the configured retrieval scope.",
         "- First inspect the current repository evidence. Read a listed SKILL.md only if that first inspection matches its applicability, owner path, error signal, or validation command.",
         "- You may read zero skills. If no listed skill matches concrete repository evidence, continue with the normal no-skill workflow.",
         "- If a skill's first concrete check does not match the current repository, ignore that skill and do not force its patch shape.",
