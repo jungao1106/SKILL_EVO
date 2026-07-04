@@ -16,12 +16,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import compare_jobs, write_report
+from evolution.candidate_pack import (
+    materialize_failure_candidate_augmented_pack,
+    read_jsonl,
+)
 from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
 
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
 DEFAULT_EVO_ROOT = ROOT / "run_logs" / "evolution"
 DEFAULT_SKILL_ROOT = ROOT / "skills" / "accepted"
+DEFAULT_EVAL_PACK_ROOT = ROOT / "skills" / "eval_candidate_augmented"
 
 
 def log(message: str) -> None:
@@ -214,6 +219,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-job-dir", type=Path, default=None)
     parser.add_argument("--skill-version-id", required=True)
     parser.add_argument("--skill-root", type=Path, default=DEFAULT_SKILL_ROOT)
+    parser.add_argument(
+        "--candidate-promotion-decisions",
+        type=Path,
+        default=None,
+        help=(
+            "Optional training/promotion_decisions.jsonl. When set, build a candidate-augmented "
+            "eval pack containing promoted transfer skills plus selected staged failure-mode candidates."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-eval-pack-root",
+        type=Path,
+        default=DEFAULT_EVAL_PACK_ROOT,
+        help="Root under which candidate-augmented eval packs are materialized.",
+    )
+    parser.add_argument(
+        "--candidate-min-repo-support",
+        type=int,
+        default=int(os.getenv("SKILL_EVO_CANDIDATE_MIN_REPO_SUPPORT", "2")),
+        help="Minimum distinct repo support for staged failure-mode candidates included in the eval pack.",
+    )
+    parser.add_argument(
+        "--candidate-max-skills",
+        type=int,
+        default=int(os.getenv("SKILL_EVO_CANDIDATE_MAX_SKILLS", "8")),
+        help="Maximum staged failure-mode candidates to include after per-signature deduplication.",
+    )
+    parser.add_argument(
+        "--candidate-include-promoted",
+        action="store_true",
+        help="Also render promoted failure-mode decisions as candidate entries. Off by default to avoid duplicates.",
+    )
+    parser.add_argument(
+        "--candidate-include-existing-signatures",
+        action="store_true",
+        help=(
+            "Include staged candidates even when the same failure signature already has a promoted "
+            "failure-mode skill in the base pack. Off by default to avoid duplicate prompt entries."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-up-to-trigger-index",
+        type=int,
+        default=None,
+        help="Only include candidate decisions produced at or before this failure-mode trigger.",
+    )
+    parser.add_argument(
+        "--reuse-candidate-eval-pack",
+        action="store_true",
+        help="Reuse an existing candidate-augmented eval pack directory instead of rebuilding it.",
+    )
     parser.add_argument("--memory-path", type=Path, default=None)
     parser.add_argument("--task-names-file", action="append", type=Path, default=None)
     parser.add_argument("--include-task-name", action="append", default=None)
@@ -251,6 +307,60 @@ def main() -> None:
     skill_pack_root = args.skill_root.expanduser().resolve() / args.skill_version_id
     if not args.dry_run and not skill_pack_root.exists():
         raise SystemExit(f"Missing skill pack root: {skill_pack_root}")
+    base_skill_pack_root = skill_pack_root
+    candidate_pack_manifest: dict[str, Any] | None = None
+    if args.candidate_promotion_decisions:
+        promotion_decisions_path = args.candidate_promotion_decisions.expanduser().resolve()
+        if not args.dry_run and not promotion_decisions_path.exists():
+            raise SystemExit(f"Missing candidate promotion decisions: {promotion_decisions_path}")
+        candidate_pack_root = (
+            args.candidate_eval_pack_root.expanduser().resolve()
+            / f"{args.skill_version_id}_{args.run_name}"
+        )
+        if args.reuse_candidate_eval_pack and candidate_pack_root.exists():
+            manifest_path = candidate_pack_root / "candidate_augmented_manifest.json"
+            if manifest_path.exists():
+                candidate_pack_manifest = json.loads(manifest_path.read_text(errors="replace"))
+            else:
+                candidate_pack_manifest = {
+                    "schema_version": 1,
+                    "kind": "failure_mode_candidate_augmented_skill_pack",
+                    "output_root": str(candidate_pack_root),
+                    "reused_without_manifest": True,
+                }
+        else:
+            decisions = [] if args.dry_run else read_jsonl(promotion_decisions_path)
+            if args.dry_run:
+                candidate_pack_root.mkdir(parents=True, exist_ok=True)
+                candidate_pack_manifest = {
+                    "schema_version": 1,
+                    "kind": "failure_mode_candidate_augmented_skill_pack",
+                    "dry_run": True,
+                    "source_skill_root": str(base_skill_pack_root),
+                    "output_root": str(candidate_pack_root),
+                    "promotion_decisions_path": str(promotion_decisions_path),
+                    "selection": {
+                        "min_repo_support": args.candidate_min_repo_support,
+                        "max_candidates": args.candidate_max_skills,
+                        "include_promoted_candidates": args.candidate_include_promoted,
+                        "include_existing_signatures": args.candidate_include_existing_signatures,
+                        "up_to_trigger_index": args.candidate_up_to_trigger_index,
+                    },
+                }
+            else:
+                candidate_pack_manifest = materialize_failure_candidate_augmented_pack(
+                    source_skill_root=base_skill_pack_root,
+                    output_root=candidate_pack_root,
+                    promotion_decisions=decisions,
+                    run_name=args.run_name,
+                    min_repo_support=args.candidate_min_repo_support,
+                    max_candidates=args.candidate_max_skills,
+                    include_promoted_candidates=args.candidate_include_promoted,
+                    include_existing_signatures=args.candidate_include_existing_signatures,
+                    up_to_trigger_index=args.candidate_up_to_trigger_index,
+                    clean=True,
+                )
+        skill_pack_root = candidate_pack_root
 
     env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
@@ -276,6 +386,8 @@ def main() -> None:
         "eval_job_dir": str(eval_job_dir),
         "skill_version_id": args.skill_version_id,
         "skill_pack_root": str(skill_pack_root),
+        "base_skill_pack_root": str(base_skill_pack_root),
+        "candidate_augmented_eval": candidate_pack_manifest,
         "memory_path": env.get("PI_SKILL_HARNESS_MEMORY_PATH"),
         "pi_skill_env": {
             "PI_SKILL_PACK_ROOT": env["PI_SKILL_PACK_ROOT"],
@@ -285,7 +397,12 @@ def main() -> None:
     }
     write_json(run_dir / "manifest.json", manifest)
 
-    if not args.skip_eval and args.eval_job_dir is None:
+    if args.skip_eval:
+        log(f"skip-eval: wrote manifest to {run_dir / 'manifest.json'}")
+        if candidate_pack_manifest:
+            log(f"skip-eval: wrote candidate-augmented pack to {skill_pack_root}")
+        return
+    if args.eval_job_dir is None:
         run_command(
             benchmark_command(args, job_name=eval_job_name),
             env=env,

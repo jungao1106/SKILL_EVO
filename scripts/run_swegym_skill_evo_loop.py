@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import compare_jobs, first_reward_value, summarize_job, trial_result_paths, write_report
+from evolution.candidate_pack import materialize_failure_candidate_augmented_pack
 from agents.skill_evaluator import calibration_event, evaluate_candidate
 from agents.skill_writer import (
     build_failure_cluster,
@@ -40,6 +41,7 @@ from providers import ensure_macaron_attribution_header, ensure_reasoning_effort
 DEFAULT_SWEGYM_DATASET = ROOT / "data" / "harbor_swegym_500_uniform"
 DEFAULT_EVO_ROOT = ROOT / "run_logs" / "swegym_skill_evo"
 DEFAULT_SKILL_ARCHIVE_ROOT = ROOT / "skills" / "accepted"
+DEFAULT_CANDIDATE_EVAL_PACK_ROOT = ROOT / "skills" / "eval_candidate_augmented"
 DEFAULT_WANDB_PROJECT = "skills-evo-swegym"
 DEFAULT_VERIFIER_BUFFER_SEC = 900
 DEFAULT_REPO_UPDATE_BATCH_SIZE = 5
@@ -2150,6 +2152,40 @@ def parse_args() -> argparse.Namespace:
         help="Run validation metrics without rolling back rejected candidate versions.",
     )
     parser.add_argument(
+        "--validation-include-failure-candidates",
+        action="store_true",
+        help=(
+            "Ablation mode: validation gates use promoted transfer skills plus selected staged "
+            "failure-mode candidates rendered as negative-evidence skills."
+        ),
+    )
+    parser.add_argument(
+        "--validation-candidate-pack-root",
+        type=Path,
+        default=DEFAULT_CANDIDATE_EVAL_PACK_ROOT,
+        help="Root for temporary candidate-augmented validation skill packs.",
+    )
+    parser.add_argument(
+        "--validation-candidate-min-repo-support",
+        type=int,
+        default=int(os.getenv("SKILL_EVO_VALIDATION_CANDIDATE_MIN_REPO_SUPPORT", "2")),
+        help="Minimum distinct repo support for staged failure-mode candidates included in validation.",
+    )
+    parser.add_argument(
+        "--validation-candidate-max-skills",
+        type=int,
+        default=int(os.getenv("SKILL_EVO_VALIDATION_CANDIDATE_MAX_SKILLS", "8")),
+        help="Maximum staged failure-mode candidates included after per-signature deduplication.",
+    )
+    parser.add_argument(
+        "--validation-candidate-include-existing-signatures",
+        action="store_true",
+        help=(
+            "Include staged candidates even when that failure signature already has a promoted "
+            "failure-mode skill. Off by default to avoid duplicate prompt entries."
+        ),
+    )
+    parser.add_argument(
         "--run-verified-test",
         action="store_true",
         help="After train-val, run final skill-assisted evaluation on SWEBench-Verified.",
@@ -2337,6 +2373,11 @@ def main() -> None:
             "validation_max_diagnostic_rate": args.validation_max_diagnostic_rate,
             "validation_regression_tolerance": args.validation_regression_tolerance,
             "skip_validation_gate": args.skip_validation_gate,
+            "validation_include_failure_candidates": args.validation_include_failure_candidates,
+            "validation_candidate_min_repo_support": args.validation_candidate_min_repo_support,
+            "validation_candidate_max_skills": args.validation_candidate_max_skills,
+            "validation_candidate_include_existing_signatures": args.validation_candidate_include_existing_signatures,
+            "validation_candidate_pack_root": str(args.validation_candidate_pack_root),
         },
         "missing_runtime_env": missing_env,
     }
@@ -2622,8 +2663,47 @@ def main() -> None:
                             f"{run_name}_validation_iter{iteration:02d}_gate{gate_index:04d}_skills"
                         )
                         gate_job_dir = ROOT / "jobs" / gate_job_name
+                        validation_skill_pack_root = candidate_skill_pack_root
+                        candidate_augmented_manifest: dict[str, Any] | None = None
+                        if args.validation_include_failure_candidates and not args.dry_run:
+                            validation_skill_pack_root = (
+                                args.validation_candidate_pack_root.expanduser().resolve()
+                                / run_name
+                                / f"iter{iteration:02d}_gate{gate_index:04d}_{candidate_version}"
+                            )
+                            candidate_augmented_manifest = materialize_failure_candidate_augmented_pack(
+                                source_skill_root=candidate_skill_pack_root,
+                                output_root=validation_skill_pack_root,
+                                promotion_decisions=promotion_decisions,
+                                run_name=run_name,
+                                min_repo_support=args.validation_candidate_min_repo_support,
+                                max_candidates=args.validation_candidate_max_skills,
+                                include_promoted_candidates=False,
+                                include_existing_signatures=args.validation_candidate_include_existing_signatures,
+                                clean=True,
+                            )
+                        elif args.validation_include_failure_candidates:
+                            validation_skill_pack_root = (
+                                args.validation_candidate_pack_root.expanduser().resolve()
+                                / run_name
+                                / f"iter{iteration:02d}_gate{gate_index:04d}_{candidate_version}"
+                            )
+                            candidate_augmented_manifest = {
+                                "schema_version": 1,
+                                "kind": "failure_mode_candidate_augmented_skill_pack",
+                                "dry_run": True,
+                                "source_skill_root": str(candidate_skill_pack_root),
+                                "output_root": str(validation_skill_pack_root),
+                                "selection": {
+                                    "min_repo_support": args.validation_candidate_min_repo_support,
+                                    "max_candidates": args.validation_candidate_max_skills,
+                                    "include_promoted_candidates": False,
+                                    "include_existing_signatures": args.validation_candidate_include_existing_signatures,
+                                    "dedupe": "latest_per_failure_signature",
+                                },
+                            }
                         env["PI_SKILL_HARNESS_MEMORY_PATH"] = str(train_memory_path)
-                        env["PI_SKILL_PACK_ROOT"] = str(candidate_skill_pack_root)
+                        env["PI_SKILL_PACK_ROOT"] = str(validation_skill_pack_root)
                         env["PI_USE_SKILL_HARNESS_MEMORY"] = "false"
                         env["PI_SKILL_RETRIEVAL_SCOPE"] = "transfer"
                         if not job_result_is_complete(gate_job_dir):
@@ -2678,6 +2758,9 @@ def main() -> None:
                             "accepted_version_before": accepted_before,
                             "accepted_version_after": accepted_version,
                             "job_dir": str(gate_job_dir),
+                            "skill_pack_root": str(validation_skill_pack_root),
+                            "base_skill_pack_root": str(candidate_skill_pack_root),
+                            "candidate_augmented_validation": candidate_augmented_manifest,
                             "metrics": candidate_metrics,
                             "decision": gate_decision,
                         }
