@@ -390,6 +390,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skill-root", type=Path, default=ROOT / "skills" / "accepted")
     parser.add_argument("--promotion-decisions", type=Path, default=DEFAULT_PROMOTION_DECISIONS)
     parser.add_argument("--frozen-library-root", type=Path, default=ROOT / "skills" / "downstream")
+    parser.add_argument(
+        "--external-skill-pack-root",
+        type=Path,
+        default=None,
+        help="Evaluate an already materialized skill pack directly; skip frozen-library materialization.",
+    )
     parser.add_argument("--frozen-min-success-repo-support", type=int, default=2)
     parser.add_argument("--frozen-min-success-positive-support", type=int, default=2)
     parser.add_argument("--frozen-max-success-skills", type=int, default=8)
@@ -426,17 +432,26 @@ def main() -> None:
     args = parse_args()
     if args.baseline_only and args.with_baseline:
         raise SystemExit("--baseline-only and --with-baseline are mutually exclusive")
+    if args.baseline_only and args.external_skill_pack_root:
+        raise SystemExit("--baseline-only cannot be combined with --external-skill-pack-root")
     args.env_file = args.env_file.expanduser().resolve()
     args.skill_root = args.skill_root.expanduser().resolve()
     args.promotion_decisions = args.promotion_decisions.expanduser().resolve()
     args.frozen_library_root = args.frozen_library_root.expanduser().resolve()
+    args.external_skill_pack_root = (
+        args.external_skill_pack_root.expanduser().resolve()
+        if args.external_skill_pack_root
+        else None
+    )
     args.python = str(Path(args.python).expanduser()) if "/" in args.python else args.python
     verify_python_runtime(args.python)
 
     source_skill_root = args.skill_root / args.skill_version_id
-    if not args.baseline_only and not source_skill_root.exists():
+    if args.external_skill_pack_root and not args.external_skill_pack_root.exists():
+        raise SystemExit(f"Missing external skill pack root: {args.external_skill_pack_root}")
+    if not args.baseline_only and not args.external_skill_pack_root and not source_skill_root.exists():
         raise SystemExit(f"Missing source skill root: {source_skill_root}")
-    if not args.baseline_only and not args.promotion_decisions.exists():
+    if not args.baseline_only and not args.external_skill_pack_root and not args.promotion_decisions.exists():
         raise SystemExit(f"Missing promotion decisions: {args.promotion_decisions}")
     task_files = expand_glob(args.task_file_glob)
     if len(task_files) != args.num_shards:
@@ -446,9 +461,15 @@ def main() -> None:
 
     run_id = safe_name(args.run_id or f"{args.run_prefix}_{utc_tag()}")
     run_dir = ROOT / "run_logs" / "swebench_verified_frozen_shards" / run_id
-    skill_pack_root = args.frozen_library_root / run_id / args.skill_version_id
+    skill_pack_root = args.external_skill_pack_root or args.frozen_library_root / run_id / args.skill_version_id
     frozen_manifest = None
-    if not args.baseline_only:
+    if args.external_skill_pack_root:
+        frozen_manifest = {
+            "kind": "external_skill_pack",
+            "output_root": str(skill_pack_root),
+            "materialized_by": "upstream_gate_or_manual_pack",
+        }
+    elif not args.baseline_only:
         from evolution.frozen_library import materialize_frozen_skill_library_from_files
 
         if args.dry_run:
@@ -548,6 +569,9 @@ def main() -> None:
             "swebench_verified_no_skills_baseline_sharded_eval"
             if args.baseline_only
             else
+            "swebench_verified_external_skill_pack_direct_eval"
+            if args.external_skill_pack_root
+            else
             "swebench_verified_frozen_library_sharded_eval_with_baseline"
             if args.with_baseline
             else "swebench_verified_frozen_library_direct_skills_eval"
@@ -559,6 +583,7 @@ def main() -> None:
         "source_skill_root": str(source_skill_root),
         "promotion_decisions": str(args.promotion_decisions),
         "frozen_library_root": str(args.frozen_library_root),
+        "external_skill_pack_root": str(args.external_skill_pack_root) if args.external_skill_pack_root else None,
         "skill_pack_root": str(skill_pack_root),
         "frozen_library_manifest": frozen_manifest,
         "with_baseline": args.with_baseline,
