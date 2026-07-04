@@ -996,8 +996,11 @@ class Handler(BaseHTTPRequestHandler):
         )
         sys.stderr.write(
             "[harbor-reasoning-proxy] "
-            f"{self.command} {urllib.parse.urlsplit(self.path).path} "
-            f"reasoning_effort_none={str(injected_reasoning_effort).lower()}\n"
+            "{} {} reasoning_effort_none={}\n".format(
+                self.command,
+                urllib.parse.urlsplit(self.path).path,
+                str(injected_reasoning_effort).lower(),
+            )
         )
         try:
             with urllib.request.urlopen(request, timeout=900) as response:
@@ -1042,7 +1045,11 @@ class Handler(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer((HOST, PORT), Handler)
 sys.stderr.write(
-    f"[harbor-reasoning-proxy] listening on {HOST}:{PORT}, upstream={UPSTREAM_BASE}\n"
+    "[harbor-reasoning-proxy] listening on {}:{}, upstream={}\n".format(
+        HOST,
+        PORT,
+        UPSTREAM_BASE,
+    )
 )
 server.serve_forever()
 '''.strip()
