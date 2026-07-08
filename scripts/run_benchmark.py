@@ -298,6 +298,9 @@ def build_config(args: argparse.Namespace) -> Any:
         retry_kwargs["exclude_exceptions"] = set(retry_exclude)
 
     agent = _agent_name(args.agent)
+    metrics = []
+    if not _is_local_deepswe_dataset(args.dataset):
+        metrics.append(MetricConfig(type=MetricType.MEAN))
     return JobConfig(
         job_name=args.job_name,
         jobs_dir=ROOT / "jobs",
@@ -333,7 +336,7 @@ def build_config(args: argparse.Namespace) -> Any:
         verifier=VerifierConfig(disable=args.disable_verifier),
         agents=[_agent_config(args, provider)],
         datasets=[DatasetConfig(**dataset_kwargs)],
-        metrics=[MetricConfig(type=MetricType.MEAN)],
+        metrics=metrics,
     )
 
 
@@ -404,49 +407,82 @@ def _patch_harbor_runtime(
     if not deepswe_pre_artifacts:
         return
 
-    import harbor.models.task.artifacts as task_artifacts
-    import harbor.trial.artifact_handler as artifact_handler_module
-    from harbor.constants import MAIN_SERVICE_NAME
+    from harbor.metrics.mean import Mean
 
-    def is_main_deepswe_model_patch_artifact(artifact: Any) -> bool:
-        return (
-            getattr(artifact, "source", "").rstrip("/") == "/logs/artifacts/model.patch"
-            and task_artifacts.effective_artifact_service(artifact) == MAIN_SERVICE_NAME
-        )
+    original_mean_compute = Mean.compute
+    if not getattr(original_mean_compute, "_skills_evo_deepswe_multi_reward_patch", False):
 
-    original_with_convention_entry = task_artifacts.with_convention_entry
-    if not getattr(
-        original_with_convention_entry,
-        "_skills_evo_deepswe_model_patch_artifact_patch",
-        False,
-    ):
+        def compute_with_deepswe_reward_key(
+            self: Any,
+            rewards: list[dict[str, float | int] | None],
+        ) -> dict[str, float | int]:
+            normalized_rewards: list[dict[str, float | int] | None] = []
+            for reward in rewards:
+                if isinstance(reward, dict) and len(reward) > 1 and "reward" in reward:
+                    normalized_rewards.append({"reward": reward["reward"]})
+                else:
+                    normalized_rewards.append(reward)
+            return original_mean_compute(self, normalized_rewards)
 
-        def with_convention_entry_without_deepswe_dir(
-            entries: Any,
-            *,
-            convention_source: str,
-        ) -> list[Any]:
-            normalized = task_artifacts.normalize_artifact_entries(entries)
-            if (
-                convention_source.rstrip("/") == "/logs/artifacts"
-                and any(
-                    is_main_deepswe_model_patch_artifact(artifact)
-                    for artifact in normalized
-                )
-            ):
-                return normalized
-            return original_with_convention_entry(
-                entries,
-                convention_source=convention_source,
+        compute_with_deepswe_reward_key._skills_evo_deepswe_multi_reward_patch = True  # type: ignore[attr-defined]
+        Mean.compute = compute_with_deepswe_reward_key  # type: ignore[method-assign]
+
+    try:
+        import harbor.models.task.artifacts as task_artifacts
+        import harbor.trial.artifact_handler as artifact_handler_module
+        from harbor.constants import MAIN_SERVICE_NAME
+    except ModuleNotFoundError:
+        task_artifacts = None
+        artifact_handler_module = None
+        MAIN_SERVICE_NAME = None
+
+    if task_artifacts is not None and artifact_handler_module is not None:
+
+        def is_main_deepswe_model_patch_artifact(artifact: Any) -> bool:
+            return (
+                getattr(artifact, "source", "").rstrip("/")
+                == "/logs/artifacts/model.patch"
+                and task_artifacts.effective_artifact_service(artifact)
+                == MAIN_SERVICE_NAME
             )
 
-        with_convention_entry_without_deepswe_dir._skills_evo_deepswe_model_patch_artifact_patch = True  # type: ignore[attr-defined]
-        task_artifacts.with_convention_entry = with_convention_entry_without_deepswe_dir
-        artifact_handler_module.with_convention_entry = (
-            with_convention_entry_without_deepswe_dir
-        )
-    else:
-        artifact_handler_module.with_convention_entry = original_with_convention_entry
+        original_with_convention_entry = task_artifacts.with_convention_entry
+        if not getattr(
+            original_with_convention_entry,
+            "_skills_evo_deepswe_model_patch_artifact_patch",
+            False,
+        ):
+
+            def with_convention_entry_without_deepswe_dir(
+                entries: Any,
+                *,
+                convention_source: str,
+            ) -> list[Any]:
+                normalized = task_artifacts.normalize_artifact_entries(entries)
+                if (
+                    convention_source.rstrip("/") == "/logs/artifacts"
+                    and any(
+                        is_main_deepswe_model_patch_artifact(artifact)
+                        for artifact in normalized
+                    )
+                ):
+                    return normalized
+                return original_with_convention_entry(
+                    entries,
+                    convention_source=convention_source,
+                )
+
+            with_convention_entry_without_deepswe_dir._skills_evo_deepswe_model_patch_artifact_patch = True  # type: ignore[attr-defined]
+            task_artifacts.with_convention_entry = (
+                with_convention_entry_without_deepswe_dir
+            )
+            artifact_handler_module.with_convention_entry = (
+                with_convention_entry_without_deepswe_dir
+            )
+        else:
+            artifact_handler_module.with_convention_entry = (
+                original_with_convention_entry
+            )
 
     def trial_environment(trial: Any) -> Any:
         return getattr(trial, "_environment", None) or getattr(
