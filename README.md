@@ -6,8 +6,9 @@ It keeps:
 
 - Harbor as the benchmark harness.
 - E2B as the remote sandbox.
-- Pi as the only agent adapter.
+- Pi and Claude Code as selectable agent adapters.
 - A generic `openai` provider driven by `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_MODEL`, and `OPENAI_COMPAT_API`.
+- First-class `novita`, `macaron`/`marcron`, and `sglang` provider profiles.
 - A separate `tinker` provider profile.
 - `--use-skills` / `--no-skills` selection.
 - The existing Pi tool-use harness in `scripts/check_pi_tool_harness.py`.
@@ -29,6 +30,54 @@ npm install -g @earendil-works/pi-coding-agent
 ```
 
 Fill `.env` with provider and E2B credentials.
+
+## Unified Benchmark Runner
+
+`scripts/run_benchmark.py` is the shared entry point for SWE-Bench Verified and
+local DeepSWE-style Harbor datasets:
+
+```bash
+python scripts/run_benchmark.py \
+  --dataset swe-bench/swe-bench-verified@2 \
+  --agent pi \
+  --provider novita \
+  --use-skills \
+  --n-tasks 1 \
+  --job-name smoke_verified_pi_novita
+```
+
+Claude Code uses the same runner and provider profile:
+
+```bash
+python scripts/run_benchmark.py \
+  --dataset swe-bench/swe-bench-verified@2 \
+  --agent claude-code \
+  --provider novita \
+  --no-skills \
+  --n-tasks 1 \
+  --job-name smoke_verified_claude_novita
+```
+
+DeepSWE can be launched through the thin wrapper, which defaults to the local
+reference dataset path when present:
+
+```bash
+python scripts/run_deepswe.py \
+  --agent claude-code \
+  --provider sglang \
+  --n-tasks 1 \
+  --job-name smoke_deepswe_claude_sglang
+```
+
+Provider profiles:
+
+- `novita`: Pi uses `NOVITA_BASE_URL`; Claude Code uses `NOVITA_ANTHROPIC_BASE_URL`.
+- `macaron`/`marcron`: Pi uses `MACARON_BASE_URL`; Claude Code uses `MACARON_ANTHROPIC_BASE_URL`; `CLAUDE_CODE_ATTRIBUTION_HEADER=0` is set by default.
+- `sglang`: Pi uses `SGLANG_BASE_URL`; Claude Code uses `SGLANG_ANTHROPIC_BASE_URL`.
+
+DeepSWE local datasets automatically enable the `pre_artifacts.sh` hook so the
+task can produce `/logs/artifacts/model.patch` before verification. Disable it
+with `--disable-deepswe-pre-artifacts`.
 
 ## Run
 

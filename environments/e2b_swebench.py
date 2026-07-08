@@ -145,6 +145,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         pi_template_suffix: str | None = None,
         strip_dockerfile_comments: bool = True,
         sandbox_timeout_sec: int | None = None,
+        force_allow_internet: bool = False,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -165,6 +166,10 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         self._sandbox_timeout_sec = self._resolve_sandbox_timeout_sec(
             sandbox_timeout_sec
         )
+        self._force_allow_internet = force_allow_internet
+
+    def _allow_internet_access(self) -> bool:
+        return True if self._force_allow_internet else self.task_env_config.allow_internet
 
     def _legacy_template_base(self) -> str:
         return self.environment_name.replace("/", "__").replace(".", "-")
@@ -349,7 +354,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                     template=self._template_name,
                     metadata=metadata,
                     timeout=self._sandbox_timeout_sec,
-                    allow_internet_access=self.task_env_config.allow_internet,
+                    allow_internet_access=self._allow_internet_access(),
                 ),
                 timeout=_sandbox_create_timeout_sec(),
             )
@@ -370,7 +375,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                         template=self._template_name,
                         metadata=metadata,
                         timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self.task_env_config.allow_internet,
+                        allow_internet_access=self._allow_internet_access(),
                     ),
                     timeout=_sandbox_create_timeout_sec(),
                 )
@@ -390,7 +395,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                         template=self._template_name,
                         metadata=metadata,
                         timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self.task_env_config.allow_internet,
+                        allow_internet_access=self._allow_internet_access(),
                     ),
                     timeout=_sandbox_create_timeout_sec(),
                 )
@@ -406,7 +411,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                         template=self._template_name,
                         metadata=metadata,
                         timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self.task_env_config.allow_internet,
+                        allow_internet_access=self._allow_internet_access(),
                     ),
                     timeout=_sandbox_create_timeout_sec(),
                 )
@@ -424,7 +429,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                         template=self._template_name,
                         metadata=metadata,
                         timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self.task_env_config.allow_internet,
+                        allow_internet_access=self._allow_internet_access(),
                     ),
                     timeout=_sandbox_create_timeout_sec(),
                 )
@@ -444,7 +449,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 template=template_name,
                 metadata=metadata,
                 timeout=self._sandbox_timeout_sec,
-                allow_internet_access=self.task_env_config.allow_internet,
+                allow_internet_access=self._allow_internet_access(),
             ),
             timeout=_sandbox_create_timeout_sec(),
         )

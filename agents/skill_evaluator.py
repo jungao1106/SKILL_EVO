@@ -52,6 +52,7 @@ def evaluate_candidate(
     candidate: dict[str, Any],
     evidence: dict[str, Any],
     verifier_context: dict[str, Any] | None = None,
+    evaluator_context: dict[str, Any] | None = None,
     evaluator_policy: dict[str, Any] | list[str] | None = None,
     min_repo_positive_support: int = 2,
     min_failure_repo_support: int = 3,
@@ -66,7 +67,7 @@ def evaluate_candidate(
     risks = _candidate_risks(candidate)
     case_counts = evidence.get("case_counts") if isinstance(evidence.get("case_counts"), dict) else {}
     diagnostic_counts = evidence.get("diagnostic_signature_counts") if isinstance(evidence.get("diagnostic_signature_counts"), dict) else {}
-    verifier_context = verifier_context or {}
+    feedback_context = evaluator_context if evaluator_context is not None else (verifier_context or {})
     if isinstance(evaluator_policy, dict):
         policy_rules = [str(rule) for rule in (evaluator_policy.get("rules") or []) if str(rule).strip()]
         policy_update_count = int(evaluator_policy.get("update_count") or 0)
@@ -138,7 +139,7 @@ def evaluate_candidate(
         reason = "hard safety risk detected"
     elif level == "repo" and positive_support < min_repo_positive_support:
         decision = "memory_only"
-        reason = "insufficient verifier-positive repo support"
+        reason = "insufficient positive repo support"
     elif level == "repo" and not repeated_repo_signal:
         decision = "memory_only"
         reason = "missing repeated repo path, edit, or validation evidence"
@@ -150,7 +151,7 @@ def evaluate_candidate(
         reason = "insufficient cross-repo support for failure-mode candidate"
     elif score >= 0.62 and not strong_negative:
         decision = "accept"
-        reason = "candidate passed deterministic verifier-proxy gate"
+        reason = "candidate passed deterministic evaluator gate"
     elif score >= 0.45:
         decision = "revise"
         reason = "candidate has partial support but needs stronger evidence or structure"
@@ -168,7 +169,8 @@ def evaluate_candidate(
         "confidence": round(min(0.95, 0.45 + abs(score - 0.5)), 3),
         "risk_flags": risks,
         "reason": reason,
-        "verifier_context": verifier_context,
+        "evaluator_context": feedback_context,
+        "verifier_context": feedback_context,
         "evidence_summary": {
             "support_tasks": support_tasks,
             "positive_support": positive_support,
@@ -191,8 +193,9 @@ def calibration_event(
     candidate: dict[str, Any],
     decision: dict[str, Any],
     verifier_context: dict[str, Any] | None = None,
+    evaluator_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    verifier_context = verifier_context or {}
+    feedback_context = evaluator_context if evaluator_context is not None else (verifier_context or {})
     return {
         "created_at": utc_now(),
         "candidate_level": candidate.get("level"),
@@ -200,5 +203,6 @@ def calibration_event(
         "evaluator_decision": decision.get("decision"),
         "proxy_reward": decision.get("proxy_reward"),
         "risk_flags": decision.get("risk_flags") or [],
-        "verifier_context": verifier_context,
+        "evaluator_context": feedback_context,
+        "verifier_context": feedback_context,
     }

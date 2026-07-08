@@ -5,6 +5,22 @@ from typing import Any, MutableMapping
 
 MACARON_ATTRIBUTION_HEADER_ENV = "CLAUDE_CODE_ATTRIBUTION_HEADER"
 MACARON_ATTRIBUTION_HEADER_VALUE = "0"
+SUPPORTED_PROVIDER_CHOICES = (
+    "openai",
+    "tinker",
+    "novita",
+    "macaron",
+    "marcron",
+    "sglang",
+    "sglang_qwen",
+)
+CLAUDE_CODE_PROVIDER_CHOICES = (
+    "novita",
+    "macaron",
+    "marcron",
+    "sglang",
+    "sglang_qwen",
+)
 
 
 def is_macaron_base_url(base_url: str | None) -> bool:
@@ -46,7 +62,7 @@ def ensure_reasoning_effort_none(
 
 @dataclass(frozen=True)
 class ProviderSpec:
-    """Provider settings for the Pi agent model entry."""
+    """Provider settings for both Pi and Claude Code harnesses."""
 
     name: str
     env_prefix: str
@@ -59,6 +75,10 @@ class ProviderSpec:
     pi_auth_header: bool = True
     pi_model_reasoning: bool = False
     default_api_key: str | None = None
+    default_base_url: str | None = None
+    default_model: str | None = None
+    anthropic_base_url_env: str | None = None
+    default_anthropic_base_url: str | None = None
 
     @property
     def model_name(self) -> str:
@@ -66,11 +86,33 @@ class ProviderSpec:
 
     @property
     def model(self) -> str:
+        value = os.getenv(self.model_env)
+        if value is not None and value.strip():
+            return value.strip()
+        if self.default_model is not None:
+            return self.default_model
         return os.environ[self.model_env]
 
     @property
     def base_url(self) -> str:
+        value = os.getenv(self.base_url_env)
+        if value is not None and value.strip():
+            return value.strip()
+        if self.default_base_url is not None:
+            return self.default_base_url
         return os.environ[self.base_url_env]
+
+    @property
+    def anthropic_base_url(self) -> str:
+        env_name = self.anthropic_base_url_env
+        if not env_name:
+            raise ValueError(f"Provider {self.name!r} does not support Claude Code.")
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return value.strip()
+        if self.default_anthropic_base_url is not None:
+            return self.default_anthropic_base_url
+        return os.environ[env_name]
 
     @property
     def provider_api(self) -> str:
@@ -79,16 +121,40 @@ class ProviderSpec:
             return self.default_provider_api
         return value.strip()
 
-    def required_env(self) -> list[str]:
-        required = [self.base_url_env, self.model_env]
+    def supports_claude_code(self) -> bool:
+        return bool(self.anthropic_base_url_env and self.default_anthropic_base_url)
+
+    def required_env(self, *, agent: str = "pi") -> list[str]:
         if self.default_api_key is None:
-            required.insert(0, self.api_key_env)
+            required = [self.api_key_env]
+        else:
+            required = []
+
+        if agent in {"claude", "claude-code", "claude_sdk", "claude-sdk"}:
+            if not self.supports_claude_code():
+                raise ValueError(
+                    f"Provider {self.name!r} does not define a Claude Code endpoint."
+                )
+            if (
+                self.anthropic_base_url_env
+                and self.default_anthropic_base_url is None
+            ):
+                required.append(self.anthropic_base_url_env)
+            if self.default_model is None:
+                required.append(self.model_env)
+            return required
+
+        if self.default_base_url is None:
+            required.append(self.base_url_env)
+        if self.default_model is None:
+            required.append(self.model_env)
         return required
 
-    def env_mapping(self) -> dict[str, str]:
-        include_macaron_env = ensure_macaron_attribution_header(
-            os.getenv(self.base_url_env)
-        )
+    def env_mapping(self, *, agent: str = "pi") -> dict[str, str]:
+        if agent in {"claude", "claude-code", "claude_sdk", "claude-sdk"}:
+            return self.claude_env_mapping()
+
+        include_macaron_env = ensure_macaron_attribution_header(self.base_url)
         mapping = {
             self.base_url_env: f"${{{self.base_url_env}}}",
             self.model_env: f"${{{self.model_env}}}",
@@ -98,6 +164,23 @@ class ProviderSpec:
         if include_macaron_env:
             mapping[MACARON_ATTRIBUTION_HEADER_ENV] = (
                 f"${{{MACARON_ATTRIBUTION_HEADER_ENV}}}"
+            )
+        return mapping
+
+    def claude_env_mapping(self) -> dict[str, str]:
+        if not self.anthropic_base_url_env:
+            raise ValueError(f"Provider {self.name!r} does not support Claude Code.")
+        ensure_macaron_attribution_header(self.anthropic_base_url)
+        mapping = {
+            self.anthropic_base_url_env: f"${{{self.anthropic_base_url_env}}}",
+            self.model_env: f"${{{self.model_env}}}",
+            MACARON_ATTRIBUTION_HEADER_ENV: f"${{{MACARON_ATTRIBUTION_HEADER_ENV}}}",
+        }
+        if self.default_api_key is None or os.environ.get(self.api_key_env):
+            mapping[self.api_key_env] = f"${{{self.api_key_env}}}"
+        if os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"):
+            mapping["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = (
+                "${CLAUDE_CODE_MAX_OUTPUT_TOKENS}"
             )
         return mapping
 
@@ -159,6 +242,10 @@ def _spec(
     env_prefix: str,
     default_provider_api: str,
     compat: dict[str, Any],
+    default_base_url: str | None = None,
+    default_model: str | None = None,
+    anthropic_base_url_env: str | None = None,
+    default_anthropic_base_url: str | None = None,
 ) -> ProviderSpec:
     return ProviderSpec(
         name=name,
@@ -169,13 +256,37 @@ def _spec(
         provider_api_env=f"{env_prefix}_API",
         default_provider_api=default_provider_api,
         pi_openai_compat=compat,
+        default_base_url=default_base_url,
+        default_model=default_model,
+        anthropic_base_url_env=anthropic_base_url_env,
+        default_anthropic_base_url=default_anthropic_base_url,
     )
 
 
-def resolve_provider(name: str) -> ProviderSpec:
+def normalize_provider_name(name: str) -> str:
     provider = name.strip().lower()
+    if provider == "marcron":
+        return "macaron"
+    if provider in {"openai-compatible", "openai_compat", "compat"}:
+        return "openai"
+    return provider
 
-    if provider in {"openai", "openai-compatible", "openai_compat", "compat"}:
+
+def _glm_openai_compat(prefix: str) -> dict[str, Any]:
+    compat = _openai_compat_from_env(prefix)
+    compat.setdefault("requiresThinkingAsText", _bool_env(f"{prefix}_THINKING_AS_TEXT", True))
+    compat.setdefault("thinkingFormat", os.getenv(f"{prefix}_THINKING_FORMAT", "zai"))
+    compat.setdefault("supportsReasoningEffort", True)
+    compat.setdefault("reasoningEffort", os.getenv(f"{prefix}_REASONING_EFFORT", "none"))
+    compat.setdefault("defaultReasoningEffort", compat["reasoningEffort"])
+    compat.setdefault("enableThinking", _bool_env(f"{prefix}_ENABLE_THINKING", False))
+    return compat
+
+
+def resolve_provider(name: str) -> ProviderSpec:
+    provider = normalize_provider_name(name)
+
+    if provider == "openai":
         return _spec(
             name="openai",
             env_prefix="OPENAI_COMPAT",
@@ -198,6 +309,55 @@ def resolve_provider(name: str) -> ProviderSpec:
             compat=compat,
         )
 
+    if provider == "novita":
+        return _spec(
+            name="novita",
+            env_prefix="NOVITA",
+            default_provider_api="openai-completions",
+            compat=_glm_openai_compat("NOVITA"),
+            default_base_url="https://api.novita.ai/v3/openai",
+            default_model="zai-org/glm-5.2",
+            anthropic_base_url_env="NOVITA_ANTHROPIC_BASE_URL",
+            default_anthropic_base_url="https://api.novita.ai/anthropic",
+        )
+
+    if provider == "macaron":
+        return _spec(
+            name="macaron",
+            env_prefix="MACARON",
+            default_provider_api="openai-completions",
+            compat=_glm_openai_compat("MACARON"),
+            default_base_url="https://pi-api-cn.macaron.xin/v1",
+            default_model="glm-5.2",
+            anthropic_base_url_env="MACARON_ANTHROPIC_BASE_URL",
+            default_anthropic_base_url="https://pi-api.macaron.xin/anthropic",
+        )
+
+    if provider == "sglang":
+        return _spec(
+            name="sglang",
+            env_prefix="SGLANG",
+            default_provider_api="openai-completions",
+            compat=_glm_openai_compat("SGLANG"),
+            default_base_url="http://34.201.124.250:39606/v1",
+            default_model="zai-org/GLM-5.2-FP8",
+            anthropic_base_url_env="SGLANG_ANTHROPIC_BASE_URL",
+            default_anthropic_base_url="http://34.201.124.250:39606",
+        )
+
+    if provider == "sglang_qwen":
+        return _spec(
+            name="sglang_qwen",
+            env_prefix="SGLANG_QWEN",
+            default_provider_api="openai-completions",
+            compat=_glm_openai_compat("SGLANG_QWEN"),
+            default_base_url="http://123.57.26.97:7997/v1",
+            default_model="qwen3.6-35b-a3b",
+            anthropic_base_url_env="SGLANG_QWEN_ANTHROPIC_BASE_URL",
+            default_anthropic_base_url="http://123.57.26.97:7997",
+        )
+
     raise ValueError(
-        f"Unsupported provider {name!r}. Supported providers are: openai, tinker."
+        f"Unsupported provider {name!r}. Supported providers are: "
+        + ", ".join(SUPPORTED_PROVIDER_CHOICES)
     )

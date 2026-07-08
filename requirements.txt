@@ -5,3 +5,4 @@ dockerfile-parse>=2.0.1
 e2b>=1.0.0
 tenacity>=8.2.0
 wandb>=0.17.0
+claude-agent-sdk>=0.1.0

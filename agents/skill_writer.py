@@ -114,7 +114,7 @@ def write_repo_candidate(cluster: dict[str, Any]) -> dict[str, Any]:
         "abort_condition": "Stop using this repo candidate if the current traceback, symbol, path, or focused test does not match the cluster evidence.",
         "support_summary": (
             f"{cluster.get('support_tasks', 0)} task events; "
-            f"{cluster.get('positive_support', 0)} verifier-positive events; "
+            f"{cluster.get('positive_support', 0)} positive events; "
             f"paths={', '.join(repeated_paths) or 'none'}; "
             f"tests={', '.join(repeated_tests) or 'none'}; "
             f"failures={', '.join(repeated_failures) or 'none'}"
@@ -179,7 +179,7 @@ def candidate_to_skill_markdown(
     lines = [
         "---",
         f"name: {name}",
-        f"description: {level} skill accepted from verifier-calibrated evaluator.",
+        f"description: {level} skill accepted by the evaluator.",
         "active: true",
         f"quality_score: {quality:.2f}",
         f"quality_tier: {level}",
