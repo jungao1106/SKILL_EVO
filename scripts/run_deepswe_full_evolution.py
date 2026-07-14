@@ -49,6 +49,30 @@ def timestamp_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def absolute_path_preserving_symlinks(path: Path) -> Path:
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def validate_child_python(python: Path) -> None:
+    completed = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import scripts.run_benchmark; import scripts.aggregate_benchmark_job",
+        ],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stdout or "").strip()[-2000:]
+        raise SystemExit(
+            f"DeepSWE child Python preflight failed for {python}: {detail}"
+        )
+
+
 def read_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.is_file():
@@ -251,7 +275,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     args.base_skill_root = args.base_skill_root.expanduser().resolve()
     args.policy_state = args.policy_state.expanduser().resolve()
     args.env_file = args.env_file.expanduser().resolve()
-    args.python = args.python.expanduser().resolve()
+    args.python = absolute_path_preserving_symlinks(args.python)
     if not 2 <= args.max_gate <= 4:
         raise SystemExit("--max-gate must be between 2 and 4.")
     for path, label in (
@@ -262,6 +286,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     ):
         if not path.exists():
             raise SystemExit(f"Missing {label}: {path}")
+    validate_child_python(args.python)
     expected_trials = len(list(args.dataset.glob("*/task.toml")))
     if expected_trials != 113:
         raise SystemExit(

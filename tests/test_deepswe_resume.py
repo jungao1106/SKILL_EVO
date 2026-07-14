@@ -28,6 +28,7 @@ from scripts.run_benchmark import (
     _upgrade_deepswe_resume_config,
 )
 from scripts.run_deepswe import build_deepswe_argv
+from scripts.run_deepswe_full_evolution import absolute_path_preserving_symlinks
 from scripts import run_swebench_tts_subset_evo_loop as subset_loop
 
 
@@ -91,6 +92,21 @@ class DeepSweWrapperDefaultsTest(unittest.TestCase):
         self.assertNotIn("--override-memory-mb", argv)
         self.assertNotIn("--max-retries", argv)
         self.assertEqual(argv[argv.index("--override-storage-mb") + 1], "40960")
+
+
+class FullEvolutionRunnerTest(unittest.TestCase):
+    def test_child_python_path_keeps_virtualenv_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            interpreter = root / "python-real"
+            interpreter.write_text("placeholder")
+            venv_python = root / "venv-python"
+            venv_python.symlink_to(interpreter)
+
+            normalized = absolute_path_preserving_symlinks(venv_python)
+
+            self.assertEqual(normalized, venv_python)
+            self.assertTrue(normalized.is_symlink())
 
 
 class JobResumeStateTest(unittest.TestCase):
