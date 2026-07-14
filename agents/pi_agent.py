@@ -7,6 +7,7 @@ import shlex
 import tarfile
 import tempfile
 import textwrap
+import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -54,6 +55,7 @@ PI_SKILL_PACK_TAR_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz")
 PI_SKILL_PACK_EXCLUDE_DIRS = {"benchmark-sharded-concurrency"}
 PI_SKILL_PACK_CHUNK_SIZE = 24_000
 PI_MAX_PROMPT_SKILLS = 8
+DEFAULT_PI_AGENT_VERSION = "0.80.6"
 PI_MACARON_PROXY_PORT = 18080
 PI_REASONING_PROXY_PORT = PI_MACARON_PROXY_PORT
 PI_RUNTIME_PATH_COMMAND = (
@@ -327,6 +329,9 @@ def _active_task_skill_roots() -> list[Path]:
     version_id = version.get("version_id") if version else None
     if override:
         root = Path(override).expanduser()
+        # An explicit benchmark pack is a closed experiment input. Do not mix
+        # accepted-version ancestors from mutable harness memory into it.
+        return [root]
     elif isinstance(version_id, str) and version_id:
         root = PI_TASK_SKILLS_BASE / version_id
     else:
@@ -417,6 +422,12 @@ def _task_slug_from_instruction(instruction: str) -> str:
 
 
 def _repo_slug_from_instruction(instruction: str) -> str:
+    marker = re.search(
+        r"(?<![A-Za-z0-9_.-])skill-repo:([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+)",
+        instruction,
+    )
+    if marker:
+        return marker.group(1)
     task_slug = _task_slug_from_instruction(instruction)
     if "__" not in task_slug:
         return ""
@@ -441,9 +452,11 @@ def _skill_retrieval_scopes() -> set[str]:
         if item.strip()
     }
     if "transfer" in scopes:
-        scopes.update({"general", "success", "failure"})
+        scopes.update({"general", "success", "failure", "test_time"})
     if "all" in scopes:
-        scopes.update({"general", "success", "failure", "repo", "task"})
+        scopes.update(
+            {"general", "success", "failure", "repo", "task", "test_time"}
+        )
     return scopes or {"task"}
 
 
@@ -459,6 +472,16 @@ def _skill_scope_rank(skill: dict[str, str], task_slug: str, repo_slug: str) -> 
 
     if "task" in scopes and task_slug and task_slug in normalized:
         return 0
+
+    if "test_time" in scopes:
+        if repo_slug and normalized.startswith(f"_test_time/repo/{repo_slug}/"):
+            return 0
+        if normalized.startswith("_test_time/failure_modes/"):
+            return 1
+        if normalized.startswith("_test_time/") and not normalized.startswith(
+            "_test_time/repo/"
+        ):
+            return 4
 
     if "repo" in scopes and repo_slug:
         repo_org = _repo_org_from_slug(repo_slug)
@@ -589,6 +612,22 @@ def _task_filter_text(instruction: str, environment: BaseEnvironment) -> str:
         value = getattr(environment, attr, "")
         if value:
             parts.append(str(value))
+    environment_dir = getattr(environment, "environment_dir", None)
+    if environment_dir is not None:
+        task_toml = Path(environment_dir).parent / "task.toml"
+        try:
+            task_config = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+            repository_url = str(
+                (task_config.get("metadata") or {}).get("repository_url") or ""
+            )
+            match = re.search(
+                r"(?:github\.com[/:])([^/]+)/([^/#]+?)(?:\.git)?$",
+                repository_url.rstrip("/"),
+            )
+            if match:
+                parts.append(f"skill-repo:{match.group(1)}__{match.group(2)}")
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
     return "\n".join(parts)
 
 
@@ -1692,10 +1731,11 @@ class PiAgent(BaseInstalledAgent):
         use_skills: bool = False,
         benchmark_name: str = "swe-bench",
         require_workspace_change: bool = True,
+        version: str = DEFAULT_PI_AGENT_VERSION,
         *args: Any,
         **kwargs: Any,
     ):
-        super().__init__(logs_dir=logs_dir, *args, **kwargs)
+        super().__init__(logs_dir=logs_dir, version=version, *args, **kwargs)
         self.provider_name = provider_name
         self.api_key_env = api_key_env
         self.base_url_env = base_url_env
@@ -1812,7 +1852,9 @@ fi
         )
         if pi_check.return_code == 0:
             parsed_version = self.parse_version(pi_check.stdout)
-            if parsed_version:
+            if parsed_version and (
+                not self._version or parsed_version == self._version
+            ):
                 self._version = parsed_version
                 await self.exec_as_root(
                     environment,
@@ -1834,7 +1876,7 @@ fi
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
 
-        version_spec = f"@{self._version}" if self._version else "@latest"
+        version_spec = f"@{self._version or DEFAULT_PI_AGENT_VERSION}"
         await self.exec_as_agent(
             environment,
             command=self._install_node_and_pi_command(version_spec),
