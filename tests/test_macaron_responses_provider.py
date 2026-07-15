@@ -1,4 +1,5 @@
 import argparse
+import ast
 import os
 import unittest
 from unittest import mock
@@ -144,6 +145,28 @@ class MacaronResponsesProviderTest(unittest.TestCase):
                 "128000",
             )
         self.assertEqual(context_window, 200000)
+
+    def test_swegym_validation_candidate_decisions_are_loaded_from_disk(self) -> None:
+        source = run_swegym_skill_evo_loop.Path(
+            run_swegym_skill_evo_loop.__file__
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "materialize_failure_candidate_augmented_pack"
+        ]
+        self.assertEqual(len(calls), 1)
+        promotion_keyword = next(
+            keyword
+            for keyword in calls[0].keywords
+            if keyword.arg == "promotion_decisions"
+        )
+        self.assertIsInstance(promotion_keyword.value, ast.Call)
+        self.assertIsInstance(promotion_keyword.value.func, ast.Name)
+        self.assertEqual(promotion_keyword.value.func.id, "read_jsonl")
 
 
 if __name__ == "__main__":

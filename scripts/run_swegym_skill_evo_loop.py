@@ -20,7 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import compare_jobs, first_reward_value, summarize_job, trial_result_paths, write_report
-from evolution.candidate_pack import materialize_failure_candidate_augmented_pack
+from evolution.candidate_pack import (
+    materialize_failure_candidate_augmented_pack,
+    read_jsonl,
+)
 from agents.skill_evaluator import calibration_event, evaluate_candidate
 from agents.skill_writer import (
     build_failure_cluster,
@@ -2673,7 +2676,9 @@ def main() -> None:
                             candidate_augmented_manifest = materialize_failure_candidate_augmented_pack(
                                 source_skill_root=candidate_skill_pack_root,
                                 output_root=validation_skill_pack_root,
-                                promotion_decisions=promotion_decisions,
+                                promotion_decisions=read_jsonl(
+                                    train_dir / "promotion_decisions.jsonl"
+                                ),
                                 run_name=run_name,
                                 min_repo_support=args.validation_candidate_min_repo_support,
                                 max_candidates=args.validation_candidate_max_skills,
