@@ -72,7 +72,7 @@ python scripts/run_deepswe.py \
 Provider profiles:
 
 - `novita`: Pi uses `NOVITA_BASE_URL`; Claude Code uses `NOVITA_ANTHROPIC_BASE_URL`.
-- `macaron`/`marcron`: Pi uses `MACARON_BASE_URL`; Claude Code uses `MACARON_ANTHROPIC_BASE_URL`; `CLAUDE_CODE_ATTRIBUTION_HEADER=0` is set by default.
+- `macaron`/`marcron`: the SKILLS_EVO Pi path uses `MACARON_BASE_URL`. It defaults to `https://pi-api-cn.macaron.xin/v1`, model `glm-5.2`, API shape `openai-responses`, and a 200,000-token context window. `marcron` is a compatibility alias for `macaron`.
 - `sglang`: Pi uses `SGLANG_BASE_URL`; Claude Code uses `SGLANG_ANTHROPIC_BASE_URL`.
 
 DeepSWE local datasets automatically enable the `pre_artifacts.sh` hook so the
@@ -99,6 +99,22 @@ OPENAI_COMPAT_API=openai-completions
 ```
 
 For a Responses-shaped GPT 5.5 endpoint, set `OPENAI_COMPAT_API=openai-responses`.
+
+Macaron CN GLM 5.2 has a first-class Pi profile, so the endpoint, model, API
+shape, and context window do not need to be repeated on the command line:
+
+```bash
+MACARON_API_KEY=... E2B_API_KEY=... \
+python scripts/run_swegym_skill_evo_loop.py \
+  --provider macaron \
+  --run-name swegym_macaron_glm52 \
+  --concurrency 1
+```
+
+The same `--provider macaron` (or compatibility spelling `marcron`) works with
+`run_skill_evo_verified.py` and `run_skill_evo_eval_only.py`. The API key stays
+in the child-process environment for both Pi evaluation and backbone summary
+calls; it is not appended to the generated `run_benchmark.py` argv.
 
 Tinker:
 
@@ -168,6 +184,17 @@ Smoke-check model endpoints without launching a benchmark:
 python scripts/check_openai_compat.py
 python scripts/check_tinker_models.py
 ```
+
+Check the first-class Macaron Responses profile directly with its environment
+variable; no benchmark or E2B sandbox is launched:
+
+```bash
+LLM_PROVIDER=macaron MACARON_API_KEY=... \
+python scripts/check_openai_compat.py
+```
+
+The check exits nonzero unless the Responses body reports `status=completed`
+and contains non-empty output text.
 
 ## Skill/Harness Evolution Memory
 

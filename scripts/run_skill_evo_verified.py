@@ -18,7 +18,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import compare_jobs, summarize_job, write_report
-from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
+from providers import (
+    ProviderSpec,
+    SUPPORTED_PROVIDER_CHOICES,
+    configure_provider_env,
+)
 
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
@@ -49,6 +53,23 @@ def run_command(
     if dry_run:
         return
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def configure_provider(args: argparse.Namespace, env: dict[str, str]) -> ProviderSpec:
+    provider = configure_provider_env(
+        args.provider,
+        env,
+        api_key=args.provider_api_key,
+        base_url=args.provider_base_url,
+        model=args.provider_model,
+        provider_api=args.provider_api,
+    )
+    args.provider = provider.name
+    args.provider_base_url = env.get(provider.base_url_env)
+    args.provider_model = env.get(provider.model_env)
+    args.provider_api = env.get(provider.provider_api_env)
+    args.provider_api_key = None
+    return provider
 
 
 def read_active_version(memory_path: Path) -> str:
@@ -169,6 +190,7 @@ def task_args(args: argparse.Namespace) -> list[str]:
 def benchmark_command(
     args: argparse.Namespace,
     *,
+    provider: ProviderSpec,
     job_name: str,
     use_skills: bool,
 ) -> list[str]:
@@ -178,7 +200,7 @@ def benchmark_command(
         "--dataset",
         args.dataset,
         "--provider",
-        args.provider,
+        provider.name,
         "--job-name",
         job_name,
         "--concurrency",
@@ -200,8 +222,6 @@ def benchmark_command(
         command.extend(["--provider-base-url", args.provider_base_url])
     if args.provider_model:
         command.extend(["--provider-model", args.provider_model])
-    if args.provider_api_key:
-        command.extend(["--provider-api-key", args.provider_api_key])
     if args.provider_api:
         command.extend(["--provider-api", args.provider_api])
     if args.model_context_window is not None:
@@ -385,7 +405,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dataset", default=os.getenv("HARBOR_DATASET", DEFAULT_DATASET))
-    parser.add_argument("--provider", choices=["openai", "tinker"], default=os.getenv("LLM_PROVIDER", "openai"))
+    parser.add_argument(
+        "--provider",
+        choices=SUPPORTED_PROVIDER_CHOICES,
+        default=os.getenv("LLM_PROVIDER", "openai"),
+    )
     parser.add_argument("--provider-base-url", default=os.getenv("PROVIDER_BASE_URL"))
     parser.add_argument("--provider-model", default=os.getenv("PROVIDER_MODEL"))
     parser.add_argument("--provider-api-key", default=os.getenv("PROVIDER_API_KEY"))
@@ -468,6 +492,9 @@ def main() -> None:
             "--include-task-name, and --task-names-file."
         )
 
+    env = os.environ.copy()
+    provider = configure_provider(args, env)
+
     run_name = args.run_name or f"verified_testset_{utc_stamp()}"
     run_dir = DEFAULT_EVO_ROOT / run_name
     training_dir = run_dir / "training"
@@ -476,14 +503,7 @@ def main() -> None:
     eval_dir.mkdir(parents=True, exist_ok=True)
     policy_paths = copy_default_policies(run_dir)
 
-    env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
-    ensure_macaron_attribution_header(args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"), env)
-    ensure_reasoning_effort_none(
-        args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"),
-        env,
-        env_prefix="OPENAI_COMPAT",
-    )
 
     baseline_job_name = f"{run_name}_baseline_noskills"
     eval_job_name = f"{run_name}_eval_skills"
@@ -524,7 +544,7 @@ def main() -> None:
         "run_name": run_name,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dataset": args.dataset,
-        "provider": args.provider,
+        "provider": provider.name,
         "mode": "direct_test_set_training_and_eval",
         "train_eval_split": "same_tasks",
         "task_selection": "all_dataset_tasks" if is_full_dataset_selection(args) else "filtered_tasks",
@@ -545,7 +565,12 @@ def main() -> None:
 
     if not args.skip_baseline and args.baseline_job_dir is None:
         run_command(
-            benchmark_command(args, job_name=baseline_job_name, use_skills=False),
+            benchmark_command(
+                args,
+                provider=provider,
+                job_name=baseline_job_name,
+                use_skills=False,
+            ),
             env=env,
             dry_run=args.dry_run,
         )
@@ -600,7 +625,12 @@ def main() -> None:
         if not args.dry_run and not skill_pack_root.exists():
             raise SystemExit(f"Missing skill pack root: {skill_pack_root}")
         run_command(
-            benchmark_command(args, job_name=eval_job_name, use_skills=True),
+            benchmark_command(
+                args,
+                provider=provider,
+                job_name=eval_job_name,
+                use_skills=True,
+            ),
             env=env,
             dry_run=args.dry_run,
         )
