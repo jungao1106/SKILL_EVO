@@ -185,6 +185,17 @@ python scripts/check_openai_compat.py
 python scripts/check_tinker_models.py
 ```
 
+Check the first-class Macaron Responses profile directly with its environment
+variable; no benchmark or E2B sandbox is launched:
+
+```bash
+LLM_PROVIDER=macaron MACARON_API_KEY=... \
+python scripts/check_openai_compat.py
+```
+
+The check exits nonzero unless the Responses body reports `status=completed`
+and contains non-empty output text.
+
 ## Skill/Harness Evolution Memory
 
 `scripts/update_skill_harness_memory.py` builds an append-only, versioned memory
