@@ -14,6 +14,7 @@ from scripts.materialize_deepswe_tts_evolution_gates import (
     sha256_tree,
 )
 from scripts.attach_deepswe_gate_report import attach_gate_report
+from scripts.aggregate_benchmark_job import reconcile_root_job_stats
 from scripts.run_benchmark import (
     DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS,
     _deepswe_result_infra_reason,
@@ -139,6 +140,72 @@ class JobResumeStateTest(unittest.TestCase):
             )
 
             self.assertEqual(_existing_job_progress(job_dir), (2, 3, None))
+
+    def test_aggregate_reconciles_stale_root_stats_from_trial_results(self) -> None:
+        from harbor.models.agent.context import AgentContext
+        from harbor.models.task.id import LocalTaskId
+        from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
+        from harbor.models.trial.result import AgentInfo, TrialResult
+        from harbor.models.verifier.result import VerifierResult
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            job_dir = root / "job"
+            task_dir = root / "task"
+            job_dir.mkdir()
+            task_dir.mkdir()
+
+            for name, reward in (("failed", 0), ("passed", 1)):
+                trial_dir = job_dir / name
+                trial_dir.mkdir()
+                config = TrialConfig(
+                    task=TaskConfig(path=task_dir, source="tasks"),
+                    trial_name=name,
+                    trials_dir=job_dir,
+                    agent=AgentConfig(name="oracle"),
+                )
+                result = TrialResult(
+                    task_name=f"task-{name}",
+                    trial_name=name,
+                    trial_uri=trial_dir.resolve().as_uri(),
+                    task_id=LocalTaskId(path=task_dir),
+                    task_checksum="checksum",
+                    config=config,
+                    agent_info=AgentInfo(name="oracle", version="test"),
+                    agent_result=AgentContext(),
+                    verifier_result=VerifierResult(rewards={"reward": reward}),
+                )
+                (trial_dir / "result.json").write_text(result.model_dump_json())
+
+            root_result_path = job_dir / "result.json"
+            stale_root = {
+                "stats": {
+                    "n_trials": 2,
+                    "n_errors": 1,
+                    "evals": {
+                        "oracle__tasks": {
+                            "reward_stats": {"reward": {"-1": ["failed"]}},
+                            "exception_stats": {"InfraError": ["failed"]},
+                        }
+                    },
+                }
+            }
+            root_result_path.write_text(json.dumps(stale_root))
+
+            reconciled = reconcile_root_job_stats(
+                job_dir,
+                root_result_path,
+                stale_root,
+            )
+
+            stats = reconciled["stats"]
+            self.assertEqual(stats["n_trials"], 2)
+            self.assertEqual(stats["n_errors"], 0)
+            evaluation = next(iter(stats["evals"].values()))
+            self.assertEqual(evaluation["reward_stats"]["reward"]["0"], ["failed"])
+            self.assertEqual(evaluation["reward_stats"]["reward"]["1"], ["passed"])
+            self.assertEqual(evaluation["metrics"], [{"mean": 0.5}])
+            self.assertEqual(json.loads(root_result_path.read_text()), reconciled)
 
     def test_infra_and_interrupted_trials_are_archived_for_reverification(self) -> None:
         from harbor.models.agent.context import AgentContext

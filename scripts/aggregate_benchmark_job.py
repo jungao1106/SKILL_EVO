@@ -29,6 +29,37 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
+def reconcile_root_job_stats(
+    job_dir: Path,
+    root_result_path: Path,
+    root: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebuild Harbor's mutable job summary from authoritative trial results."""
+    from harbor.models.job.result import JobStats
+    from harbor.models.trial.result import TrialResult
+
+    trial_results = [
+        TrialResult.model_validate_json(path.read_text(errors="replace"))
+        for path in trial_result_paths(job_dir)
+    ]
+    stats = JobStats.from_trial_results(trial_results)
+    for eval_stats in stats.evals.values():
+        reward_counts = eval_stats.reward_stats.get("reward") or {}
+        denominator = sum(len(trial_names) for trial_names in reward_counts.values())
+        if not denominator:
+            continue
+        total = sum(
+            float(reward) * len(trial_names)
+            for reward, trial_names in reward_counts.items()
+        )
+        eval_stats.metrics = [{"mean": total / denominator}]
+
+    reconciled = dict(root)
+    reconciled["stats"] = stats.model_dump(mode="json")
+    write_json(root_result_path, reconciled)
+    return reconciled
+
+
 def infra_invalid_trials(job_dir: Path) -> list[dict[str, str]]:
     invalid: list[dict[str, str]] = []
     if not job_dir.is_dir():
@@ -222,8 +253,9 @@ def main() -> None:
         }
         root = {}
     else:
-        summary = summarize_job(job_dir)
         root = read_json(root_result)
+        root = reconcile_root_job_stats(job_dir, root_result, root)
+        summary = summarize_job(job_dir)
 
     expected = args.expected_trials
     if expected is None:
