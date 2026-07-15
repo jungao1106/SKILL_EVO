@@ -235,6 +235,11 @@ _DOCKER_ENV_REFERENCE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
     r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
+_SHELL_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:^|_)(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|BEARER_TOKEN|"
+    r"PASSWORD|SECRET|CREDENTIALS?)(?:$|_)"
+)
 
 
 def _dockerfile_runtime_env(
@@ -358,6 +363,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             sandbox_timeout_sec
         )
         self._force_allow_internet = force_allow_internet
+        self._dockerfile_declared_env: dict[str, str] = {}
 
     def _allow_internet_access(self) -> bool:
         return True if self._force_allow_internet else self.task_env_config.allow_internet
@@ -638,6 +644,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         )
 
     async def _restore_dockerfile_runtime_env(self) -> None:
+        self._dockerfile_declared_env = {}
         if not self.task_env_config.docker_image:
             return
         if not self._sandbox:
@@ -662,6 +669,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             self._environment_definition_path,
             base_env,
         )
+        self._dockerfile_declared_env = dockerfile_env
         self._persistent_env = {
             **dockerfile_env,
             **self._persistent_env,
@@ -673,6 +681,48 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 f"keys={','.join(sorted(dockerfile_env))} "
                 "status=ok"
             )
+
+    def _command_with_dockerfile_env(
+        self,
+        command: str,
+        env: dict[str, str] | None,
+    ) -> str:
+        """Export imported-image Dockerfile ENV values inside the command shell."""
+
+        declared_env = getattr(self, "_dockerfile_declared_env", {})
+        if not declared_env:
+            return command
+
+        per_exec_env = env or {}
+        exports: list[str] = []
+        for key, declared_value in sorted(declared_env.items()):
+            if not _SHELL_ENV_NAME.fullmatch(key) or _SENSITIVE_ENV_NAME.search(key):
+                continue
+            value = per_exec_env.get(
+                key,
+                self._persistent_env.get(key, declared_value),
+            )
+            exports.append(f"export {key}={shlex.quote(str(value))}")
+        if not exports:
+            return command
+        return "\n".join([*exports, command])
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> Any:
+        command = self._command_with_dockerfile_env(command, env)
+        return await super().exec(
+            command=command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
 
     def _workdir_from_dockerfile(self) -> str | None:
         return next(

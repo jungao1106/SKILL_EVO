@@ -261,6 +261,13 @@ ENV FINAL_ENV=yes
                     "PATH": "/task/bin:/usr/bin",
                 },
             )
+            self.assertEqual(
+                environment._dockerfile_declared_env,
+                {
+                    "PYTHONPATH": "/app/src",
+                    "PATH": "/task/bin:/usr/bin",
+                },
+            )
 
     def test_restore_dockerfile_env_skips_native_dockerfile_templates(self) -> None:
         environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
@@ -275,6 +282,80 @@ ENV FINAL_ENV=yes
         self.assertEqual(
             environment._persistent_env,
             {"PATH": "/already/from/dockerfile"},
+        )
+        self.assertEqual(environment._dockerfile_declared_env, {})
+
+    def test_exec_exports_only_dockerfile_env_with_per_exec_precedence(self) -> None:
+        environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+        environment._dockerfile_declared_env = {
+            "PATH": "/opt/venv/bin:/usr/bin",
+            "PYTHONPATH": "/app",
+            "VIRTUAL_ENV": "/opt/venv",
+            "NOVITA_API_KEY": "docker-placeholder",
+        }
+        environment._persistent_env = {
+            "PATH": "/opt/venv/bin:/usr/bin",
+            "PYTHONPATH": "/configured/src",
+            "VIRTUAL_ENV": "/opt/venv",
+            "NOVITA_API_KEY": "provider-secret",
+        }
+
+        with patch.object(
+            e2b_swebench.E2BEnvironment,
+            "exec",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(return_code=0),
+        ) as base_exec:
+            asyncio.run(
+                environment.exec(
+                    "python -m pytest",
+                    env={
+                        "PATH": "/per-exec/bin",
+                        "OPENAI_COMPAT_API_KEY": "per-exec-secret",
+                    },
+                )
+            )
+
+        command = base_exec.await_args.kwargs["command"]
+        self.assertEqual(
+            command,
+            "\n".join(
+                (
+                    "export PATH=/per-exec/bin",
+                    "export PYTHONPATH=/configured/src",
+                    "export VIRTUAL_ENV=/opt/venv",
+                    "python -m pytest",
+                )
+            ),
+        )
+        self.assertNotIn("NOVITA_API_KEY", command)
+        self.assertNotIn("provider-secret", command)
+        self.assertNotIn("OPENAI_COMPAT_API_KEY", command)
+        self.assertNotIn("per-exec-secret", command)
+        self.assertEqual(
+            base_exec.await_args.kwargs["env"],
+            {
+                "PATH": "/per-exec/bin",
+                "OPENAI_COMPAT_API_KEY": "per-exec-secret",
+            },
+        )
+
+    def test_exec_keeps_native_dockerfile_command_unchanged(self) -> None:
+        environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+        environment._dockerfile_declared_env = {}
+        environment._persistent_env = {"NOVITA_API_KEY": "provider-secret"}
+
+        with patch.object(
+            e2b_swebench.E2BEnvironment,
+            "exec",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(return_code=0),
+        ) as base_exec:
+            asyncio.run(environment.exec("python -m pytest"))
+
+        self.assertEqual(
+            base_exec.await_args.kwargs["command"],
+            "python -m pytest",
         )
 
 
