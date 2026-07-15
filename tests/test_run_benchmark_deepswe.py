@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -13,9 +14,16 @@ from scripts.run_benchmark import (
     DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS,
     DeepSweAgentSetupInfraError,
     DeepSweArtifactDownloadError,
+    DeepSweVerifierInfraError,
     _DEEPSWE_MODEL_PATCH_POSTPROCESS_SCRIPT,
+    _DEEPSWE_VERIFIER_TEST_ERRATA,
+    _apply_deepswe_verifier_test_errata,
+    _deepswe_fresh_environment_verifier_retry,
     _download_deepswe_artifacts_with_retry,
     _deepswe_official_test_patch_paths,
+    _ensure_deepswe_agent_logs_before_isolation,
+    _move_deepswe_verification_to_fresh_environment,
+    _preserve_go_build_events_in_raw_log,
     _required_deepswe_artifact_paths,
 )
 
@@ -244,6 +252,68 @@ new file mode 100644
                 ["tests/new test.py"],
             )
 
+    def test_go_build_events_are_logged_before_reporter_filter(self) -> None:
+        source = r"""
+# The `grep -v '"Action":"build-'` filter remains required by the reporter.
+go test -json ./... | grep -v '"Action":"build-' | tee -a "$RUN_LOG" | reporter
+go test -json ./pkg \
+  | grep -v '"Action":"build-' \
+  | tee -a "$RUN_LOG" | reporter
+""".lstrip()
+
+        transformed, count = _preserve_go_build_events_in_raw_log(source)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            transformed.count(
+                "| tee -a \"$RUN_LOG\" | grep -v "
+                "'\"Action\":\"build-' | reporter"
+            ),
+            2,
+        )
+        self.assertIn("# The `grep -v", transformed)
+
+    def test_hidden_test_errata_is_checksum_guarded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "example-task"
+            tests_dir = Path(tmp) / "prepared-tests"
+            tests_dir.mkdir()
+            source = "type helper struct{}\nfunc helper() {}\n"
+            patch_path = tests_dir / "test.patch"
+            patch_path.write_text(source)
+            erratum = {
+                "path": "test.patch",
+                "sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "replacements": (("helper", "taskUniqueHelper", 2),),
+            }
+
+            with mock.patch.dict(
+                _DEEPSWE_VERIFIER_TEST_ERRATA,
+                {task_dir.name: erratum},
+                clear=True,
+            ):
+                applied = _apply_deepswe_verifier_test_errata(
+                    task_dir,
+                    tests_dir,
+                )
+
+            self.assertEqual(applied, ["helper->taskUniqueHelper:2"])
+            self.assertNotIn("helper", patch_path.read_text())
+
+            patch_path.write_text(source + "// drift\n")
+            with (
+                mock.patch.dict(
+                    _DEEPSWE_VERIFIER_TEST_ERRATA,
+                    {task_dir.name: erratum},
+                    clear=True,
+                ),
+                self.assertRaisesRegex(
+                    DeepSweVerifierInfraError,
+                    "erratum source changed",
+                ),
+            ):
+                _apply_deepswe_verifier_test_errata(task_dir, tests_dir)
+
 
 class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
     async def test_retries_required_downloads_in_the_same_trial(self) -> None:
@@ -351,6 +421,306 @@ class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
             DeepSweAgentSetupInfraError.__name__,
             DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS,
         )
+
+
+class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_deepswe_timeout_retries_same_patch_in_fresh_environment(self) -> None:
+        from harbor.trial.trial import VerifierTimeoutError
+
+        calls: list[str] = []
+
+        async def verify_once(_trial: object) -> None:
+            calls.append("once")
+            if len(calls) == 1:
+                raise VerifierTimeoutError("verifier timed out")
+            _trial.result.verifier_result = SimpleNamespace(  # type: ignore[attr-defined]
+                rewards={"reward": 0}
+            )
+
+        async def verify_with_retry(_trial: object) -> None:
+            calls.append("retry-wrapper")
+
+        verify_with_retry.__wrapped__ = verify_once  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp)
+            (task_dir / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+            trial = SimpleNamespace(
+                _task=SimpleNamespace(
+                    paths=SimpleNamespace(task_dir=task_dir),
+                ),
+                _logger=mock.Mock(),
+                _skills_evo_deepswe_fresh_verifier_environment=True,
+                result=SimpleNamespace(verifier_result=None),
+            )
+            with (
+                mock.patch(
+                    "scripts.run_benchmark."
+                    "_download_deepswe_verifier_logs_best_effort",
+                    new_callable=mock.AsyncMock,
+                ) as download_logs,
+                mock.patch(
+                    "scripts.run_benchmark."
+                    "_replace_deepswe_verifier_environment",
+                    new_callable=mock.AsyncMock,
+                ) as replace_environment,
+            ):
+                patched = _deepswe_fresh_environment_verifier_retry(
+                    verify_with_retry
+                )
+                await patched(trial)
+
+            download_logs.assert_awaited_once_with(
+                trial,
+                label="timeout_attempt_1",
+            )
+            replace_environment.assert_awaited_once_with(
+                trial,
+                retry_index=1,
+                stop_current=True,
+            )
+        self.assertEqual(calls, ["once", "once"])
+
+    async def test_negative_reward_retries_same_patch_in_fresh_environment(self) -> None:
+        calls = 0
+
+        async def verify_once(trial: object) -> None:
+            nonlocal calls
+            calls += 1
+            trial.result.verifier_result = SimpleNamespace(  # type: ignore[attr-defined]
+                rewards={"reward": -1 if calls == 1 else 0}
+            )
+
+        async def verify_with_retry(_trial: object) -> None:
+            raise AssertionError("Harbor retry wrapper should not run")
+
+        verify_with_retry.__wrapped__ = verify_once  # type: ignore[attr-defined]
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp)
+            (task_dir / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+            trial = SimpleNamespace(
+                _task=SimpleNamespace(
+                    paths=SimpleNamespace(task_dir=task_dir),
+                ),
+                _logger=mock.Mock(),
+                _skills_evo_deepswe_fresh_verifier_environment=True,
+                result=SimpleNamespace(verifier_result=None),
+            )
+            with (
+                mock.patch(
+                    "scripts.run_benchmark."
+                    "_download_deepswe_verifier_logs_best_effort",
+                    new_callable=mock.AsyncMock,
+                ) as download_logs,
+                mock.patch(
+                    "scripts.run_benchmark."
+                    "_replace_deepswe_verifier_environment",
+                    new_callable=mock.AsyncMock,
+                ) as replace_environment,
+            ):
+                patched = _deepswe_fresh_environment_verifier_retry(
+                    verify_with_retry
+                )
+                await patched(trial)
+
+            download_logs.assert_awaited_once_with(
+                trial,
+                label="negative_reward_attempt_1",
+            )
+            replace_environment.assert_awaited_once_with(
+                trial,
+                retry_index=1,
+                stop_current=True,
+            )
+        self.assertEqual(calls, 2)
+
+    async def test_non_deepswe_preserves_harbor_retry_wrapper(self) -> None:
+        calls: list[str] = []
+
+        async def verify_once(_trial: object) -> None:
+            calls.append("once")
+
+        async def verify_with_retry(_trial: object) -> None:
+            calls.append("retry-wrapper")
+
+        verify_with_retry.__wrapped__ = verify_once  # type: ignore[attr-defined]
+        trial = SimpleNamespace(
+            _task=SimpleNamespace(
+                paths=SimpleNamespace(task_dir=Path("/does/not/exist")),
+            )
+        )
+
+        patched = _deepswe_fresh_environment_verifier_retry(verify_with_retry)
+        await patched(trial)
+
+        self.assertEqual(calls, ["retry-wrapper"])
+
+    async def test_deepswe_verifier_uses_fresh_offline_environment(self) -> None:
+        from harbor.models.task.config import EnvironmentConfig as TaskEnvironmentConfig
+        from harbor.models.trial.config import (
+            EnvironmentConfig as TrialEnvironmentConfig,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_dir = root / "task"
+            environment_dir = task_dir / "environment"
+            environment_dir.mkdir(parents=True)
+            (task_dir / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+            (task_dir / "task.toml").write_text(
+                """\
+[metadata]
+base_commit_hash = "abc123"
+[verifier]
+environment_mode = "separate"
+[verifier.environment]
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480
+allow_internet = false
+"""
+            )
+            paths = SimpleNamespace(
+                trial_dir=root / "trial",
+                artifacts_dir=root / "trial" / "artifacts",
+                agent_dir=root / "trial" / "agent",
+                verifier_dir=root / "trial" / "verifier",
+            )
+
+            async def download_patch(*, source_path: str, target_path: Path) -> None:
+                self.assertEqual(source_path, "/logs/artifacts/model.patch")
+                target_path.write_text("diff --git a/a b/a\n")
+
+            agent_environment = SimpleNamespace(
+                download_file=mock.AsyncMock(side_effect=download_patch),
+                stop=mock.AsyncMock(),
+            )
+            verifier_environment = SimpleNamespace(
+                default_user=None,
+                start=mock.AsyncMock(),
+                stop=mock.AsyncMock(),
+                exec=mock.AsyncMock(
+                    return_value=SimpleNamespace(return_code=0)
+                ),
+                upload_file=mock.AsyncMock(),
+            )
+            trial_environment = TrialEnvironmentConfig(
+                import_path="environments.e2b_swebench:E2BSwebenchEnvironment",
+                env={"NOVITA_API_KEY": "secret"},
+                kwargs={
+                    "force_allow_internet": True,
+                    "template_namespace": "test-team",
+                    "pi_template_suffix": "agent-augmented",
+                },
+            )
+            task_environment = TaskEnvironmentConfig(
+                cpus=1,
+                memory_mb=2048,
+                storage_mb=10240,
+                allow_internet=True,
+                mcp_servers=[],
+                skills_dir="/agent/skills",
+            )
+            trial = SimpleNamespace(
+                _environment=agent_environment,
+                _trial_paths=paths,
+                _task=SimpleNamespace(
+                    name="datacurve/example",
+                    paths=SimpleNamespace(
+                        task_dir=task_dir,
+                        environment_dir=environment_dir,
+                    ),
+                    config=SimpleNamespace(
+                        environment=task_environment,
+                        verifier=SimpleNamespace(user="verifier"),
+                    ),
+                ),
+                config=SimpleNamespace(
+                    trial_name="example__trial",
+                    environment=trial_environment,
+                    agent=SimpleNamespace(import_path="agents.unknown:Agent"),
+                    environment_build_timeout_multiplier=None,
+                    timeout_multiplier=1.0,
+                ),
+                _logger=mock.Mock(),
+            )
+
+            with mock.patch(
+                "harbor.environments.factory.EnvironmentFactory."
+                "create_environment_from_config",
+                return_value=verifier_environment,
+            ) as create_environment:
+                await _move_deepswe_verification_to_fresh_environment(trial)
+
+            agent_environment.stop.assert_awaited_once_with(delete=True)
+            self.assertIs(trial._environment, verifier_environment)
+            verifier_environment.start.assert_awaited_once_with(force_build=False)
+            verifier_environment.upload_file.assert_awaited_once_with(
+                source_path=paths.artifacts_dir / "model.patch",
+                target_path="/logs/artifacts/model.patch",
+            )
+            self.assertEqual(verifier_environment.default_user, "verifier")
+
+            call = create_environment.call_args.kwargs
+            self.assertEqual(call["session_id"], "example__trial-verifier")
+            self.assertEqual(call["config"].env, {})
+            self.assertFalse(call["config"].kwargs["force_allow_internet"])
+            self.assertEqual(call["config"].kwargs["pi_template_suffix"], "")
+            self.assertEqual(call["task_env_config"].cpus, 2)
+            self.assertEqual(call["task_env_config"].memory_mb, 8192)
+            self.assertEqual(call["task_env_config"].storage_mb, 20480)
+            self.assertFalse(call["task_env_config"].allow_internet)
+            self.assertEqual(call["task_env_config"].mcp_servers, [])
+            self.assertIsNone(call["task_env_config"].skills_dir)
+
+    async def test_agent_logs_are_retried_before_agent_sandbox_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = SimpleNamespace(
+                artifacts_dir=root / "artifacts",
+                agent_dir=root / "agent",
+            )
+            calls = 0
+
+            async def download_logs(**_kwargs: object) -> None:
+                nonlocal calls
+                calls += 1
+                if calls < 2:
+                    return
+                paths.agent_dir.mkdir(parents=True, exist_ok=True)
+                for name in (
+                    "claude-agent-metadata.json",
+                    "claude-agent-sdk-result.json",
+                    "claude-agent-sdk.jsonl",
+                ):
+                    (paths.agent_dir / name).write_text("{}")
+
+            trial = SimpleNamespace(
+                _trial_paths=paths,
+                config=SimpleNamespace(
+                    agent=SimpleNamespace(
+                        import_path="agents.claude_sdk_agent:ClaudeSdkAgent"
+                    )
+                ),
+                _are_agent_logs_downloaded=True,
+                _maybe_download_logs=mock.AsyncMock(side_effect=download_logs),
+            )
+            with mock.patch("scripts.run_benchmark.asyncio.sleep", mock.AsyncMock()):
+                await _ensure_deepswe_agent_logs_before_isolation(
+                    trial,
+                    result_only=False,
+                )
+
+            self.assertEqual(calls, 2)
+            self.assertTrue(
+                all(
+                    path.is_file()
+                    for path in _required_deepswe_artifact_paths(
+                        trial,
+                        result_only=False,
+                    )[1:]
+                )
+            )
 
 
 if __name__ == "__main__":

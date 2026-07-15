@@ -160,6 +160,123 @@ class TemplateLookupCacheTests(unittest.TestCase):
         previous_sandbox.kill.assert_awaited_once()
         self.assertIsNone(environment._sandbox)
 
+    def test_dockerfile_runtime_env_resolves_against_base_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dockerfile = Path(temp_dir) / "Dockerfile"
+            dockerfile.write_text(
+                """\
+FROM example.invalid/base
+ENV DENO_DIR=/deno-cache
+ENV PATH=\"/root/go/bin:${PATH}\"
+ENV FIRST=one SECOND=\"two words\"
+ENV LEGACY legacy value
+""",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                e2b_swebench._dockerfile_runtime_env(
+                    dockerfile,
+                    {"PATH": "/usr/local/bin:/usr/bin"},
+                ),
+                {
+                    "DENO_DIR": "/deno-cache",
+                    "PATH": "/root/go/bin:/usr/local/bin:/usr/bin",
+                    "FIRST": "one",
+                    "SECOND": "two words",
+                    "LEGACY": "legacy value",
+                },
+            )
+
+    def test_dockerfile_runtime_env_uses_final_stage_and_instruction_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dockerfile = Path(temp_dir) / "Dockerfile"
+            dockerfile.write_text(
+                """\
+FROM example.invalid/base AS builder
+ENV FROM_BUILDER=yes PATH=/builder:$PATH
+FROM example.invalid/runtime
+ENV A=old
+ENV A=new B=$A
+ENV FINAL=yes
+""",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                e2b_swebench._dockerfile_runtime_env(
+                    dockerfile,
+                    {"PATH": "/usr/bin"},
+                ),
+                {"A": "new", "B": "old", "FINAL": "yes"},
+            )
+
+    def test_dockerfile_runtime_env_inherits_named_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dockerfile = Path(temp_dir) / "Dockerfile"
+            dockerfile.write_text(
+                """\
+FROM example.invalid/base AS builder
+ENV BUILDER_ENV=preserved
+FROM builder
+ENV FINAL_ENV=yes
+""",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                e2b_swebench._dockerfile_runtime_env(dockerfile, {}),
+                {"BUILDER_ENV": "preserved", "FINAL_ENV": "yes"},
+            )
+
+    def test_restore_dockerfile_env_keeps_explicit_runtime_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment_dir = Path(temp_dir)
+            (environment_dir / "Dockerfile").write_text(
+                "ENV PYTHONPATH=/app/src\nENV PATH=/task/bin:$PATH\n",
+                encoding="utf-8",
+            )
+            environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+            environment.environment_dir = environment_dir
+            environment.environment_name = "datacurve/task"
+            environment.task_env_config = SimpleNamespace(docker_image="image:tag")
+            environment._persistent_env = {"PYTHONPATH": "/explicit"}
+            environment._sandbox = SimpleNamespace(
+                commands=SimpleNamespace(
+                    run=AsyncMock(
+                        return_value=SimpleNamespace(
+                            exit_code=0,
+                            stdout="PATH=/usr/bin\nHOME=/root\n",
+                        )
+                    )
+                )
+            )
+
+            asyncio.run(environment._restore_dockerfile_runtime_env())
+
+            self.assertEqual(
+                environment._persistent_env,
+                {
+                    "PYTHONPATH": "/explicit",
+                    "PATH": "/task/bin:/usr/bin",
+                },
+            )
+
+    def test_restore_dockerfile_env_skips_native_dockerfile_templates(self) -> None:
+        environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+        commands = SimpleNamespace(run=AsyncMock())
+        environment._sandbox = SimpleNamespace(commands=commands)
+        environment.task_env_config = SimpleNamespace(docker_image=None)
+        environment._persistent_env = {"PATH": "/already/from/dockerfile"}
+
+        asyncio.run(environment._restore_dockerfile_runtime_env())
+
+        commands.run.assert_not_awaited()
+        self.assertEqual(
+            environment._persistent_env,
+            {"PATH": "/already/from/dockerfile"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

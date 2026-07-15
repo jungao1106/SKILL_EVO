@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tomllib
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +47,9 @@ DEEPSWE_MIN_MAX_RETRIES = 3
 DEEPSWE_MIN_SANDBOX_TIMEOUT_SEC = 14400
 DEEPSWE_MIN_VERIFIER_BUFFER_SEC = 4800
 DEEPSWE_RESUME_CONTRACT_VERSION = 1
-DEEPSWE_ARTIFACT_HOOK_VERSION = "exact-official-test-paths-v3"
+DEEPSWE_ARTIFACT_HOOK_VERSION = (
+    "exact-official-test-paths-v7-fresh-verifier-retry-test-errata"
+)
 AGENT_CHOICES = ("pi", "claude-code")
 DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS = {
     "AgentSetupTimeoutError",
@@ -516,6 +520,70 @@ def _deepswe_official_test_patch_paths(task_dir: Path) -> list[str]:
     return list(dict.fromkeys(paths))
 
 
+_GO_BUILD_EVENT_FILTER = """grep -v '"Action":"build-'"""
+_GO_BUILD_EVENT_LOG_PIPE = re.compile(
+    r"\|\s*"
+    + re.escape(_GO_BUILD_EVENT_FILTER)
+    + r"\s*(?:\\\s*\n\s*)?\|\s*tee\s+-a\s+(?P<log>\"\$RUN_LOG\")"
+)
+
+
+def _preserve_go_build_events_in_raw_log(script: str) -> tuple[str, int]:
+    """Tee raw Go JSON before filtering events unsupported by the reporter."""
+
+    return _GO_BUILD_EVENT_LOG_PIPE.subn(
+        rf"| tee -a \g<log> | {_GO_BUILD_EVENT_FILTER}",
+        script,
+    )
+
+
+_DEEPSWE_VERIFIER_TEST_ERRATA: dict[str, dict[str, Any]] = {
+    "prometheus-transactional-reload-status": {
+        "path": "test.patch",
+        "sha256": "e570ec05827cb951b1cd58b417e04d39805523f2abdab32dce84d7d4d8c50435",
+        "replacements": (
+            ("reloadStatusResponse", "olympusReloadStatusResponse", 3),
+            ("getReloadStatus", "olympusGetReloadStatus", 9),
+        ),
+    },
+}
+
+
+def _apply_deepswe_verifier_test_errata(
+    task_dir: Path,
+    prepared_tests_dir: Path,
+) -> list[str]:
+    """Apply checksum-guarded fixes for confirmed hidden-test defects."""
+
+    erratum = _DEEPSWE_VERIFIER_TEST_ERRATA.get(task_dir.name)
+    if erratum is None:
+        return []
+    target = prepared_tests_dir / str(erratum["path"])
+    content = target.read_text(encoding="utf-8")
+    replacements = erratum["replacements"]
+    if all(old not in content for old, _new, _count in replacements):
+        return []
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    if digest != erratum["sha256"]:
+        raise DeepSweVerifierInfraError(
+            f"DeepSWE test erratum source changed for {task_dir.name}: "
+            f"expected={erratum['sha256']} actual={digest}"
+        )
+
+    applied: list[str] = []
+    for old, new, expected_count in replacements:
+        actual_count = content.count(old)
+        if actual_count != expected_count:
+            raise DeepSweVerifierInfraError(
+                f"DeepSWE test erratum count mismatch for {task_dir.name}: "
+                f"identifier={old} expected={expected_count} actual={actual_count}"
+            )
+        content = content.replace(old, new)
+        applied.append(f"{old}->{new}:{actual_count}")
+    target.write_text(content, encoding="utf-8")
+    return applied
+
+
 def _deepswe_artifact_hook_info(trial: Any) -> tuple[Path, str | None] | None:
     task = getattr(trial, "task", None) or getattr(trial, "_task", None)
     task_dir_value = getattr(task, "task_dir", None)
@@ -539,6 +607,351 @@ def _deepswe_artifact_hook_info(trial: Any) -> tuple[Path, str | None] | None:
     if base_commit is not None:
         base_commit = str(base_commit).strip() or None
     return pre_artifacts, base_commit
+
+
+def _deepswe_fresh_environment_verifier_retry(
+    original_verify_with_retry: Any,
+) -> Any:
+    """Retry a timed-out DeepSWE verifier once in a pristine sandbox."""
+
+    from harbor.trial.trial import VerifierTimeoutError
+
+    verify_once = getattr(
+        original_verify_with_retry,
+        "__wrapped__",
+        original_verify_with_retry,
+    )
+
+    @wraps(original_verify_with_retry)
+    async def verify_without_deepswe_same_sandbox_retry(self: Any) -> Any:
+        if _deepswe_artifact_hook_info(self) is None or not getattr(
+            self,
+            "_skills_evo_deepswe_fresh_verifier_environment",
+            False,
+        ):
+            return await original_verify_with_retry(self)
+        for attempt in range(1, 3):
+            try:
+                result = await verify_once(self)
+            except VerifierTimeoutError:
+                await _download_deepswe_verifier_logs_best_effort(
+                    self,
+                    label=f"timeout_attempt_{attempt}",
+                )
+                if attempt >= 2:
+                    raise
+                self._logger.warning(
+                    "DeepSWE verifier timed out; retrying the same model.patch "
+                    "once in a fresh verifier sandbox"
+                )
+                self.result.verifier_result = None
+                await _replace_deepswe_verifier_environment(
+                    self,
+                    retry_index=attempt,
+                    stop_current=True,
+                )
+                continue
+            negative_reward = _negative_deepswe_reward(
+                self.result.verifier_result
+            )
+            if negative_reward is None:
+                return result
+            await _download_deepswe_verifier_logs_best_effort(
+                self,
+                label=f"negative_reward_attempt_{attempt}",
+            )
+            if attempt >= 2:
+                raise DeepSweVerifierInfraError(
+                    "DeepSWE verifier returned negative reward "
+                    f"{negative_reward} in two fresh sandboxes"
+                )
+            self._logger.warning(
+                "DeepSWE verifier returned negative reward %s; retrying the "
+                "same model.patch once in a fresh verifier sandbox",
+                negative_reward,
+            )
+            self.result.verifier_result = None
+            await _replace_deepswe_verifier_environment(
+                self,
+                retry_index=attempt,
+                stop_current=True,
+            )
+        raise AssertionError("unreachable")
+
+    verify_without_deepswe_same_sandbox_retry._skills_evo_deepswe_fresh_verifier_retry_patch = True  # type: ignore[attr-defined]
+    return verify_without_deepswe_same_sandbox_retry
+
+
+def _deepswe_verifier_task_environment(trial: Any) -> Any:
+    """Recover the separate verifier environment ignored by Harbor 0.3.0."""
+
+    hook_info = _deepswe_artifact_hook_info(trial)
+    if hook_info is None:
+        raise DeepSweVerifierInfraError("DeepSWE task metadata is unavailable")
+    task_dir = hook_info[0].parent
+    try:
+        task_toml = tomllib.loads(
+            (task_dir / "task.toml").read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise DeepSweVerifierInfraError(
+            f"Could not load DeepSWE verifier environment metadata: {exc}"
+        ) from exc
+
+    verifier = task_toml.get("verifier")
+    if not isinstance(verifier, dict) or verifier.get("environment_mode") != "separate":
+        raise DeepSweVerifierInfraError(
+            "DeepSWE task must declare verifier.environment_mode='separate'"
+        )
+    overrides = verifier.get("environment")
+    if not isinstance(overrides, dict):
+        raise DeepSweVerifierInfraError(
+            "DeepSWE task is missing [verifier.environment]"
+        )
+
+    task_environment = trial._task.config.environment
+    allowed = set(type(task_environment).model_fields)
+    unknown = sorted(set(overrides) - allowed)
+    if unknown:
+        raise DeepSweVerifierInfraError(
+            "Unsupported DeepSWE verifier environment fields: " + ", ".join(unknown)
+        )
+    values = task_environment.model_dump()
+    values.update(overrides)
+    values["mcp_servers"] = []
+    values["skills_dir"] = None
+    return type(task_environment).model_validate(values)
+
+
+def _deepswe_verifier_trial_environment_config(
+    trial: Any,
+    task_environment: Any,
+) -> Any:
+    environment_config = trial.config.environment.model_copy(deep=True)
+    environment_config.force_build = False
+    environment_config.delete = True
+    environment_config.env = {}
+    environment_config.override_cpus = task_environment.cpus
+    environment_config.override_memory_mb = task_environment.memory_mb
+    environment_config.override_storage_mb = task_environment.storage_mb
+    environment_config.override_gpus = task_environment.gpus
+    environment_config.suppress_override_warnings = True
+    source_kwargs = environment_config.kwargs
+    environment_config.kwargs = {
+        key: source_kwargs[key]
+        for key in (
+            "template_namespace",
+            "strip_dockerfile_comments",
+            "sandbox_timeout_sec",
+        )
+        if key in source_kwargs
+    }
+    environment_config.kwargs.update(
+        {
+            "pi_template_suffix": "",
+            "force_allow_internet": False,
+        }
+    )
+    return environment_config
+
+
+async def _ensure_deepswe_agent_logs_before_isolation(
+    trial: Any,
+    *,
+    result_only: bool,
+) -> None:
+    if result_only:
+        return
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    required = _required_deepswe_artifact_paths(trial, result_only=False)[1:]
+    missing = [path for path in required if not path.is_file()]
+    for attempt in range(1, DEEPSWE_ARTIFACT_DOWNLOAD_ATTEMPTS + 1):
+        if not missing:
+            return
+        if attempt > 1:
+            await asyncio.sleep(attempt - 1)
+        trial._are_agent_logs_downloaded = False
+        await trial._maybe_download_logs(
+            source_dir=EnvironmentPaths.agent_dir.as_posix(),
+            target_dir=trial._trial_paths.agent_dir,
+        )
+        missing = [path for path in required if not path.is_file()]
+    if missing:
+        raise DeepSweArtifactDownloadError(
+            "Required DeepSWE agent logs are missing before verifier isolation: "
+            + ", ".join(str(path) for path in missing)
+        )
+
+
+async def _replace_deepswe_verifier_environment(
+    trial: Any,
+    *,
+    retry_index: int,
+    stop_current: bool,
+) -> None:
+    from harbor.environments.factory import EnvironmentFactory
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    task_environment = _deepswe_verifier_task_environment(trial)
+    local_patch = trial._trial_paths.artifacts_dir / "model.patch"
+    if not local_patch.is_file():
+        raise DeepSweVerifierInfraError(
+            "Local DeepSWE model.patch is unavailable for isolated verification"
+        )
+    if stop_current:
+        await trial._environment.stop(delete=True)
+
+    shutil.rmtree(trial._trial_paths.verifier_dir, ignore_errors=True)
+    trial._trial_paths.verifier_dir.mkdir(parents=True, exist_ok=True)
+    environment_config = _deepswe_verifier_trial_environment_config(
+        trial,
+        task_environment,
+    )
+
+    verifier_environment = EnvironmentFactory.create_environment_from_config(
+        config=environment_config,
+        environment_dir=trial._task.paths.environment_dir,
+        environment_name=trial._task.name,
+        session_id=(
+            f"{trial.config.trial_name}-verifier"
+            + (f"-retry{retry_index}" if retry_index else "")
+        ),
+        trial_paths=trial._trial_paths,
+        task_env_config=task_environment,
+        logger=trial._logger,
+    )
+    trial._environment = verifier_environment
+    multiplier = (
+        trial.config.environment_build_timeout_multiplier
+        if trial.config.environment_build_timeout_multiplier is not None
+        else trial.config.timeout_multiplier
+    )
+    build_timeout_sec = task_environment.build_timeout_sec * multiplier
+    last_error: Exception | None = None
+    for start_attempt in range(1, 3):
+        try:
+            await asyncio.wait_for(
+                verifier_environment.start(force_build=False),
+                timeout=build_timeout_sec,
+            )
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            await verifier_environment.stop(delete=True)
+            if start_attempt < 2:
+                trial._logger.warning(
+                    "Fresh DeepSWE verifier environment failed to start; "
+                    "retrying locally (%d/2): %s",
+                    start_attempt,
+                    exc,
+                )
+                await asyncio.sleep(start_attempt)
+    if last_error is not None:
+        raise DeepSweVerifierInfraError(
+            "Fresh DeepSWE verifier environment could not start after two attempts: "
+            f"{type(last_error).__name__}: {last_error}"
+        ) from last_error
+
+    verifier_environment.default_user = trial._task.config.verifier.user
+    mkdir_result = await verifier_environment.exec(
+        command="mkdir -p /logs/artifacts && chmod 777 /logs/artifacts",
+        user="root",
+        timeout_sec=30,
+    )
+    if mkdir_result.return_code != 0:
+        raise DeepSweVerifierInfraError(
+            "Could not prepare the isolated DeepSWE verifier artifact directory"
+        )
+    await verifier_environment.upload_file(
+        source_path=local_patch,
+        target_path=f"{EnvironmentPaths.artifacts_dir.as_posix()}/model.patch",
+    )
+    trial._skills_evo_deepswe_fresh_verifier_environment = True
+
+
+async def _download_deepswe_verifier_logs_best_effort(
+    trial: Any,
+    *,
+    label: str,
+) -> None:
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    target = trial._trial_paths.trial_dir / "verifier_attempts" / label
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        await trial._environment.download_dir(
+            source_dir=EnvironmentPaths.verifier_dir.as_posix(),
+            target_dir=target,
+        )
+    except Exception as exc:
+        trial._logger.warning(
+            "Could not preserve partial DeepSWE verifier logs (%s): %s",
+            label,
+            exc,
+        )
+    verifier_result = trial.result.verifier_result
+    if verifier_result is None:
+        return
+    try:
+        if hasattr(verifier_result, "model_dump_json"):
+            payload = verifier_result.model_dump_json(indent=2)
+        else:
+            payload = json.dumps(
+                getattr(verifier_result, "rewards", None),
+                indent=2,
+            )
+        (target / "verifier_result.json").write_text(
+            payload + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        trial._logger.warning(
+            "Could not preserve DeepSWE verifier result snapshot (%s): %s",
+            label,
+            exc,
+        )
+
+
+async def _move_deepswe_verification_to_fresh_environment(
+    trial: Any,
+    *,
+    result_only: bool = False,
+) -> None:
+    """Move DeepSWE grading to a pristine, offline sandbox."""
+
+    if getattr(trial, "_skills_evo_deepswe_fresh_verifier_environment", False):
+        return
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    local_patch = trial._trial_paths.artifacts_dir / "model.patch"
+    local_patch.parent.mkdir(parents=True, exist_ok=True)
+    local_patch.unlink(missing_ok=True)
+    agent_environment = trial._environment
+    await agent_environment.download_file(
+        source_path=f"{EnvironmentPaths.artifacts_dir.as_posix()}/model.patch",
+        target_path=local_patch,
+    )
+    if not local_patch.is_file():
+        raise DeepSweVerifierInfraError(
+            "DeepSWE model.patch was not downloaded before verifier isolation"
+        )
+    await _ensure_deepswe_agent_logs_before_isolation(
+        trial,
+        result_only=result_only,
+    )
+    await agent_environment.stop(delete=True)
+    await _replace_deepswe_verifier_environment(
+        trial,
+        retry_index=0,
+        stop_current=False,
+    )
+    trial._skills_evo_deepswe_fresh_verifier_environment = True
+    trial._logger.info(
+        "DeepSWE verifier isolation active: fresh sandbox, internet disabled, "
+        "agent environment variables removed"
+    )
 
 
 def _negative_deepswe_reward(result: Any) -> float | None:
@@ -1477,28 +1890,63 @@ def _patch_harbor_runtime(
         async def verify_with_local_dirs(self: Any) -> Any:
             self._trial_paths.verifier_dir.mkdir(parents=True, exist_ok=True)
             self._trial_paths.test_stdout_path.parent.mkdir(parents=True, exist_ok=True)
-            for attempt in range(1, 3):
-                result = await original_verify(self)
-                negative_reward = _negative_deepswe_reward(result)
-                if negative_reward is None or not _deepswe_artifact_hook_info(self):
-                    return result
-                if attempt < 2:
-                    _log(
-                        "DeepSWE verifier returned negative reward "
-                        f"{negative_reward}; re-verifying the same sandbox patch once"
-                    )
-                    continue
-                raise DeepSweVerifierInfraError(
-                    "DeepSWE verifier returned negative reward "
-                    f"{negative_reward} twice for the same patch"
+            is_deepswe = (
+                deepswe_pre_artifacts
+                and _deepswe_artifact_hook_info(self) is not None
+            )
+            original_task_dir = self._task.paths.task_dir
+            prepared_task_dir: Path | None = None
+            if is_deepswe:
+                prepared_task_dir = (
+                    self._trial_paths.trial_dir / ".deepswe-verifier-task"
                 )
-            raise AssertionError("unreachable")
+                shutil.rmtree(prepared_task_dir, ignore_errors=True)
+                prepared_tests_dir = prepared_task_dir / "tests"
+                shutil.copytree(self._task.paths.tests_dir, prepared_tests_dir)
+                applied_errata = _apply_deepswe_verifier_test_errata(
+                    original_task_dir,
+                    prepared_tests_dir,
+                )
+                if applied_errata:
+                    self._logger.info(
+                        "Applied checksum-guarded DeepSWE verifier test errata: %s",
+                        ", ".join(applied_errata),
+                    )
+                prepared_test_script = prepared_tests_dir / "test.sh"
+                script, preserved_count = _preserve_go_build_events_in_raw_log(
+                    prepared_test_script.read_text(encoding="utf-8")
+                )
+                prepared_test_script.write_text(script, encoding="utf-8")
+                self._task.paths.task_dir = prepared_task_dir
+                if preserved_count:
+                    self._logger.info(
+                        "DeepSWE verifier will preserve %d filtered Go build event "
+                        "stream(s) in the raw run log",
+                        preserved_count,
+                    )
+            try:
+                result = await original_verify(self)
+            finally:
+                self._task.paths.task_dir = original_task_dir
+                if prepared_task_dir is not None:
+                    shutil.rmtree(prepared_task_dir, ignore_errors=True)
+            return result
 
         verify_with_local_dirs._skills_evo_verifier_dir_patch = True  # type: ignore[attr-defined]
         Verifier.verify = verify_with_local_dirs
 
     from harbor.models.trial.paths import EnvironmentPaths
     from harbor.trial.trial import Trial
+
+    original_verify_with_retry = Trial._verify_with_retry
+    if not getattr(
+        original_verify_with_retry,
+        "_skills_evo_deepswe_fresh_verifier_retry_patch",
+        False,
+    ):
+        Trial._verify_with_retry = _deepswe_fresh_environment_verifier_retry(
+            original_verify_with_retry
+        )
 
     original_cleanup = Trial._cleanup_and_finalize
     if not getattr(
@@ -1832,7 +2280,20 @@ def _patch_harbor_runtime(
 
             async def run_deepswe_pre_artifacts_then_verify(self: Any) -> None:
                 await run_deepswe_pre_artifacts(self)
-                return await original_run_verification(self)
+                if _deepswe_artifact_hook_info(self) is not None:
+                    await _move_deepswe_verification_to_fresh_environment(
+                        self,
+                        result_only=result_only,
+                    )
+                try:
+                    return await original_run_verification(self)
+                except BaseException:
+                    if _deepswe_artifact_hook_info(self) is not None:
+                        await _download_deepswe_verifier_logs_best_effort(
+                            self,
+                            label="verification_error",
+                        )
+                    raise
 
             run_deepswe_pre_artifacts_then_verify._skills_evo_deepswe_pre_artifacts_patch = True  # type: ignore[attr-defined]
             Trial._run_verification = run_deepswe_pre_artifacts_then_verify
