@@ -21,7 +21,11 @@ from evolution.candidate_pack import (
     read_jsonl,
 )
 from evolution.frozen_library import materialize_frozen_skill_library
-from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
+from providers import (
+    ProviderSpec,
+    SUPPORTED_PROVIDER_CHOICES,
+    configure_provider_env,
+)
 
 
 DEFAULT_DATASET = "swe-bench/swe-bench-verified@2"
@@ -42,6 +46,23 @@ def run_command(command: list[str], *, env: dict[str, str], dry_run: bool) -> No
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
+def configure_provider(args: argparse.Namespace, env: dict[str, str]) -> ProviderSpec:
+    provider = configure_provider_env(
+        args.provider,
+        env,
+        api_key=args.provider_api_key,
+        base_url=args.provider_base_url,
+        model=args.provider_model,
+        provider_api=args.provider_api,
+    )
+    args.provider = provider.name
+    args.provider_base_url = env.get(provider.base_url_env)
+    args.provider_model = env.get(provider.model_env)
+    args.provider_api = env.get(provider.provider_api_env)
+    args.provider_api_key = None
+    return provider
+
+
 def task_args(args: argparse.Namespace) -> list[str]:
     values: list[str] = []
     for task_file in args.task_names_file or []:
@@ -53,14 +74,19 @@ def task_args(args: argparse.Namespace) -> list[str]:
     return values
 
 
-def benchmark_command(args: argparse.Namespace, *, job_name: str) -> list[str]:
+def benchmark_command(
+    args: argparse.Namespace,
+    *,
+    provider: ProviderSpec,
+    job_name: str,
+) -> list[str]:
     command = [
         sys.executable,
         str(ROOT / "scripts" / "run_benchmark.py"),
         "--dataset",
         args.dataset,
         "--provider",
-        args.provider,
+        provider.name,
         "--job-name",
         job_name,
         "--concurrency",
@@ -82,8 +108,6 @@ def benchmark_command(args: argparse.Namespace, *, job_name: str) -> list[str]:
         command.extend(["--provider-base-url", args.provider_base_url])
     if args.provider_model:
         command.extend(["--provider-model", args.provider_model])
-    if args.provider_api_key:
-        command.extend(["--provider-api-key", args.provider_api_key])
     if args.provider_api:
         command.extend(["--provider-api", args.provider_api])
     if args.model_context_window is not None:
@@ -212,7 +236,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--dataset", default=os.getenv("HARBOR_DATASET", DEFAULT_DATASET))
-    parser.add_argument("--provider", choices=["openai", "tinker"], default=os.getenv("LLM_PROVIDER", "openai"))
+    parser.add_argument(
+        "--provider",
+        choices=SUPPORTED_PROVIDER_CHOICES,
+        default=os.getenv("LLM_PROVIDER", "openai"),
+    )
     parser.add_argument("--provider-base-url", default=os.getenv("PROVIDER_BASE_URL"))
     parser.add_argument("--provider-model", default=os.getenv("PROVIDER_MODEL"))
     parser.add_argument("--provider-api-key", default=os.getenv("PROVIDER_API_KEY"))
@@ -321,6 +349,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     load_dotenv(ROOT / ".env", override=False)
     args = parse_args()
+    env = os.environ.copy()
+    provider = configure_provider(args, env)
     run_dir = DEFAULT_EVO_ROOT / args.run_name
     eval_dir = run_dir / "evaluation"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -452,17 +482,10 @@ def main() -> None:
                 )
         skill_pack_root = candidate_pack_root
 
-    env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
     env["PI_SKILL_PACK_ROOT"] = str(skill_pack_root)
     env["PI_USE_SKILL_HARNESS_MEMORY"] = "false"
     env["PI_SKILL_RETRIEVAL_SCOPE"] = "transfer"
-    ensure_macaron_attribution_header(args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"), env)
-    ensure_reasoning_effort_none(
-        args.provider_base_url or env.get("OPENAI_COMPAT_BASE_URL"),
-        env,
-        env_prefix="OPENAI_COMPAT",
-    )
     if args.memory_path:
         env["PI_SKILL_HARNESS_MEMORY_PATH"] = str(args.memory_path.expanduser().resolve())
 
@@ -472,6 +495,7 @@ def main() -> None:
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mode": "eval_only",
         "dataset": args.dataset,
+        "provider": provider.name,
         "baseline_job_dir": str(baseline_job_dir),
         "eval_job_dir": str(eval_job_dir),
         "skill_version_id": args.skill_version_id,
@@ -497,7 +521,7 @@ def main() -> None:
         return
     if args.eval_job_dir is None:
         run_command(
-            benchmark_command(args, job_name=eval_job_name),
+            benchmark_command(args, provider=provider, job_name=eval_job_name),
             env=env,
             dry_run=args.dry_run,
         )

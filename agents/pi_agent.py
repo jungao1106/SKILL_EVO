@@ -872,6 +872,13 @@ def _reasoning_proxy_base_url(base_url: str) -> str:
     return f"http://127.0.0.1:{PI_REASONING_PROXY_PORT}{path.rstrip('/')}"
 
 
+def _uses_reasoning_proxy(base_url: str, provider_api: str) -> bool:
+    return (
+        provider_api.strip().lower() == "openai-completions"
+        and requires_reasoning_effort_none(base_url)
+    )
+
+
 def _reasoning_effort_none_proxy_command(base_url: str, api_key_env: str) -> str:
     proxy_script = r'''
 import json
@@ -1939,7 +1946,10 @@ fi
         env = self._required_env()
         provider_model = env[self.model_env]
         provider_base_url = env[self.base_url_env]
-        use_reasoning_proxy = requires_reasoning_effort_none(provider_base_url)
+        use_reasoning_proxy = _uses_reasoning_proxy(
+            provider_base_url,
+            self.provider_api,
+        )
         effective_provider_base_url = (
             _reasoning_proxy_base_url(provider_base_url)
             if use_reasoning_proxy

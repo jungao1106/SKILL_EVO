@@ -77,6 +77,8 @@ class ProviderSpec:
     default_api_key: str | None = None
     default_base_url: str | None = None
     default_model: str | None = None
+    default_context_window: int = 128000
+    default_max_tokens: int = 32000
     anthropic_base_url_env: str | None = None
     default_anthropic_base_url: str | None = None
 
@@ -244,6 +246,8 @@ def _spec(
     compat: dict[str, Any],
     default_base_url: str | None = None,
     default_model: str | None = None,
+    default_context_window: int = 128000,
+    default_max_tokens: int = 32000,
     anthropic_base_url_env: str | None = None,
     default_anthropic_base_url: str | None = None,
 ) -> ProviderSpec:
@@ -258,6 +262,8 @@ def _spec(
         pi_openai_compat=compat,
         default_base_url=default_base_url,
         default_model=default_model,
+        default_context_window=default_context_window,
+        default_max_tokens=default_max_tokens,
         anthropic_base_url_env=anthropic_base_url_env,
         default_anthropic_base_url=default_anthropic_base_url,
     )
@@ -267,7 +273,12 @@ def normalize_provider_name(name: str) -> str:
     provider = name.strip().lower()
     if provider == "marcron":
         return "macaron"
-    if provider in {"openai-compatible", "openai_compat", "compat"}:
+    if provider in {
+        "openai-compatible",
+        "openai_compat",
+        "openai_compatible",
+        "compat",
+    }:
         return "openai"
     return provider
 
@@ -325,10 +336,11 @@ def resolve_provider(name: str) -> ProviderSpec:
         return _spec(
             name="macaron",
             env_prefix="MACARON",
-            default_provider_api="openai-completions",
+            default_provider_api="openai-responses",
             compat=_glm_openai_compat("MACARON"),
             default_base_url="https://pi-api-cn.macaron.xin/v1",
             default_model="glm-5.2",
+            default_context_window=200000,
             anthropic_base_url_env="MACARON_ANTHROPIC_BASE_URL",
             default_anthropic_base_url="https://pi-api.macaron.xin/anthropic",
         )
@@ -361,3 +373,73 @@ def resolve_provider(name: str) -> ProviderSpec:
         f"Unsupported provider {name!r}. Supported providers are: "
         + ", ".join(SUPPORTED_PROVIDER_CHOICES)
     )
+
+
+def _nonempty(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def configure_provider_env(
+    name: str,
+    env: MutableMapping[str, str],
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    provider_api: str | None = None,
+) -> ProviderSpec:
+    """Resolve one provider profile and materialize it in a child environment."""
+
+    provider = resolve_provider(name)
+    env["LLM_PROVIDER"] = provider.name
+
+    resolved_base_url = (
+        _nonempty(base_url)
+        or _nonempty(env.get(provider.base_url_env))
+        or provider.default_base_url
+    )
+    resolved_model = (
+        _nonempty(model)
+        or _nonempty(env.get(provider.model_env))
+        or provider.default_model
+    )
+    resolved_api_key = (
+        _nonempty(api_key)
+        or _nonempty(env.get(provider.api_key_env))
+        or provider.default_api_key
+    )
+    resolved_provider_api = (
+        _nonempty(provider_api)
+        or _nonempty(env.get(provider.provider_api_env))
+        or provider.default_provider_api
+    )
+
+    if resolved_base_url is not None:
+        env[provider.base_url_env] = resolved_base_url
+    if resolved_model is not None:
+        env[provider.model_env] = resolved_model
+    if resolved_api_key is not None:
+        env[provider.api_key_env] = resolved_api_key
+    env[provider.provider_api_env] = resolved_provider_api
+    env.setdefault(
+        f"{provider.env_prefix}_CONTEXT_WINDOW",
+        str(provider.default_context_window),
+    )
+    env.setdefault(
+        f"{provider.env_prefix}_MAX_TOKENS",
+        str(provider.default_max_tokens),
+    )
+
+    ensure_macaron_attribution_header(resolved_base_url, env)
+    if provider.name in {"novita", "macaron", "sglang", "sglang_qwen"}:
+        env.setdefault(f"{provider.env_prefix}_REASONING_EFFORT", "none")
+        env.setdefault(f"{provider.env_prefix}_ENABLE_THINKING", "false")
+    ensure_reasoning_effort_none(
+        resolved_base_url,
+        env,
+        env_prefix=provider.env_prefix,
+    )
+    return provider

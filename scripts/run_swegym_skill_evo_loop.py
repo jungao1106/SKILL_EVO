@@ -3,7 +3,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -35,7 +34,11 @@ from scripts.run_skill_evo_verified import (
     next_skill_version_id,
     read_active_version,
 )
-from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
+from providers import (
+    ProviderSpec,
+    SUPPORTED_PROVIDER_CHOICES,
+    configure_provider_env,
+)
 
 
 DEFAULT_SWEGYM_DATASET = ROOT / "data" / "harbor_swegym_500_uniform"
@@ -78,13 +81,6 @@ def list_env(name: str) -> list[str] | None:
         return None
     items = [item.strip() for item in value.split(",")]
     return [item for item in items if item]
-
-
-def normalize_provider(value: str | None) -> str:
-    provider = str(value or "openai").strip().lower()
-    if provider in {"novita", "openai-compatible", "openai_compatible"}:
-        return "openai"
-    return provider
 
 
 def flatten_list_values(values: list[str] | None) -> list[str] | None:
@@ -212,26 +208,44 @@ def _env_present(env: dict[str, str], name: str) -> bool:
     return bool(str(env.get(name) or "").strip())
 
 
-def missing_runtime_env(args: argparse.Namespace, env: dict[str, str], *, benchmark_runs: bool) -> list[str]:
+def configure_provider(args: argparse.Namespace, env: dict[str, str]) -> ProviderSpec:
+    provider = configure_provider_env(
+        args.provider,
+        env,
+        api_key=args.provider_api_key,
+        base_url=args.provider_base_url,
+        model=args.provider_model,
+        provider_api=args.provider_api,
+    )
+    args.provider = provider.name
+    args.provider_base_url = env.get(provider.base_url_env)
+    args.provider_model = env.get(provider.model_env)
+    args.provider_api = env.get(provider.provider_api_env)
+    args.provider_api_key = None
+    return provider
+
+
+def missing_runtime_env(
+    args: argparse.Namespace,
+    env: dict[str, str],
+    *,
+    provider: ProviderSpec,
+    benchmark_runs: bool,
+) -> list[str]:
     missing: list[str] = []
     if benchmark_runs and not _env_present(env, "E2B_API_KEY"):
         missing.append("E2B_API_KEY")
-    if args.provider == "openai":
-        provider_names = (
-            "OPENAI_COMPAT_API_KEY",
-            "OPENAI_COMPAT_BASE_URL",
-            "OPENAI_COMPAT_MODEL",
-        )
-    else:
-        provider_names = ("TINKER_API_KEY", "TINKER_BASE_URL", "TINKER_MODEL")
     if benchmark_runs:
-        missing.extend(name for name in provider_names if not _env_present(env, name))
+        missing.extend(
+            name for name in provider.required_env() if not _env_present(env, name)
+        )
     if (
         not args.skip_training_update
         and args.summarize_with_backbone
         and args.baseline_train_job_dir is not None
     ):
-        missing.extend(name for name in provider_names if not _env_present(env, name))
+        if not _env_present(env, provider.api_key_env):
+            missing.append(provider.api_key_env)
     return list(dict.fromkeys(missing))
 
 
@@ -1654,6 +1668,7 @@ class WandbLogger:
 def benchmark_command(
     args: argparse.Namespace,
     *,
+    provider: ProviderSpec,
     dataset: Path | str,
     benchmark_name: str,
     job_name: str,
@@ -1668,7 +1683,7 @@ def benchmark_command(
         "--benchmark-name",
         benchmark_name,
         "--provider",
-        args.provider,
+        provider.name,
         "--job-name",
         job_name,
         "--concurrency",
@@ -1990,9 +2005,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-ratio", type=float, default=0.05)
     parser.add_argument(
         "--provider",
-        choices=["openai", "tinker", "novita", "openai-compatible", "openai_compatible"],
+        choices=[
+            *SUPPORTED_PROVIDER_CHOICES,
+            "openai-compatible",
+            "openai_compatible",
+        ],
         default=os.getenv("LLM_PROVIDER", "openai"),
-        help="Provider profile. novita/openai-compatible aliases are normalized to openai-compatible mode.",
+        help="Provider profile resolved through providers.ProviderSpec.",
     )
     parser.add_argument("--provider-base-url", default=os.getenv("PROVIDER_BASE_URL"))
     parser.add_argument("--provider-model", default=os.getenv("PROVIDER_MODEL"))
@@ -2220,17 +2239,8 @@ def main() -> None:
     load_dotenv(ROOT / ".env", override=False)
     args = parse_args()
     args.max_task_evidence_edits_per_task = args.max_task_skill_edits_per_task
-    args.provider = normalize_provider(args.provider)
-    if args.provider == "openai":
-        args.provider_base_url = args.provider_base_url or os.getenv("OPENAI_COMPAT_BASE_URL")
-        args.provider_model = args.provider_model or os.getenv("OPENAI_COMPAT_MODEL")
-        args.provider_api_key = args.provider_api_key or os.getenv("OPENAI_COMPAT_API_KEY")
-        args.provider_api = args.provider_api or os.getenv("OPENAI_COMPAT_API")
-    elif args.provider == "tinker":
-        args.provider_base_url = args.provider_base_url or os.getenv("TINKER_BASE_URL")
-        args.provider_model = args.provider_model or os.getenv("TINKER_MODEL")
-        args.provider_api_key = args.provider_api_key or os.getenv("TINKER_API_KEY")
-        args.provider_api = args.provider_api or os.getenv("TINKER_API")
+    env = os.environ.copy()
+    provider = configure_provider(args, env)
 
     run_name = args.run_name or f"swegym_glm51_loop_{utc_stamp()}"
     run_dir = DEFAULT_EVO_ROOT / run_name
@@ -2274,26 +2284,7 @@ def main() -> None:
             "Use --skill-version-id with a new value or --overwrite-skill-version."
         )
 
-    env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
-    if args.provider_api_key:
-        if args.provider == "openai":
-            env["OPENAI_COMPAT_API_KEY"] = args.provider_api_key
-        elif args.provider == "tinker":
-            env["TINKER_API_KEY"] = args.provider_api_key
-    if args.provider_base_url:
-        env["OPENAI_COMPAT_BASE_URL" if args.provider == "openai" else "TINKER_BASE_URL"] = args.provider_base_url
-    if args.provider_model:
-        env["OPENAI_COMPAT_MODEL" if args.provider == "openai" else "TINKER_MODEL"] = args.provider_model
-    if args.provider_api:
-        env["OPENAI_COMPAT_API" if args.provider == "openai" else "TINKER_API"] = args.provider_api
-    ensure_macaron_attribution_header(args.provider_base_url, env)
-    if args.provider == "openai":
-        ensure_reasoning_effort_none(
-            args.provider_base_url,
-            env,
-            env_prefix="OPENAI_COMPAT",
-        )
 
     train_job_name = f"{run_name}_swegym_train_noskills"
     default_train_job_dir = ROOT / "jobs" / train_job_name
@@ -2344,7 +2335,12 @@ def main() -> None:
         or args.training_iterations > 0
         or args.run_verified_test
     )
-    missing_env = missing_runtime_env(args, env, benchmark_runs=benchmark_runs)
+    missing_env = missing_runtime_env(
+        args,
+        env,
+        provider=provider,
+        benchmark_runs=benchmark_runs,
+    )
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "run_name": run_name,
@@ -2352,7 +2348,7 @@ def main() -> None:
         "mode": "swegym_train_val_loop",
         "dry_run": args.dry_run,
         "smoke": args.smoke,
-        "provider": args.provider,
+        "provider": provider.name,
         "swegym_dataset": str(args.swegym_dataset),
         "verified_dataset": args.verified_dataset,
         "split": repo_stats,
@@ -2428,6 +2424,7 @@ def main() -> None:
             run_command(
                 benchmark_command(
                     args,
+                    provider=provider,
                     dataset=args.swegym_dataset,
                     benchmark_name="swe-gym",
                     job_name=train_job_name,
@@ -2473,6 +2470,7 @@ def main() -> None:
             run_command(
                 benchmark_command(
                     args,
+                    provider=provider,
                     dataset=args.swegym_dataset,
                     benchmark_name="swe-gym",
                     job_name=val_base_name,
@@ -2578,6 +2576,7 @@ def main() -> None:
                         run_command(
                             benchmark_command(
                                 args,
+                                provider=provider,
                                 dataset=args.swegym_dataset,
                                 benchmark_name="swe-gym",
                                 job_name=skill_job_name,
@@ -2710,6 +2709,7 @@ def main() -> None:
                             run_command(
                                 benchmark_command(
                                     args,
+                                    provider=provider,
                                     dataset=args.swegym_dataset,
                                     benchmark_name="swe-gym",
                                     job_name=gate_job_name,
@@ -2831,6 +2831,7 @@ def main() -> None:
             run_command(
                 benchmark_command(
                     args,
+                    provider=provider,
                     dataset=args.swegym_dataset,
                     benchmark_name="swe-gym",
                     job_name=final_val_skill_name,
@@ -2887,6 +2888,7 @@ def main() -> None:
                 run_command(
                     benchmark_command(
                         args,
+                        provider=provider,
                         dataset=args.verified_dataset,
                         benchmark_name="swe-bench",
                         job_name=verified_job_name,

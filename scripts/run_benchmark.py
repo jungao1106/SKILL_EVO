@@ -90,6 +90,10 @@ def _provider_spec() -> ProviderSpec:
 
 
 def _provider_int_env(provider: ProviderSpec, suffix: str, default: str) -> int:
+    if suffix == "CONTEXT_WINDOW":
+        default = str(provider.default_context_window)
+    elif suffix == "MAX_TOKENS":
+        default = str(provider.default_max_tokens)
     return int(os.getenv(f"{provider.env_prefix}_{suffix}", default))
 
 
