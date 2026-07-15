@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import tempfile
 import threading
 import time
@@ -228,6 +229,76 @@ def _normalize_from_image_refs(content: str) -> str:
         # instance ids such as Project-MONAI in generated image names.
         lines.append(f"{prefix}{image_ref.lower()}{suffix}")
     return "\n".join(lines) + "\n"
+
+
+_DOCKER_ENV_REFERENCE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _dockerfile_runtime_env(
+    dockerfile_path: Path,
+    base_env: dict[str, str],
+) -> dict[str, str]:
+    """Resolve Dockerfile ENV instructions lost by E2B image imports."""
+
+    resolved = dict(base_env)
+    declared: dict[str, str] = {}
+    stage_envs: dict[str, dict[str, str]] = {}
+    current_stage_keys: list[str] = []
+    stage_index = -1
+    structure = DockerfileParser(path=str(dockerfile_path)).structure
+    for instruction in structure:
+        operation = instruction.get("instruction")
+        if operation == "FROM":
+            tokens = shlex.split(str(instruction.get("value") or ""), posix=True)
+            tokens = [token for token in tokens if not token.startswith("--")]
+            if not tokens:
+                continue
+            stage_index += 1
+            source = tokens[0]
+            inherited = stage_envs.get(source, {})
+            declared = dict(inherited)
+            resolved = {**base_env, **declared}
+            current_stage_keys = [str(stage_index)]
+            for index, token in enumerate(tokens[:-1]):
+                if token.upper() == "AS":
+                    current_stage_keys.append(tokens[index + 1])
+                    break
+            for key in current_stage_keys:
+                stage_envs[key] = dict(declared)
+            continue
+        if operation != "ENV":
+            continue
+        tokens = shlex.split(str(instruction.get("value") or ""), posix=True)
+        if not tokens:
+            continue
+        if "=" not in tokens[0]:
+            assignments = [(tokens[0], " ".join(tokens[1:]))]
+        else:
+            assignments = [
+                token.split("=", 1)
+                for token in tokens
+                if "=" in token
+            ]
+        before_instruction = dict(resolved)
+        pending: list[tuple[str, str]] = []
+        for key, raw_value in assignments:
+            value = _DOCKER_ENV_REFERENCE.sub(
+                lambda match: before_instruction.get(
+                    match.group("braced") or match.group("plain"),
+                    "",
+                ),
+                raw_value,
+            )
+            pending.append((key, value))
+        for key, value in pending:
+            resolved[key] = value
+            declared[key] = value
+        for stage_key in current_stage_keys:
+            stage_envs[stage_key] = dict(declared)
+    return declared
 
 
 def _is_missing_or_unlaunchable_template_error(exc: SandboxException) -> bool:
@@ -566,6 +637,43 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             allow_internet_access=self._allow_internet_access(),
         )
 
+    async def _restore_dockerfile_runtime_env(self) -> None:
+        if not self.task_env_config.docker_image:
+            return
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        result = await self._sandbox.commands.run(
+            "env",
+            user="root",
+            timeout=30,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Could not read the E2B sandbox environment before restoring "
+                "Dockerfile ENV instructions"
+            )
+        base_env = {}
+        for line in str(result.stdout or "").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            base_env[key] = value
+        dockerfile_env = _dockerfile_runtime_env(
+            self._environment_definition_path,
+            base_env,
+        )
+        self._persistent_env = {
+            **dockerfile_env,
+            **self._persistent_env,
+        }
+        if dockerfile_env:
+            _benchmark_log(
+                "E2B_ENV_RESTORE "
+                f"task={self.environment_name} "
+                f"keys={','.join(sorted(dockerfile_env))} "
+                "status=ok"
+            )
+
     def _workdir_from_dockerfile(self) -> str | None:
         return next(
             (
@@ -710,6 +818,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             )
 
         await self._wait_for_sandbox_ready()
+        await self._restore_dockerfile_runtime_env()
         await self._prepare_runtime_dirs()
         await self._validate_sandbox_resources()
 
