@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,8 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.job_run_lock import exclusive_job_run  # noqa: E402
+from evolution.score import summarize_job  # noqa: E402
 from providers import resolve_provider  # noqa: E402
+from scripts.aggregate_benchmark_job import (  # noqa: E402
+    infra_invalid_trials,
+    job_identity_issues,
+)
+from scripts.job_run_lock import exclusive_job_run  # noqa: E402
 
 
 DEFAULT_PYTHON = Path(
@@ -28,14 +35,12 @@ DEFAULT_DATASET = Path(
     "/vePFS-Mindverse/user/intern/jungao/Marcronv1-Coding/deep-swe/tasks"
 )
 DEFAULT_BASE_SKILLS = (
-    ROOT
-    / "skills/downstream/"
+    ROOT / "skills/downstream/"
     "swebench_verified_cc_novita_glm52_v0201_frozen_downstream_20260711_074608/"
     "v0201"
 )
 DEFAULT_POLICY = (
-    ROOT
-    / "run_logs/swegym_skill_evo/"
+    ROOT / "run_logs/swegym_skill_evo/"
     "swegym_novita_glm52_c15_resume_merged_20260630_071956/"
     "training/policy_state.json"
 )
@@ -83,7 +88,7 @@ def read_env_file(path: Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip().strip("\"").strip("'")
+        value = value.strip().strip('"').strip("'")
         if key:
             values[key] = value
     return values
@@ -146,6 +151,200 @@ def aggregate_is_complete(
         and int(completeness.get("expected_trials") or 0) == expected_trials
         and int(completeness.get("trial_result_files") or 0) == expected_trials
     )
+
+
+def dataset_task_names(dataset: Path) -> list[str]:
+    names: list[str] = []
+    for task_path in sorted(dataset.glob("*/task.toml")):
+        try:
+            payload = tomllib.loads(task_path.read_text(errors="strict"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError(
+                f"Invalid DeepSWE task metadata: {task_path}: {exc}"
+            ) from exc
+        name = (payload.get("task") or {}).get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"Missing task.name in DeepSWE task metadata: {task_path}")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("DeepSWE dataset contains duplicate task names")
+    return names
+
+
+def task_set_sha256(task_names: list[str]) -> str:
+    payload = ("\n".join(sorted(task_names)) + "\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_existing_frozen_report(
+    path: Path,
+    *,
+    expected_trials: int,
+    expected_run_id: str,
+    expected_task_names: list[str],
+) -> Path:
+    """Validate a frozen aggregate and its authoritative trial results."""
+
+    report_path = path.expanduser().resolve()
+    if not report_path.is_file():
+        raise ValueError(f"Missing existing frozen score report: {report_path}")
+    try:
+        report = json.loads(report_path.read_text(errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid existing frozen score report: {report_path}: {exc}"
+        ) from exc
+    if not isinstance(report, dict):
+        raise ValueError("Existing frozen score report must contain a JSON object")
+
+    def require(condition: bool, detail: str) -> None:
+        if not condition:
+            raise ValueError(
+                f"Existing frozen score report failed validation: {detail}"
+            )
+
+    require(
+        len(expected_task_names) == expected_trials
+        and len(set(expected_task_names)) == expected_trials,
+        "expected dataset task identity is invalid",
+    )
+    require(report.get("schema_version") == 1, "schema_version must be 1")
+    require(report.get("complete") is True, "complete must be true")
+    require(report.get("run_id") == expected_run_id, "run_id mismatch")
+    require(report.get("benchmark_name") == "deepswe", "benchmark must be deepswe")
+    require(report.get("infra_invalid_trials") == [], "infra-invalid trials remain")
+
+    completeness = report.get("completeness")
+    require(isinstance(completeness, dict), "missing completeness object")
+    require(
+        type(completeness.get("expected_trials")) is int
+        and completeness["expected_trials"] == expected_trials,
+        "completeness.expected_trials mismatch",
+    )
+    require(
+        type(completeness.get("trial_result_files")) is int
+        and completeness["trial_result_files"] == expected_trials,
+        "completeness.trial_result_files mismatch",
+    )
+    require(
+        type(completeness.get("infra_invalid_trials")) is int
+        and completeness["infra_invalid_trials"] == 0,
+        "completeness.infra_invalid_trials must be 0",
+    )
+    require(bool(completeness.get("finished_at")), "missing completeness.finished_at")
+
+    evaluation = report.get("evaluation")
+    require(isinstance(evaluation, dict), "missing evaluation object")
+    require(evaluation.get("job_name") == expected_run_id, "evaluation job mismatch")
+    require(
+        type(evaluation.get("n_trials")) is int
+        and evaluation["n_trials"] == expected_trials,
+        "evaluation.n_trials mismatch",
+    )
+    report_tasks = report.get("tasks")
+    evaluation_tasks = evaluation.get("tasks")
+    require(isinstance(report_tasks, list), "tasks must be a list")
+    require(isinstance(evaluation_tasks, list), "evaluation.tasks must be a list")
+    require(len(report_tasks) == expected_trials, "tasks length mismatch")
+    require(
+        len(evaluation_tasks) == expected_trials, "evaluation.tasks length mismatch"
+    )
+    require(report_tasks == evaluation_tasks, "top-level and evaluation tasks differ")
+    require(
+        all(isinstance(row, dict) for row in report_tasks),
+        "task rows must be objects",
+    )
+
+    observed_task_names = [row.get("task_name") for row in report_tasks]
+    observed_trial_names = [row.get("trial_name") for row in report_tasks]
+    require(
+        all(isinstance(name, str) and name for name in observed_task_names),
+        "task row has an invalid task_name",
+    )
+    require(
+        all(isinstance(name, str) and name for name in observed_trial_names),
+        "task row has an invalid trial_name",
+    )
+    require(
+        len(set(observed_task_names)) == expected_trials,
+        "task names are not unique",
+    )
+    require(
+        len(set(observed_trial_names)) == expected_trials,
+        "trial names are not unique",
+    )
+    require(
+        sorted(observed_task_names) == sorted(expected_task_names),
+        "task set does not match the requested dataset",
+    )
+
+    job_dir_value = evaluation.get("job_dir")
+    require(
+        isinstance(job_dir_value, str) and job_dir_value, "missing evaluation.job_dir"
+    )
+    job_dir = Path(job_dir_value).expanduser().resolve()
+    require(job_dir.is_dir(), f"missing source job directory: {job_dir}")
+    require(job_dir.name == expected_run_id, "source job directory name mismatch")
+    root_result_path = job_dir / "result.json"
+    job_config_path = job_dir / "config.json"
+    require(
+        root_result_path.is_file(), f"missing source job result: {root_result_path}"
+    )
+    require(job_config_path.is_file(), f"missing source job config: {job_config_path}")
+    try:
+        root_result = json.loads(root_result_path.read_text(errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid source job result: {root_result_path}: {exc}"
+        ) from exc
+    require(isinstance(root_result, dict), "source job result must be a JSON object")
+    require(
+        root_result.get("finished_at") == completeness["finished_at"],
+        "source job finished_at differs from the report",
+    )
+    require(
+        type(root_result.get("n_total_trials")) is int
+        and root_result["n_total_trials"] == expected_trials,
+        "source job total trial count mismatch",
+    )
+
+    provenance = report.get("provenance")
+    require(isinstance(provenance, dict), "missing provenance object")
+    require(
+        provenance.get("benchmark_name") == "deepswe", "provenance benchmark mismatch"
+    )
+    require(
+        provenance.get("job_config_sha256")
+        == hashlib.sha256(job_config_path.read_bytes()).hexdigest(),
+        "source job config hash mismatch",
+    )
+    require(
+        provenance.get("task_set_sha256") == task_set_sha256(expected_task_names),
+        "task set hash mismatch",
+    )
+
+    try:
+        current_evaluation = summarize_job(job_dir)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Could not summarize source frozen job: {job_dir}: {exc}"
+        ) from exc
+    require(
+        current_evaluation == evaluation,
+        "source trial results no longer match the score report",
+    )
+    current_infra_invalid = infra_invalid_trials(job_dir)
+    require(
+        current_infra_invalid == [],
+        f"source job now has infra-invalid trials: {current_infra_invalid}",
+    )
+    identity_issues, configured_trials = job_identity_issues(job_dir)
+    require(identity_issues == [], f"source job identity issues: {identity_issues}")
+    require(
+        configured_trials == expected_trials,
+        "source job configured trial count mismatch",
+    )
+    return report_path
 
 
 def run_eval_until_valid(
@@ -250,6 +449,15 @@ def parse_args() -> argparse.Namespace:
         default=f"deepswe_cc_novita_glm52_infrafix_frozen_{stamp}",
     )
     parser.add_argument(
+        "--existing-frozen-report",
+        type=Path,
+        default=None,
+        help=(
+            "Reuse a completed frozen score_report.json after validating it and "
+            "all 113 source trial results; gate 1 and later gates still run."
+        ),
+    )
+    parser.add_argument(
         "--tts-run-id",
         default=f"deepswe_cc_novita_glm52_infrafix_tts_evo_{stamp}",
     )
@@ -276,6 +484,8 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     args.policy_state = args.policy_state.expanduser().resolve()
     args.env_file = args.env_file.expanduser().resolve()
     args.python = absolute_path_preserving_symlinks(args.python)
+    if args.existing_frozen_report is not None:
+        args.existing_frozen_report = args.existing_frozen_report.expanduser().resolve()
     if not 2 <= args.max_gate <= 4:
         raise SystemExit("--max-gate must be between 2 and 4.")
     for path, label in (
@@ -287,7 +497,8 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         if not path.exists():
             raise SystemExit(f"Missing {label}: {path}")
     validate_child_python(args.python)
-    expected_trials = len(list(args.dataset.glob("*/task.toml")))
+    expected_task_names = dataset_task_names(args.dataset)
+    expected_trials = len(expected_task_names)
     if expected_trials != 113:
         raise SystemExit(
             f"Expected the full 113-task DeepSWE dataset, found {expected_trials}: "
@@ -331,13 +542,13 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     )
     provider = resolve_provider(args.provider)
     missing_env = ["E2B_API_KEY"] + [
-        name
-        for name in provider.required_env(agent="claude-code")
-        if not env.get(name)
+        name for name in provider.required_env(agent="claude-code") if not env.get(name)
     ]
     missing_env = [name for name in dict.fromkeys(missing_env) if not env.get(name)]
     if missing_env:
-        raise SystemExit("Missing required environment variables: " + ", ".join(missing_env))
+        raise SystemExit(
+            "Missing required environment variables: " + ", ".join(missing_env)
+        )
 
     log_dir = run_dir / "logs"
     state = {
@@ -351,20 +562,39 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "tmp_free_bytes_at_start": tmp_free_bytes,
         "started_at": utc_now(),
         "status": "running",
-        "current_step": "frozen_eval",
+        "current_step": (
+            "validate_existing_frozen_report"
+            if args.existing_frozen_report is not None
+            else "frozen_eval"
+        ),
+        "existing_frozen_report": (
+            str(args.existing_frozen_report)
+            if args.existing_frozen_report is not None
+            else None
+        ),
     }
     write_json_atomic(state_path, state)
 
-    frozen_out = run_dir / "frozen" / "aggregate"
-    frozen_report = run_eval_until_valid(
-        args=args,
-        env=env,
-        job_name=args.frozen_run_id,
-        skill_root=args.base_skill_root,
-        output_dir=frozen_out,
-        log_dir=log_dir,
-        expected_trials=expected_trials,
-    )
+    if args.existing_frozen_report is not None:
+        frozen_report = validate_existing_frozen_report(
+            args.existing_frozen_report,
+            expected_trials=expected_trials,
+            expected_run_id=args.frozen_run_id,
+            expected_task_names=expected_task_names,
+        )
+        state["frozen_report_reused"] = True
+    else:
+        frozen_out = run_dir / "frozen" / "aggregate"
+        frozen_report = run_eval_until_valid(
+            args=args,
+            env=env,
+            job_name=args.frozen_run_id,
+            skill_root=args.base_skill_root,
+            output_dir=frozen_out,
+            log_dir=log_dir,
+            expected_trials=expected_trials,
+        )
+        state["frozen_report_reused"] = False
     state["current_step"] = "materialize_gate_1"
     state["frozen_report"] = str(frozen_report)
     write_json_atomic(state_path, state)
@@ -391,11 +621,14 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "--benchmark-name",
         "deepswe",
     ]
-    if run_logged(
-        command=materialize_command,
-        env=env,
-        log_path=log_dir / "materialize_gate_1.log",
-    ) != 0:
+    if (
+        run_logged(
+            command=materialize_command,
+            env=env,
+            log_path=log_dir / "materialize_gate_1.log",
+        )
+        != 0
+    ):
         raise RuntimeError("Initial DeepSWE gate materialization failed")
 
     attach_gate0 = [
@@ -412,11 +645,14 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "--tts-root",
         str(tts_root),
     ]
-    if run_logged(
-        command=attach_gate0,
-        env=env,
-        log_path=log_dir / "attach_gate_0.log",
-    ) != 0:
+    if (
+        run_logged(
+            command=attach_gate0,
+            env=env,
+            log_path=log_dir / "attach_gate_0.log",
+        )
+        != 0
+    ):
         raise RuntimeError("Attaching the frozen report to gate 0 failed")
 
     state["current_step"] = "gate_1_eval"
@@ -446,11 +682,14 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "--tts-root",
         str(tts_root),
     ]
-    if run_logged(
-        command=attach_gate1,
-        env=env,
-        log_path=log_dir / "attach_gate_1.log",
-    ) != 0:
+    if (
+        run_logged(
+            command=attach_gate1,
+            env=env,
+            log_path=log_dir / "attach_gate_1.log",
+        )
+        != 0
+    ):
         raise RuntimeError("Attaching the gate 1 report failed")
 
     state["current_step"] = "subset_gates_2_to_4"
@@ -500,11 +739,14 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "--python",
         str(args.python),
     ]
-    if run_logged(
-        command=subset_command,
-        env=env,
-        log_path=log_dir / "subset_gates_2_to_4.log",
-    ) != 0:
+    if (
+        run_logged(
+            command=subset_command,
+            env=env,
+            log_path=log_dir / "subset_gates_2_to_4.log",
+        )
+        != 0
+    ):
         raise RuntimeError("DeepSWE subset evolution failed")
 
     state["status"] = "complete"
