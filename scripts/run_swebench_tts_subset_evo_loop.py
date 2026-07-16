@@ -28,7 +28,11 @@ from evolution.tts_evolution import (  # noqa: E402
     write_json,
     write_jsonl,
 )
-from providers import normalize_provider_name, resolve_provider  # noqa: E402
+from providers import (  # noqa: E402
+    normalize_provider_name,
+    populate_anthropic_provider_env,
+    resolve_provider,
+)
 from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
 from scripts.run_benchmark import _deepswe_result_infra_reason  # noqa: E402
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
@@ -80,6 +84,17 @@ def load_env_file(path: Path) -> dict[str, str]:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         env[key] = value
+    return env
+
+
+def runtime_env(path: Path, *, provider: Any | None = None) -> dict[str, str]:
+    """Load defaults from a file while preserving explicit process exports."""
+
+    process_env = dict(os.environ)
+    if provider is not None:
+        populate_anthropic_provider_env(provider, process_env)
+    env = load_env_file(path)
+    env.update(process_env)
     return env
 
 
@@ -250,8 +265,12 @@ def subset_job_name(
 def subset_execution_payload(
     args: argparse.Namespace, gate_root: Path
 ) -> dict[str, Any]:
-    configured_env = os.environ.copy()
-    configured_env.update(load_env_file(args.env_file))
+    provider_name = normalize_provider_name(args.provider)
+    provider = resolve_provider(provider_name)
+    configured_env = runtime_env(
+        args.env_file,
+        provider=provider if args.harness == "claude-code" else None,
+    )
     configured_env.update(
         {
             "FORCE_DISABLE_THINKING": "1",
@@ -260,8 +279,6 @@ def subset_execution_payload(
             "CLAUDE_USE_SKILL_HARNESS_MEMORY": "false",
         }
     )
-    provider_name = normalize_provider_name(args.provider)
-    provider = resolve_provider(provider_name)
     model = (
         args.provider_model
         or configured_env.get(provider.model_env)
@@ -730,8 +747,14 @@ def run_subset_eval(
             flush=True,
         )
 
-    env = os.environ.copy()
-    env.update(load_env_file(args.env_file))
+    env = runtime_env(
+        args.env_file,
+        provider=(
+            resolve_provider(args.provider)
+            if args.harness == "claude-code"
+            else None
+        ),
+    )
     env.update(
         {
             "LLM_PROVIDER": args.provider,

@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.score import summarize_job  # noqa: E402
-from providers import resolve_provider  # noqa: E402
+from providers import populate_anthropic_provider_env, resolve_provider  # noqa: E402
 from scripts.aggregate_benchmark_job import (  # noqa: E402
     infra_invalid_trials,
     job_identity_issues,
@@ -92,6 +92,14 @@ def read_env_file(path: Path) -> dict[str, str]:
         if key:
             values[key] = value
     return values
+
+
+def provider_runtime_env(path: Path, provider: Any) -> dict[str, str]:
+    process_env = dict(os.environ)
+    populate_anthropic_provider_env(provider, process_env)
+    env = read_env_file(path)
+    env.update(process_env)
+    return env
 
 
 def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
@@ -546,8 +554,8 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
             f"DeepSWE run temp directory has less than 5 GiB free: {tmp_dir}"
         )
 
-    env = read_env_file(args.env_file)
-    env.update(os.environ)
+    provider = resolve_provider(args.provider)
+    env = provider_runtime_env(args.env_file, provider)
     env.update(
         {
             "LLM_PROVIDER": args.provider,
@@ -570,7 +578,6 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
             "TEMP": str(tmp_dir),
         }
     )
-    provider = resolve_provider(args.provider)
     missing_env = ["E2B_API_KEY"] + [
         name for name in provider.required_env(agent="claude-code") if not env.get(name)
     ]

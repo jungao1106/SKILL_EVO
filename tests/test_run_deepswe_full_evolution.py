@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,65 @@ from types import SimpleNamespace
 from unittest import mock
 
 from evolution.score import summarize_job
+from providers import populate_anthropic_provider_env, resolve_provider
 from scripts import run_deepswe_full_evolution as full_evolution
+
+
+class AnthropicProviderEnvironmentTest(unittest.TestCase):
+    def test_explicit_generic_environment_overrides_env_file_provider_values(
+        self,
+    ) -> None:
+        provider = resolve_provider("macaron")
+        with tempfile.TemporaryDirectory() as raw_dir:
+            env_file = Path(raw_dir) / ".env"
+            env_file.write_text(
+                "MACARON_ANTHROPIC_BASE_URL=https://file.invalid\n"
+                "MACARON_API_KEY=file-token\n"
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_BASE_URL": "https://export.invalid",
+                    "ANTHROPIC_AUTH_TOKEN": "export-token",
+                },
+                clear=True,
+            ):
+                env = full_evolution.provider_runtime_env(env_file, provider)
+
+        self.assertEqual(
+            env["MACARON_ANTHROPIC_BASE_URL"], "https://export.invalid"
+        )
+        self.assertEqual(env["MACARON_API_KEY"], "export-token")
+
+    def test_maps_standard_anthropic_environment_for_selected_provider(self) -> None:
+        provider = resolve_provider("macaron")
+        env = {
+            "ANTHROPIC_BASE_URL": "https://example.invalid",
+            "ANTHROPIC_AUTH_TOKEN": "test-auth-token",
+        }
+
+        changed = populate_anthropic_provider_env(provider, env)
+
+        self.assertTrue(changed)
+        self.assertEqual(env["MACARON_ANTHROPIC_BASE_URL"], env["ANTHROPIC_BASE_URL"])
+        self.assertEqual(env["MACARON_API_KEY"], env["ANTHROPIC_AUTH_TOKEN"])
+
+    def test_provider_specific_environment_takes_precedence(self) -> None:
+        provider = resolve_provider("macaron")
+        env = {
+            "ANTHROPIC_BASE_URL": "https://generic.invalid",
+            "ANTHROPIC_AUTH_TOKEN": "generic-token",
+            "MACARON_ANTHROPIC_BASE_URL": "https://specific.invalid",
+            "MACARON_API_KEY": "specific-token",
+        }
+
+        changed = populate_anthropic_provider_env(provider, env)
+
+        self.assertFalse(changed)
+        self.assertEqual(
+            env["MACARON_ANTHROPIC_BASE_URL"], "https://specific.invalid"
+        )
+        self.assertEqual(env["MACARON_API_KEY"], "specific-token")
 
 
 class ExistingFrozenReportTest(unittest.TestCase):

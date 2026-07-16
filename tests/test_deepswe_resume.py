@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from providers import resolve_provider
 from scripts.job_run_lock import exclusive_job_run, job_is_running
 from scripts.materialize_deepswe_tts_evolution_gates import (
     materialization_is_reusable,
@@ -25,6 +26,7 @@ from scripts.run_benchmark import (
     _migrate_deepswe_root_config,
     _negative_deepswe_reward,
     _patch_harbor_deepswe_resume_equality,
+    _restore_explicit_anthropic_process_env,
     _trial_config_without_deepswe_infra,
     _upgrade_deepswe_resume_config,
 )
@@ -34,6 +36,29 @@ from scripts import run_swebench_tts_subset_evo_loop as subset_loop
 
 
 class DeepSweWrapperDefaultsTest(unittest.TestCase):
+    def test_explicit_generic_anthropic_env_overrides_loaded_provider_env(self) -> None:
+        explicit_env = {
+            "ANTHROPIC_BASE_URL": "https://export.invalid",
+            "ANTHROPIC_AUTH_TOKEN": "export-token",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MACARON_ANTHROPIC_BASE_URL": "https://file.invalid",
+                "MACARON_API_KEY": "file-token",
+            },
+            clear=True,
+        ):
+            _restore_explicit_anthropic_process_env(
+                SimpleNamespace(agent="claude-code", provider="macaron"),
+                explicit_env,
+            )
+            self.assertEqual(
+                os.environ["MACARON_ANTHROPIC_BASE_URL"],
+                "https://export.invalid",
+            )
+            self.assertEqual(os.environ["MACARON_API_KEY"], "export-token")
+
     def test_implicit_job_names_separate_skills_and_baseline_runs(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             baseline = build_deepswe_argv(["--no-skills"])
@@ -626,6 +651,31 @@ class SubsetResumeTest(unittest.TestCase):
             poll_sec=0,
             recovery_rounds=2,
         )
+
+    def test_process_environment_overrides_env_file_and_maps_anthropic(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            env_file = Path(raw_dir) / ".env"
+            env_file.write_text(
+                "ANTHROPIC_BASE_URL=https://file.invalid\n"
+                "ANTHROPIC_AUTH_TOKEN=file-token\n"
+                "MACARON_ANTHROPIC_BASE_URL=https://old-specific.invalid\n"
+                "MACARON_API_KEY=old-specific-token\n"
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_BASE_URL": "https://export.invalid",
+                    "ANTHROPIC_AUTH_TOKEN": "export-token",
+                },
+                clear=True,
+            ):
+                env = subset_loop.runtime_env(
+                    env_file, provider=resolve_provider("macaron")
+                )
+
+            self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://export.invalid")
+            self.assertEqual(env["MACARON_ANTHROPIC_BASE_URL"], "https://export.invalid")
+            self.assertEqual(env["MACARON_API_KEY"], "export-token")
 
     def test_inactive_incomplete_job_is_resumed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:

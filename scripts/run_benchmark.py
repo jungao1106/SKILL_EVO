@@ -27,6 +27,7 @@ from providers import (
     ensure_macaron_attribution_header,
     ensure_reasoning_effort_none,
     normalize_provider_name,
+    populate_anthropic_provider_env,
     resolve_provider,
 )
 from scripts.job_run_lock import exclusive_job_run
@@ -3436,6 +3437,8 @@ def _apply_provider_overrides(args: argparse.Namespace) -> None:
     provider = resolve_provider(args.provider)
     os.environ["LLM_PROVIDER"] = provider.name
     os.environ.setdefault("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
+    if args.agent == "claude-code":
+        populate_anthropic_provider_env(provider)
     if args.provider_base_url:
         os.environ[provider.base_url_env] = args.provider_base_url
     elif provider.default_base_url and not os.environ.get(provider.base_url_env):
@@ -3477,7 +3480,23 @@ def _apply_provider_overrides(args: argparse.Namespace) -> None:
     )
 
 
+def _restore_explicit_anthropic_process_env(
+    args: argparse.Namespace, process_env: dict[str, str]
+) -> None:
+    """Keep explicit Anthropic exports above values loaded from ``.env``."""
+
+    if args.agent != "claude-code":
+        return
+    provider = resolve_provider(args.provider)
+    explicit = dict(process_env)
+    populate_anthropic_provider_env(provider, explicit)
+    for name in (provider.api_key_env, provider.anthropic_base_url_env):
+        if name and explicit.get(name):
+            os.environ[name] = explicit[name]
+
+
 def main() -> None:
+    process_env = dict(os.environ)
     load_dotenv(ROOT / ".env", override=False)
     args = parse_args()
     saved_config = _load_saved_job_config(args)
@@ -3487,6 +3506,7 @@ def main() -> None:
         if _is_local_deepswe_dataset(args.dataset):
             _enforce_deepswe_infra_args(args)
             _validate_timeout_budget(args)
+    _restore_explicit_anthropic_process_env(args, process_env)
     _apply_provider_overrides(args)
     provider = _provider_spec()
     try:
