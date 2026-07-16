@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.run_benchmark import _deepswe_result_infra_reason  # noqa: E402
+from scripts.run_benchmark import (  # noqa: E402
+    _deepswe_result_infra_reason,
+    _deepswe_verifier_suite_infra_reason,
+)
 
 
 class AggregationError(RuntimeError):
@@ -383,6 +386,15 @@ def _validated_result_row(
         raise AggregationError(
             f"Infra-invalid result for {expected_task.slug} in {result_path}: "
             f"{infra_reason}"
+        )
+    suite_infra_reason = _deepswe_verifier_suite_infra_reason(
+        result_path.parent / "verifier",
+        result_path.parent / "artifacts" / "model.patch",
+    )
+    if suite_infra_reason is not None:
+        raise AggregationError(
+            f"Verifier suite infra-invalid for {expected_task.slug} in "
+            f"{result_path}: {suite_infra_reason}"
         )
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     reward = rewards.get("reward")

@@ -339,6 +339,55 @@ class AggregateDeepSweNoSkillsSupplementTest(unittest.TestCase):
             with self.assertRaisesRegex(AggregationError, "Infra-invalid"):
                 fixture.run()
 
+    def test_rejects_binary_zero_when_offline_toolchain_prevented_all_tests(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            result_path = next(
+                (fixture.legacy_repo / "traces" / "deepswe" / "legacy-task").glob(
+                    "*/result.json"
+                )
+            )
+            trial_dir = result_path.parent
+            (trial_dir / "artifacts").mkdir()
+            (trial_dir / "artifacts" / "model.patch").write_text(
+                "diff --git a/source.go b/source.go\n"
+                "--- a/source.go\n"
+                "+++ b/source.go\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n"
+            )
+            (trial_dir / "verifier").mkdir()
+            (trial_dir / "verifier" / "ctrf.json").write_text(
+                json.dumps(
+                    {
+                        "results": {
+                            "tests": [
+                                {
+                                    "name": "scored-test",
+                                    "message": (
+                                        "missing from report (test did not run or "
+                                        "produced no result - see raw output)"
+                                    ),
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+            (trial_dir / "verifier" / "test-stdout.txt").write_text(
+                "go: download go1.26.1: "
+                "golang.org/toolchain@v0.0.1-go1.26.1.linux-amd64: "
+                "dial tcp: lookup proxy.golang.org on 8.8.8.8:53: i/o timeout\n"
+            )
+
+            with self.assertRaisesRegex(
+                AggregationError, "Verifier suite infra-invalid"
+            ):
+                fixture.run()
+
     def test_rejects_non_binary_raw_reward_without_duration_inference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self.fixture(Path(tmp))
