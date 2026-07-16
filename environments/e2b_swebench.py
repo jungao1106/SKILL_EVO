@@ -3,7 +3,12 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
+import shlex
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +26,7 @@ from tenacity import (
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
+    wait_random_exponential,
 )
 
 from harbor.environments.e2b import E2BEnvironment
@@ -29,8 +35,26 @@ from harbor.models.trial.paths import EnvironmentPaths
 
 _TEMPLATE_BUILD_SEMAPHORE: asyncio.Semaphore | None = None
 _TEMPLATE_BUILD_SEMAPHORE_LIMIT: int | None = None
-_TEMPLATE_LOOKUP_CACHE: dict[tuple[str, tuple[str, ...]], str] = {}
+_TEMPLATE_LOOKUP_CACHE: dict[tuple[str, tuple[str, ...]], str | None] = {}
 _TEMPLATE_LOOKUP_LOCKS: dict[tuple[str, tuple[str, ...]], asyncio.Lock] = {}
+_TEMPLATE_LOOKUP_CACHE_DIRS: dict[tuple[str, ...], Path | None] = {}
+_SANDBOX_CREATE_RATE_LOCK = threading.Lock()
+_SANDBOX_CREATE_NEXT_AT = 0.0
+E2B_TEMPLATE_BUILD_POLICY_VERSION = "r3"
+E2B_IMPORTED_GO_CACHE_POLICY_VERSION = "go-cache-v1"
+PI_CODING_AGENT_VERSION = "0.80.6"
+
+_IMPORTED_GO_CACHE_DESTINATIONS = {
+    "GOMODCACHE": "/opt/skills-evo/imported-go-cache-v1/mod",
+    "GOCACHE": "/opt/skills-evo/imported-go-cache-v1/build",
+}
+_IMPORTED_GO_CACHE_ROOT = "/opt/skills-evo/imported-go-cache-v1"
+_IMPORTED_GO_TOOLCHAIN = f"{_IMPORTED_GO_CACHE_ROOT}/toolchain"
+_IMPORTED_GO_CACHE_READY = f"{_IMPORTED_GO_CACHE_ROOT}/READY"
+
+
+class E2BResourceMismatchError(RuntimeError):
+    pass
 
 
 def _template_build_semaphore() -> asyncio.Semaphore:
@@ -42,30 +66,55 @@ def _template_build_semaphore() -> asyncio.Semaphore:
         limit = 20
     limit = max(1, limit)
 
-    if (
-        _TEMPLATE_BUILD_SEMAPHORE is None
-        or _TEMPLATE_BUILD_SEMAPHORE_LIMIT != limit
-    ):
+    if _TEMPLATE_BUILD_SEMAPHORE is None or _TEMPLATE_BUILD_SEMAPHORE_LIMIT != limit:
         _TEMPLATE_BUILD_SEMAPHORE = asyncio.Semaphore(limit)
         _TEMPLATE_BUILD_SEMAPHORE_LIMIT = limit
 
     return _TEMPLATE_BUILD_SEMAPHORE
 
 
+async def _wait_for_sandbox_create_slot() -> None:
+    global _SANDBOX_CREATE_NEXT_AT
+    try:
+        rate_per_sec = float(os.getenv("E2B_SANDBOX_CREATE_RATE_PER_SEC", "4"))
+    except ValueError:
+        rate_per_sec = 4.0
+    minimum_interval = 1.0 / max(0.1, rate_per_sec)
+    with _SANDBOX_CREATE_RATE_LOCK:
+        now = time.monotonic()
+        scheduled_at = max(now, _SANDBOX_CREATE_NEXT_AT)
+        _SANDBOX_CREATE_NEXT_AT = scheduled_at + minimum_interval
+    delay = scheduled_at - now
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
 class _AsyncFileLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path | None):
         self.path = path
         self._handle: Any | None = None
 
     async def __aenter__(self) -> "_AsyncFileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self.path.open("a+", encoding="utf-8")
+        if self.path is None:
+            return self
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = self.path.open("a+", encoding="utf-8")
+        except OSError:
+            # The process-local asyncio lock still serializes template builds.
+            # Disk locking is only needed to coordinate with other processes.
+            self._handle = None
+            return self
         while True:
             try:
                 fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return self
             except BlockingIOError:
                 await asyncio.sleep(0.2)
+            except OSError:
+                self._handle.close()
+                self._handle = None
+                return self
 
     async def __aexit__(self, *_exc: Any) -> None:
         if self._handle is None:
@@ -77,17 +126,80 @@ class _AsyncFileLock:
             self._handle = None
 
 
-def _sandbox_create_timeout_sec() -> float:
+def _cache_dir_is_writable(path: Path) -> bool:
     try:
-        timeout = float(os.getenv("E2B_SANDBOX_CREATE_TIMEOUT_SEC", "180"))
-    except ValueError:
-        timeout = 180.0
-    return max(30.0, timeout)
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".write-test-", dir=path):
+            pass
+    except OSError:
+        return False
+    return True
+
+
+def _template_lookup_cache_dir_candidates(preferred: Path) -> list[Path]:
+    candidates = [preferred.expanduser()]
+    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        candidates.append(
+            Path(xdg_cache_home).expanduser() / "skill-evo/e2b_template_lookup"
+        )
+    else:
+        try:
+            candidates.append(Path.home() / ".cache/skill-evo/e2b_template_lookup")
+        except RuntimeError:
+            pass
+
+    uid = getattr(os, "getuid", lambda: "unknown")()
+    candidates.append(
+        Path(tempfile.gettempdir()) / f"skill-evo-e2b-template-lookup-{uid}"
+    )
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        identity = os.path.abspath(str(candidate))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(candidate)
+    return unique
+
+
+def _resolve_template_lookup_cache_dir(preferred: Path) -> Path | None:
+    candidates = _template_lookup_cache_dir_candidates(preferred)
+    cache_key = tuple(os.path.abspath(str(path)) for path in candidates)
+    if cache_key in _TEMPLATE_LOOKUP_CACHE_DIRS:
+        return _TEMPLATE_LOOKUP_CACHE_DIRS[cache_key]
+
+    resolved = next(
+        (path for path in candidates if _cache_dir_is_writable(path)),
+        None,
+    )
+    _TEMPLATE_LOOKUP_CACHE_DIRS[cache_key] = resolved
+    return resolved
 
 
 def _safe_template_segment(value: str) -> str:
     segment = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-_.")
     return segment or "swebench-task"
+
+
+def _template_resource_identity(
+    cpus: int,
+    memory_mb: int,
+    storage_mb: int,
+    *,
+    strip_dockerfile_comments: bool,
+    imported_go_cache: bool = False,
+) -> str:
+    comment_policy = "strip" if strip_dockerfile_comments else "keep"
+    identity = (
+        f"c{cpus}-m{memory_mb}-s{storage_mb}-"
+        f"{E2B_TEMPLATE_BUILD_POLICY_VERSION}-{comment_policy}"
+    )
+    if imported_go_cache:
+        identity += f"-{E2B_IMPORTED_GO_CACHE_POLICY_VERSION}"
+    return identity
 
 
 def _benchmark_log(message: str) -> None:
@@ -128,9 +240,289 @@ def _normalize_from_image_refs(content: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-PI_TEMPLATE_INSTALL_DOCKERFILE = r"""
+_DOCKER_ENV_REFERENCE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
+_SHELL_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:^|_)(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|BEARER_TOKEN|"
+    r"PASSWORD|SECRET|CREDENTIALS?)(?:$|_)"
+)
+
+
+def _dockerfile_runtime_env(
+    dockerfile_path: Path,
+    base_env: dict[str, str],
+) -> dict[str, str]:
+    """Resolve Dockerfile ENV instructions lost by E2B image imports."""
+
+    resolved = dict(base_env)
+    declared: dict[str, str] = {}
+    stage_envs: dict[str, dict[str, str]] = {}
+    current_stage_keys: list[str] = []
+    stage_index = -1
+    structure = DockerfileParser(path=str(dockerfile_path)).structure
+    for instruction in structure:
+        operation = instruction.get("instruction")
+        if operation == "FROM":
+            tokens = shlex.split(str(instruction.get("value") or ""), posix=True)
+            tokens = [token for token in tokens if not token.startswith("--")]
+            if not tokens:
+                continue
+            stage_index += 1
+            source = tokens[0]
+            inherited = stage_envs.get(source, {})
+            declared = dict(inherited)
+            resolved = {**base_env, **declared}
+            current_stage_keys = [str(stage_index)]
+            for index, token in enumerate(tokens[:-1]):
+                if token.upper() == "AS":
+                    current_stage_keys.append(tokens[index + 1])
+                    break
+            for key in current_stage_keys:
+                stage_envs[key] = dict(declared)
+            continue
+        if operation != "ENV":
+            continue
+        tokens = shlex.split(str(instruction.get("value") or ""), posix=True)
+        if not tokens:
+            continue
+        if "=" not in tokens[0]:
+            assignments = [(tokens[0], " ".join(tokens[1:]))]
+        else:
+            assignments = [token.split("=", 1) for token in tokens if "=" in token]
+        before_instruction = dict(resolved)
+        pending: list[tuple[str, str]] = []
+        for key, raw_value in assignments:
+            value = _DOCKER_ENV_REFERENCE.sub(
+                lambda match: before_instruction.get(
+                    match.group("braced") or match.group("plain"),
+                    "",
+                ),
+                raw_value,
+            )
+            pending.append((key, value))
+        for key, value in pending:
+            resolved[key] = value
+            declared[key] = value
+        for stage_key in current_stage_keys:
+            stage_envs[stage_key] = dict(declared)
+    return declared
+
+
+def _is_volatile_tmp_path(value: str) -> bool:
+    if not value.startswith("/"):
+        return False
+    normalized = posixpath.normpath(value)
+    return normalized == "/tmp" or normalized.startswith("/tmp/")
+
+
+def _imported_image_go_cache_paths(
+    dockerfile_path: Path,
+    docker_image: str | None,
+) -> dict[str, tuple[str, str]]:
+    """Map volatile imported-image Go caches to persistent template paths."""
+
+    if not docker_image:
+        return {}
+    declared_env = _dockerfile_runtime_env(dockerfile_path, {})
+    gomodcache = declared_env.get("GOMODCACHE")
+    if gomodcache is None or not _is_volatile_tmp_path(gomodcache):
+        return {}
+    return {
+        key: (declared_env[key], destination)
+        for key, destination in _IMPORTED_GO_CACHE_DESTINATIONS.items()
+        if key in declared_env and _is_volatile_tmp_path(declared_env[key])
+    }
+
+
+def _imported_go_cache_build_command(
+    workdir: str,
+    cache_paths: dict[str, tuple[str, str]],
+) -> str:
+    """Build an image layer containing a complete, non-volatile Go cache."""
+
+    if not cache_paths:
+        raise ValueError("Imported Go cache preparation requires at least one cache")
+
+    lines = [
+        "set -eu",
+        f"cd {shlex.quote(workdir)}",
+        "command -v go >/dev/null",
+        "test -f go.mod",
+        'backup_dir="$(mktemp -d /tmp/skills-evo-go-cache.XXXXXX)"',
+        'cp -a -- go.mod "$backup_dir/go.mod"',
+        "had_go_sum=0",
+        'if [ -e go.sum ]; then cp -a -- go.sum "$backup_dir/go.sum"; had_go_sum=1; fi',
+        "restore_go_manifests() {",
+        '  cp -a -- "$backup_dir/go.mod" go.mod',
+        '  if [ "$had_go_sum" -eq 1 ]; then cp -a -- "$backup_dir/go.sum" go.sum; else rm -f -- go.sum; fi',
+        "}",
+        "trap restore_go_manifests EXIT",
+    ]
+    for source, destination in cache_paths.values():
+        quoted_source = shlex.quote(source)
+        quoted_destination = shlex.quote(destination)
+        lines.extend(
+            [
+                f"mkdir -p -- {quoted_destination}",
+                f"if [ -d {quoted_source} ]; then cp -a -- {quoted_source}/. {quoted_destination}/; fi",
+            ]
+        )
+
+    cache_env = " ".join(
+        f"{key}={shlex.quote(destination)}"
+        for key, (_source, destination) in sorted(cache_paths.items())
+    )
+    lines.extend(
+        [
+            f"ROOT={shlex.quote(_IMPORTED_GO_CACHE_ROOT)}",
+            f"MOD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOMODCACHE'])}",
+            f"BUILD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOCACHE'])}",
+            f"TOOLCHAIN={shlex.quote(_IMPORTED_GO_TOOLCHAIN)}",
+            f"READY={shlex.quote(_IMPORTED_GO_CACHE_READY)}",
+            'mkdir -p -- "$MOD" "$BUILD"',
+            "go_mod_sha256=\"$(sha256sum go.mod | awk '{print $1}')\"",
+            'if [ "$had_go_sum" -eq 1 ]; then go_sum_sha256="$(sha256sum go.sum | awk \'{print $1}\')"; else go_sum_sha256=absent; fi',
+            'git_head="$(git rev-parse HEAD)"',
+            f"env {cache_env} GOTOOLCHAIN=auto GOFLAGS= GOWORK=off go version >/dev/null",
+            f"env {cache_env} GOTOOLCHAIN=auto GOFLAGS= GOWORK=off go mod download all",
+            f'selected_goroot="$(env {cache_env} GOTOOLCHAIN=auto GOFLAGS= GOWORK=off go env GOROOT)"',
+            'toolchain_target="$(realpath -e "$selected_goroot")"',
+            'mod_target="$(realpath -e "$MOD")"',
+            'test -x "$toolchain_target/bin/go"',
+            'case "$toolchain_target" in "$mod_target"/*|/usr/local/go) ;; *) exit 1 ;; esac',
+            'rm -f -- "$TOOLCHAIN"',
+            'ln -s -- "$toolchain_target" "$TOOLCHAIN"',
+            'test -x "$TOOLCHAIN/bin/go"',
+            'local_path="$TOOLCHAIN/bin:$PATH"',
+            'selected_go_version="$(env PATH="$local_path" GOMODCACHE="$MOD" GOCACHE="$BUILD" GOTOOLCHAIN=local GOFLAGS= GOWORK=off go version)"',
+            'toolchain_bin_sha256="$(sha256sum "$TOOLCHAIN/bin/go" | awk \'{print $1}\')"',
+        ]
+    )
+    if "GOMODCACHE" in cache_paths:
+        module_cache = shlex.quote(cache_paths["GOMODCACHE"][1])
+        lines.append(f'test -n "$(find {module_cache} -mindepth 1 -print -quit)"')
+    lines.extend(
+        [
+            "restore_go_manifests",
+            'cmp -s -- "$backup_dir/go.mod" go.mod',
+            'if [ "$had_go_sum" -eq 1 ]; then cmp -s -- "$backup_dir/go.sum" go.sum; else test ! -e go.sum; fi',
+            'ready_tmp="$READY.tmp"',
+            "{",
+            f"  printf '%s\\n' {shlex.quote(f'policy_version={E2B_IMPORTED_GO_CACHE_POLICY_VERSION}')}",
+            f"  printf '%s\\n' {shlex.quote(f'workdir={workdir}')}",
+            "  printf 'git_head=%s\\n' \"$git_head\"",
+            "  printf 'go_mod_sha256=%s\\n' \"$go_mod_sha256\"",
+            "  printf 'go_sum_present=%s\\n' \"$had_go_sum\"",
+            "  printf 'go_sum_sha256=%s\\n' \"$go_sum_sha256\"",
+            "  printf 'selected_go_version=%s\\n' \"$selected_go_version\"",
+            "  printf 'toolchain_link_target=%s\\n' \"$toolchain_target\"",
+            "  printf 'toolchain_bin_sha256=%s\\n' \"$toolchain_bin_sha256\"",
+            "  printf 'gomodcache=%s\\n' \"$MOD\"",
+            "  printf 'gocache=%s\\n' \"$BUILD\"",
+            '} > "$ready_tmp"',
+            'mv -f -- "$ready_tmp" "$READY"',
+            'test -s "$READY"',
+            "trap - EXIT",
+            'rm -rf -- "$backup_dir"',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _imported_go_cache_runtime_check_command(
+    workdir: str,
+    cache_paths: dict[str, tuple[str, str]],
+) -> str:
+    """Verify an imported Go cache without allowing a network fallback."""
+
+    if not cache_paths:
+        raise ValueError("Imported Go cache validation requires at least one cache")
+    destinations = [destination for _source, destination in cache_paths.values()]
+    lines = [
+        "set -eu",
+        f"ROOT={shlex.quote(_IMPORTED_GO_CACHE_ROOT)}",
+        f"MOD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOMODCACHE'])}",
+        f"BUILD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOCACHE'])}",
+        f"TOOLCHAIN={shlex.quote(_IMPORTED_GO_TOOLCHAIN)}",
+        f"READY={shlex.quote(_IMPORTED_GO_CACHE_READY)}",
+    ]
+    lines.extend(f"test -d {shlex.quote(path)}" for path in destinations)
+    lines.extend(
+        [
+            'test -d "$MOD"',
+            'test -d "$BUILD"',
+            'test -s "$READY"',
+            'test -L "$TOOLCHAIN"',
+            'toolchain_target="$(realpath -e "$TOOLCHAIN")"',
+            'mod_target="$(realpath -e "$MOD")"',
+            'case "$toolchain_target" in "$mod_target"/*|/usr/local/go) ;; *) exit 1 ;; esac',
+            'test -x "$TOOLCHAIN/bin/go"',
+            f"cd {shlex.quote(workdir)}",
+            "test -f go.mod",
+            'require_ready() { grep -Fqx -- "$1" "$READY"; }',
+            f"require_ready {shlex.quote(f'policy_version={E2B_IMPORTED_GO_CACHE_POLICY_VERSION}')}",
+            f"require_ready {shlex.quote(f'workdir={workdir}')}",
+            'require_ready "git_head=$(git rev-parse HEAD)"',
+            "require_ready \"go_mod_sha256=$(sha256sum go.mod | awk '{print $1}')\"",
+            "if [ -e go.sum ]; then had_go_sum=1; go_sum_sha256=\"$(sha256sum go.sum | awk '{print $1}')\"; else had_go_sum=0; go_sum_sha256=absent; fi",
+            'require_ready "go_sum_present=$had_go_sum"',
+            'require_ready "go_sum_sha256=$go_sum_sha256"',
+            'require_ready "toolchain_link_target=$toolchain_target"',
+            'require_ready "toolchain_bin_sha256=$(sha256sum "$TOOLCHAIN/bin/go" | awk \'{print $1}\')"',
+            'require_ready "gomodcache=$MOD"',
+            'require_ready "gocache=$BUILD"',
+            'local_path="$TOOLCHAIN/bin:$PATH"',
+            'selected_go_version="$(env PATH="$local_path" GOMODCACHE="$MOD" GOCACHE="$BUILD" GOTOOLCHAIN=local GOFLAGS= GOWORK=off go version)"',
+            'require_ready "selected_go_version=$selected_go_version"',
+            'backup_dir="$(mktemp -d /tmp/skills-evo-go-preflight.XXXXXX)"',
+            'cp -a -- go.mod "$backup_dir/go.mod"',
+            'if [ -e go.sum ]; then cp -a -- go.sum "$backup_dir/go.sum"; had_go_sum=1; fi',
+            "restore_go_manifests() {",
+            '  cp -a -- "$backup_dir/go.mod" go.mod',
+            '  if [ "$had_go_sum" -eq 1 ]; then cp -a -- "$backup_dir/go.sum" go.sum; else rm -f -- go.sum; fi',
+            "}",
+            "trap restore_go_manifests EXIT",
+        ]
+    )
+    cache_env = " ".join(
+        f"{key}={shlex.quote(destination)}"
+        for key, (_source, destination) in sorted(cache_paths.items())
+    )
+    offline_env = (
+        f'env PATH="$local_path" {cache_env} GOTOOLCHAIN=local '
+        "GOPROXY=off GOSUMDB=off GOFLAGS= GOWORK=off"
+    )
+    lines.extend(
+        [
+            f"{offline_env} go mod download all",
+            "restore_go_manifests",
+            'cmp -s -- "$backup_dir/go.mod" go.mod',
+            'if [ "$had_go_sum" -eq 1 ]; then cmp -s -- "$backup_dir/go.sum" go.sum; else test ! -e go.sum; fi',
+            "trap - EXIT",
+            'rm -rf -- "$backup_dir"',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _is_missing_or_unlaunchable_template_error(exc: SandboxException) -> bool:
+    message = str(exc).lower()
+    if "tag 'default' does not exist" in message:
+        return True
+    return "template" in message and (
+        "not found" in message
+        or "does not exist" in message
+        or "not exist" in message
+        or "missing" in message
+    )
+
+
+PI_TEMPLATE_INSTALL_DOCKERFILE = rf"""
 RUN if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y curl ca-certificates git jq ripgrep; elif command -v apk >/dev/null 2>&1; then apk add --no-cache curl ca-certificates git jq ripgrep nodejs npm bash; elif command -v yum >/dev/null 2>&1; then yum install -y curl ca-certificates git jq ripgrep; fi
-RUN set -e; if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash; export NVM_DIR="/root/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install 22; nvm alias default 22; fi; if [ -s /root/.nvm/nvm.sh ]; then . /root/.nvm/nvm.sh; fi; npm install -g @earendil-works/pi-coding-agent@latest; pi --version
+RUN set -e; if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash; export NVM_DIR="/root/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install 22; nvm alias default 22; fi; if [ -s /root/.nvm/nvm.sh ]; then . /root/.nvm/nvm.sh; fi; npm install -g @earendil-works/pi-coding-agent@{PI_CODING_AGENT_VERSION}; pi --version
 RUN set -e; for bin in node npm npx pi; do BIN_PATH="$(command -v "$bin" 2>/dev/null || true)"; if [ -n "$BIN_PATH" ] && [ "$BIN_PATH" != "/usr/local/bin/$bin" ]; then ln -sf "$BIN_PATH" "/usr/local/bin/$bin"; fi; done
 """
 
@@ -156,20 +548,34 @@ class E2BSwebenchEnvironment(E2BEnvironment):
 
         self._template_namespace = namespace
         self._environment_hash = digest
+        self._strip_dockerfile_comments = strip_dockerfile_comments
+        self._imported_go_cache_paths = _imported_image_go_cache_paths(
+            self._environment_definition_path,
+            self.task_env_config.docker_image,
+        )
+        self._template_resource_identity = _template_resource_identity(
+            self.task_env_config.cpus,
+            self.task_env_config.memory_mb,
+            self.task_env_config.storage_mb,
+            strip_dockerfile_comments=strip_dockerfile_comments,
+            imported_go_cache=bool(self._imported_go_cache_paths),
+        )
         self._pi_template_suffix = (
             pi_template_suffix
             if pi_template_suffix is not None
             else os.getenv("E2B_PI_TEMPLATE_SUFFIX", "pi_c6d7003a")
         ).strip("_")
         self._template_name = self._build_template_name()
-        self._strip_dockerfile_comments = strip_dockerfile_comments
         self._sandbox_timeout_sec = self._resolve_sandbox_timeout_sec(
             sandbox_timeout_sec
         )
         self._force_allow_internet = force_allow_internet
+        self._dockerfile_declared_env: dict[str, str] = {}
 
     def _allow_internet_access(self) -> bool:
-        return True if self._force_allow_internet else self.task_env_config.allow_internet
+        return (
+            True if self._force_allow_internet else self.task_env_config.allow_internet
+        )
 
     def _legacy_template_base(self) -> str:
         return self.environment_name.replace("/", "__").replace(".", "-")
@@ -183,6 +589,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
     def _build_template_name(self) -> str:
         return self._qualified_template_name(
             f"{self._safe_template_base()}__{self._environment_hash}"
+            f"__{self._template_resource_identity}"
         )
 
     def _pi_template_name(self) -> str | None:
@@ -191,10 +598,14 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         legacy_name = f"{self._legacy_template_base()}__{self._environment_hash}"
         return self._qualified_template_name(
             f"{legacy_name}__{self._pi_template_suffix}"
+            f"__{self._template_resource_identity}"
         )
 
     def _candidate_template_names(self) -> list[str]:
-        legacy_name = f"{self._legacy_template_base()}__{self._environment_hash}"
+        legacy_name = (
+            f"{self._legacy_template_base()}__{self._environment_hash}"
+            f"__{self._template_resource_identity}"
+        )
         candidates: list[str] = []
         pi_template_name = self._pi_template_name()
         if pi_template_name:
@@ -210,21 +621,30 @@ class E2BSwebenchEnvironment(E2BEnvironment):
     def _template_lookup_cache_key(self) -> tuple[str, tuple[str, ...]]:
         return (self._template_namespace, tuple(self._candidate_template_names()))
 
-    def _template_lookup_cache_file(self) -> Path:
+    def _template_lookup_cache_file(self) -> Path | None:
         raw_key = "\n".join(self._template_lookup_cache_key()[1])
         digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
-        return Path(
+        preferred = Path(
             os.getenv("E2B_TEMPLATE_LOOKUP_CACHE_DIR", ".cache/e2b_template_lookup")
-        ) / f"{digest}.json"
+        )
+        cache_dir = _resolve_template_lookup_cache_dir(preferred)
+        return cache_dir / f"{digest}.json" if cache_dir is not None else None
 
-    def _template_lookup_lock_file(self) -> Path:
-        return self._template_lookup_cache_file().with_suffix(".lock")
+    def _template_lookup_lock_file(self) -> Path | None:
+        cache_file = self._template_lookup_cache_file()
+        return cache_file.with_suffix(".lock") if cache_file is not None else None
+
+    def _template_lookup_build_lock_file(self) -> Path | None:
+        lock_file = self._template_lookup_lock_file()
+        return lock_file.with_suffix(".build.lock") if lock_file is not None else None
 
     def _read_template_lookup_file_cache(self) -> str | None:
         cache_path = self._template_lookup_cache_file()
-        if not cache_path.exists():
+        if cache_path is None:
             return None
         try:
+            if not cache_path.exists():
+                return None
             data = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
@@ -237,6 +657,8 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         cache_key = self._template_lookup_cache_key()
         _TEMPLATE_LOOKUP_CACHE[cache_key] = template_name
         cache_path = self._template_lookup_cache_file()
+        if cache_path is None:
+            return
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(
@@ -250,17 +672,26 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 + "\n",
                 encoding="utf-8",
             )
-        except OSError:
-            self.logger.debug("Failed to write E2B template lookup cache", exc_info=True)
+        except OSError as exc:
+            self.logger.debug(
+                "Failed to write E2B template lookup cache; using memory cache: %s",
+                exc,
+            )
 
     def _forget_template_lookup(self) -> None:
         _TEMPLATE_LOOKUP_CACHE.pop(self._template_lookup_cache_key(), None)
+        cache_path = self._template_lookup_cache_file()
+        if cache_path is None:
+            return
         try:
-            self._template_lookup_cache_file().unlink()
+            cache_path.unlink()
         except FileNotFoundError:
             pass
-        except OSError:
-            self.logger.debug("Failed to remove E2B template lookup cache", exc_info=True)
+        except OSError as exc:
+            self.logger.debug(
+                "Failed to remove E2B template lookup cache; continuing: %s",
+                exc,
+            )
 
     @staticmethod
     def _resolve_sandbox_timeout_sec(value: int | None) -> int:
@@ -269,7 +700,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             timeout = int(raw_value) if raw_value is not None else 3600
         except (TypeError, ValueError):
             timeout = 3600
-        return max(60, min(timeout, 7200))
+        return max(60, timeout)
 
     def _dockerfile_content_or_path(self) -> str:
         content = self._environment_definition_path.read_text(encoding="utf-8")
@@ -279,13 +710,6 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         if self._template_name == self._pi_template_name():
             content = content.rstrip() + "\n\n" + PI_TEMPLATE_INSTALL_DOCKERFILE
         return content
-
-    def _is_pi_template(self) -> bool:
-        return self._template_name == self._pi_template_name()
-
-    def _fallback_template_name(self) -> str:
-        legacy_name = f"{self._legacy_template_base()}__{self._environment_hash}"
-        return self._qualified_template_name(legacy_name)
 
     @retry(
         retry=retry_if_exception_type(
@@ -314,6 +738,15 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             template = Template().from_image(
                 image=self.task_env_config.docker_image,
             )
+            imported_go_cache_paths = getattr(self, "_imported_go_cache_paths", {})
+            if imported_go_cache_paths:
+                template = template.run_cmd(
+                    _imported_go_cache_build_command(
+                        self._workdir_from_dockerfile() or "/app",
+                        imported_go_cache_paths,
+                    ),
+                    user="root",
+                )
         else:
             template = Template(
                 file_context_path=str(Path(self.environment_dir).resolve())
@@ -338,198 +771,224 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         )
 
     @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(5),
+        wait=wait_random_exponential(multiplier=1, min=1, max=30),
         reraise=True,
     )
     async def _create_sandbox(self):
-        metadata = {
-            "environment_name": self.environment_name,
-            "session_id": self.session_id,
-        }
-
-        try:
-            self._sandbox = await asyncio.wait_for(
-                AsyncSandbox.create(
-                    template=self._template_name,
-                    metadata=metadata,
-                    timeout=self._sandbox_timeout_sec,
-                    allow_internet_access=self._allow_internet_access(),
-                ),
-                timeout=_sandbox_create_timeout_sec(),
-            )
-        except SandboxException as exc:
-            missing_default_tag = "tag 'default' does not exist" in str(exc)
-            if not missing_default_tag:
-                raise
-
-            if not self._is_pi_template():
-                self.logger.warning(
-                    "Template %s exists but is not launchable; rebuilding: %s",
-                    self._template_name,
-                    exc,
-                )
-                await self._create_template()
-                self._sandbox = await asyncio.wait_for(
-                    AsyncSandbox.create(
-                        template=self._template_name,
-                        metadata=metadata,
-                        timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self._allow_internet_access(),
-                    ),
-                    timeout=_sandbox_create_timeout_sec(),
-                )
-                return
-
-            fallback_template = self._fallback_template_name()
-            self.logger.warning(
-                "Falling back from unusable Pi template %s to %s: %s",
-                self._template_name,
-                fallback_template,
-                exc,
-            )
-            self._template_name = fallback_template
-            try:
-                self._sandbox = await asyncio.wait_for(
-                    AsyncSandbox.create(
-                        template=self._template_name,
-                        metadata=metadata,
-                        timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self._allow_internet_access(),
-                    ),
-                    timeout=_sandbox_create_timeout_sec(),
-                )
-                return
-            except SandboxException as fallback_launch_exc:
-                if not self._sandbox_template_missing(fallback_launch_exc):
-                    raise
-                await self._create_template()
-
-            try:
-                self._sandbox = await asyncio.wait_for(
-                    AsyncSandbox.create(
-                        template=self._template_name,
-                        metadata=metadata,
-                        timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self._allow_internet_access(),
-                    ),
-                    timeout=_sandbox_create_timeout_sec(),
-                )
-            except SandboxException as fallback_exc:
-                if "tag 'default' does not exist" not in str(fallback_exc):
-                    raise
-                self.logger.warning(
-                    "Fallback template %s exists but is not launchable; rebuilding: %s",
-                    self._template_name,
-                    fallback_exc,
-                )
-                await self._create_template()
-                self._sandbox = await asyncio.wait_for(
-                    AsyncSandbox.create(
-                        template=self._template_name,
-                        metadata=metadata,
-                        timeout=self._sandbox_timeout_sec,
-                        allow_internet_access=self._allow_internet_access(),
-                    ),
-                    timeout=_sandbox_create_timeout_sec(),
-                )
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
-    async def _create_sandbox_from_template(self, template_name: str) -> None:
-        metadata = {
-            "environment_name": self.environment_name,
-            "session_id": self.session_id,
-        }
-        self._sandbox = await asyncio.wait_for(
-            AsyncSandbox.create(
-                template=template_name,
-                metadata=metadata,
-                timeout=self._sandbox_timeout_sec,
-                allow_internet_access=self._allow_internet_access(),
-            ),
-            timeout=_sandbox_create_timeout_sec(),
-        )
-
-    @staticmethod
-    def _sandbox_template_missing(exc: Exception) -> bool:
-        message = str(exc).lower()
-        missing_markers = (
-            "not found",
-            "does not exist",
-            "no such template",
-            "template not found",
-            "tag 'default' does not exist",
-        )
-        return any(marker in message for marker in missing_markers)
-
-    async def _start_existing_candidate_template(self) -> bool:
-        cache_key = self._template_lookup_cache_key()
+        missing_or_unlaunchable: SandboxException | None = None
         candidates = self._candidate_template_names()
         cached_template = (
-            _TEMPLATE_LOOKUP_CACHE.get(cache_key)
+            _TEMPLATE_LOOKUP_CACHE.get(self._template_lookup_cache_key())
             or self._read_template_lookup_file_cache()
         )
         if cached_template in candidates:
             candidates = [
                 cached_template,
-                *(candidate for candidate in candidates if candidate != cached_template),
+                *(
+                    candidate
+                    for candidate in candidates
+                    if candidate != cached_template
+                ),
             ]
 
-        process_lock = _TEMPLATE_LOOKUP_LOCKS.setdefault(cache_key, asyncio.Lock())
-        async with process_lock:
-            async with _AsyncFileLock(self._template_lookup_lock_file()):
-                return await self._start_existing_candidate_template_locked(candidates)
-
-    async def _start_existing_candidate_template_locked(
-        self, candidates: list[str]
-    ) -> bool:
-        for candidate in candidates:
-            self.logger.info(
-                "E2B template launch probe: template=%s",
-                candidate,
-            )
-            _benchmark_log(
-                "E2B_TEMPLATE "
-                f"task={self.environment_name} "
-                f"status=launch_probe "
-                f"template={candidate}"
-            )
+        for template_name in candidates:
+            self._template_name = template_name
+            if not await AsyncTemplate.exists(template_name.rsplit("/", 1)[-1]):
+                continue
             try:
-                await self._create_sandbox_from_template(candidate)
+                await self._create_sandbox_from_current_template()
+                self._remember_template_exists(template_name)
+                return
             except SandboxException as exc:
-                if not self._sandbox_template_missing(exc):
+                if not _is_missing_or_unlaunchable_template_error(exc):
                     raise
-                self.logger.info(
-                    "E2B template candidate unavailable: template=%s error=%s",
-                    candidate,
+                missing_or_unlaunchable = exc
+                self._forget_template_lookup()
+                self.logger.debug(
+                    "Template %s is not launchable; trying next candidate: %s",
+                    template_name,
                     exc,
                 )
+
+        self._template_name = self._pi_template_name() or self._build_template_name()
+        process_lock = _TEMPLATE_LOOKUP_LOCKS.setdefault(
+            self._template_lookup_cache_key(), asyncio.Lock()
+        )
+        async with process_lock:
+            async with _AsyncFileLock(self._template_lookup_build_lock_file()):
+                for template_name in self._candidate_template_names():
+                    self._template_name = template_name
+                    if not await AsyncTemplate.exists(template_name.rsplit("/", 1)[-1]):
+                        continue
+                    try:
+                        await self._create_sandbox_from_current_template()
+                        self._remember_template_exists(template_name)
+                        return
+                    except SandboxException as exc:
+                        if not _is_missing_or_unlaunchable_template_error(exc):
+                            raise
+                        missing_or_unlaunchable = exc
+
+                self._template_name = (
+                    self._pi_template_name() or self._build_template_name()
+                )
+                self.logger.debug("Creating template %s", self._template_name)
                 _benchmark_log(
                     "E2B_TEMPLATE "
                     f"task={self.environment_name} "
-                    f"status=launch_miss "
-                    f"template={candidate}"
+                    f"status=miss "
+                    f"template={self._template_name}"
                 )
-                continue
+                await self._create_template()
 
-            self._template_name = candidate
-            self._remember_template_exists(candidate)
-            self.logger.info(
-                "E2B template hit: launched existing template=%s",
-                self._template_name,
+        try:
+            await self._create_sandbox_from_current_template()
+            self._remember_template_exists(self._template_name)
+        except SandboxException as exc:
+            if missing_or_unlaunchable is not None:
+                raise exc from missing_or_unlaunchable
+            raise
+
+    async def _create_sandbox_from_current_template(self) -> None:
+        metadata = {
+            "environment_name": self.environment_name,
+            "session_id": self.session_id,
+        }
+        await _wait_for_sandbox_create_slot()
+        self._sandbox = await AsyncSandbox.create(
+            template=self._template_name,
+            metadata=metadata,
+            timeout=self._sandbox_timeout_sec,
+            allow_internet_access=self._allow_internet_access(),
+        )
+
+    async def _restore_dockerfile_runtime_env(self) -> None:
+        self._dockerfile_declared_env = {}
+        if not self.task_env_config.docker_image:
+            return
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        result = await self._sandbox.commands.run(
+            "env",
+            user="root",
+            timeout=30,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Could not read the E2B sandbox environment before restoring "
+                "Dockerfile ENV instructions"
             )
+        base_env = {}
+        for line in str(result.stdout or "").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            base_env[key] = value
+        dockerfile_env = _dockerfile_runtime_env(
+            self._environment_definition_path,
+            base_env,
+        )
+        imported_go_cache_paths = getattr(self, "_imported_go_cache_paths", {})
+        imported_go_runtime_env: dict[str, str] = {}
+        if imported_go_cache_paths:
+            for key, (_source, destination) in imported_go_cache_paths.items():
+                imported_go_runtime_env[key] = destination
+            restored_path = self._persistent_env.get(
+                "PATH",
+                dockerfile_env.get("PATH", base_env.get("PATH", "")),
+            )
+            imported_go_runtime_env.update(
+                {
+                    "PATH": f"{_IMPORTED_GO_TOOLCHAIN}/bin:{restored_path}",
+                    "GOTOOLCHAIN": "local",
+                }
+            )
+            if not self._allow_internet_access():
+                imported_go_runtime_env.update(
+                    {
+                        "GOPROXY": "off",
+                        "GOSUMDB": "off",
+                    }
+                )
+            dockerfile_env.update(imported_go_runtime_env)
+        self._dockerfile_declared_env = dockerfile_env
+        self._persistent_env = {
+            **dockerfile_env,
+            **self._persistent_env,
+        }
+        self._persistent_env.update(imported_go_runtime_env)
+        if imported_go_cache_paths:
+            check = await self._sandbox.commands.run(
+                _imported_go_cache_runtime_check_command(
+                    self._workdir_from_dockerfile() or "/app",
+                    imported_go_cache_paths,
+                ),
+                user="root",
+                timeout=300,
+            )
+            if check.exit_code != 0:
+                output_tail = "\n".join(
+                    part
+                    for part in (
+                        str(getattr(check, "stdout", "") or "").strip(),
+                        str(getattr(check, "stderr", "") or "").strip(),
+                    )
+                    if part
+                )[-2000:]
+                raise RuntimeError(
+                    "Imported-image Go cache is unavailable for offline execution: "
+                    f"return_code={check.exit_code}, output_tail={output_tail!r}"
+                )
+        if dockerfile_env:
             _benchmark_log(
-                "E2B_TEMPLATE "
+                "E2B_ENV_RESTORE "
                 f"task={self.environment_name} "
-                f"status=launch_hit "
-                f"template={self._template_name}"
+                f"keys={','.join(sorted(dockerfile_env))} "
+                "status=ok"
             )
-            return True
-        return False
+
+    def _command_with_dockerfile_env(
+        self,
+        command: str,
+        env: dict[str, str] | None,
+    ) -> str:
+        """Export imported-image Dockerfile ENV values inside the command shell."""
+
+        declared_env = getattr(self, "_dockerfile_declared_env", {})
+        if not declared_env:
+            return command
+
+        per_exec_env = env or {}
+        exports: list[str] = []
+        for key, declared_value in sorted(declared_env.items()):
+            if not _SHELL_ENV_NAME.fullmatch(key) or _SENSITIVE_ENV_NAME.search(key):
+                continue
+            value = per_exec_env.get(
+                key,
+                self._persistent_env.get(key, declared_value),
+            )
+            exports.append(f"export {key}={shlex.quote(str(value))}")
+        if not exports:
+            return command
+        return "\n".join([*exports, command])
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> Any:
+        command = self._command_with_dockerfile_env(command, env)
+        return await super().exec(
+            command=command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
 
     def _workdir_from_dockerfile(self) -> str | None:
         return next(
@@ -580,9 +1039,64 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             await self._sandbox.connect(timeout=self._sandbox_timeout_sec)
             raise
 
+    async def _validate_sandbox_resources(self) -> None:
+        if not self._sandbox:
+            raise E2BResourceMismatchError("Sandbox is unavailable for resource check")
+        info = await self._sandbox.get_info()
+        required_cpus = int(self.task_env_config.cpus)
+        required_memory_mb = int(self.task_env_config.memory_mb)
+        required_storage_mb = int(self.task_env_config.storage_mb)
+        if info.cpu_count < required_cpus or info.memory_mb < required_memory_mb:
+            raise E2BResourceMismatchError(
+                "E2B template resource mismatch: "
+                f"actual={info.cpu_count}cpu/{info.memory_mb}MB "
+                f"required={required_cpus}cpu/{required_memory_mb}MB "
+                f"template={self._template_name}"
+            )
+
+        disk = await self.exec(
+            "df -Pm /app | tail -n 1 | awk '{print $2}'",
+            user="root",
+        )
+        try:
+            actual_storage_mb = int(str(disk.stdout or "").strip().splitlines()[-1])
+        except (IndexError, ValueError) as exc:
+            raise E2BResourceMismatchError(
+                f"Could not determine E2B sandbox disk size: {disk.stdout!r}"
+            ) from exc
+        minimum_storage_mb = max(1, int(required_storage_mb * 0.95))
+        if actual_storage_mb < minimum_storage_mb:
+            raise E2BResourceMismatchError(
+                "E2B sandbox disk is smaller than the task requirement: "
+                f"actual={actual_storage_mb}MB required={required_storage_mb}MB "
+                f"template={self._template_name}"
+            )
+        _benchmark_log(
+            "E2B_RESOURCE_CHECK "
+            f"task={self.environment_name} "
+            f"template={self._template_name} "
+            f"cpus={info.cpu_count} memory_mb={info.memory_mb} "
+            f"storage_mb={actual_storage_mb} status=ok"
+        )
+
+    async def _cleanup_sandbox_before_restart(self) -> None:
+        if self._sandbox is None:
+            return
+        self.logger.warning(
+            "Discarding an existing E2B sandbox before retrying environment start"
+        )
+        _benchmark_log(
+            f"E2B_SANDBOX task={self.environment_name} status=cleanup_before_restart"
+        )
+        await self.stop(delete=True)
+
     async def start(self, force_build: bool):
+        await self._cleanup_sandbox_before_restart()
         if force_build:
             self._forget_template_lookup()
+            self._template_name = (
+                self._pi_template_name() or self._build_template_name()
+            )
             self.logger.info(
                 "E2B template check: force_build=true; building template=%s",
                 self._template_name,
@@ -593,41 +1107,26 @@ class E2BSwebenchEnvironment(E2BEnvironment):
                 f"status=force_build "
                 f"template={self._template_name}"
             )
-            await self._create_template()
-            await self._create_sandbox()
-        else:
-            candidates = self._candidate_template_names()
-            self.logger.info(
-                "E2B template launch candidates=%s",
-                ", ".join(candidates),
+            process_lock = _TEMPLATE_LOOKUP_LOCKS.setdefault(
+                self._template_lookup_cache_key(), asyncio.Lock()
             )
-            _benchmark_log(
-                "E2B_TEMPLATE "
-                f"task={self.environment_name} "
-                "status=launch_candidates "
-                f"candidates={','.join(candidates)}"
-            )
-            if not await self._start_existing_candidate_template():
-                self._template_name = self._pi_template_name() or self._build_template_name()
-                self.logger.info(
-                    "E2B template miss: building template=%s",
-                    self._template_name,
-                )
-                _benchmark_log(
-                    "E2B_TEMPLATE "
-                    f"task={self.environment_name} "
-                    f"status=miss "
-                    f"template={self._template_name}"
-                )
-                built_template = False
-                async with _AsyncFileLock(
-                    self._template_lookup_lock_file().with_suffix(".build.lock")
-                ):
-                    if not await self._start_existing_candidate_template():
-                        await self._create_template()
-                        built_template = True
-                if built_template:
-                    await self._create_sandbox()
+            async with process_lock:
+                async with _AsyncFileLock(self._template_lookup_build_lock_file()):
+                    await self._create_template()
+
+        candidates = self._candidate_template_names()
+        self.logger.info(
+            "E2B template launch candidates=%s",
+            ", ".join(candidates),
+        )
+        _benchmark_log(
+            "E2B_TEMPLATE "
+            f"task={self.environment_name} "
+            "status=launch_candidates "
+            f"candidates={','.join(candidates)}"
+        )
+
+        await self._create_sandbox()
 
         if not self._sandbox:
             raise RuntimeError(
@@ -635,7 +1134,9 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             )
 
         await self._wait_for_sandbox_ready()
+        await self._restore_dockerfile_runtime_env()
         await self._prepare_runtime_dirs()
+        await self._validate_sandbox_resources()
 
         await self.exec(
             f"chmod 777 {EnvironmentPaths.agent_dir} {EnvironmentPaths.verifier_dir}"
