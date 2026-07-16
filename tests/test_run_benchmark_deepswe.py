@@ -19,6 +19,7 @@ from scripts.run_benchmark import (
     _DEEPSWE_VERIFIER_TEST_ERRATA,
     _apply_deepswe_verifier_test_errata,
     _deepswe_fresh_environment_verifier_retry,
+    _deepswe_verify_after_agent_timeout,
     _download_deepswe_artifacts_with_retry,
     _deepswe_official_test_patch_paths,
     _deepswe_verifier_suite_infra_reason,
@@ -446,6 +447,43 @@ diff --git a/{path} b/{path}
 
 
 class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
+    def test_agent_timeout_does_not_require_missing_sdk_result_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trial = SimpleNamespace(
+                _trial_paths=SimpleNamespace(
+                    artifacts_dir=root / "artifacts",
+                    agent_dir=root / "agent",
+                ),
+                config=SimpleNamespace(
+                    agent=SimpleNamespace(
+                        import_path="agents.claude_sdk_agent:ClaudeSdkAgent"
+                    )
+                ),
+                result=SimpleNamespace(
+                    exception_info=SimpleNamespace(exception_type="AgentTimeoutError")
+                ),
+            )
+
+            timeout_names = {
+                path.name
+                for path in _required_deepswe_artifact_paths(
+                    trial,
+                    result_only=False,
+                )
+            }
+            trial.result.exception_info = None
+            completed_names = {
+                path.name
+                for path in _required_deepswe_artifact_paths(
+                    trial,
+                    result_only=False,
+                )
+            }
+
+        self.assertNotIn("claude-agent-sdk-result.json", timeout_names)
+        self.assertIn("claude-agent-sdk-result.json", completed_names)
+
     async def test_retries_required_downloads_in_the_same_trial(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -558,12 +596,38 @@ class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
 class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
     def make_deepswe_trial(self, task_dir: Path) -> SimpleNamespace:
         (task_dir / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+        trial_dir = task_dir / "trial"
+        trial_dir.mkdir()
         return SimpleNamespace(
             _task=SimpleNamespace(paths=SimpleNamespace(task_dir=task_dir)),
+            _trial_paths=SimpleNamespace(trial_dir=trial_dir),
             _logger=mock.Mock(),
             _skills_evo_deepswe_fresh_verifier_environment=True,
             result=SimpleNamespace(verifier_result=None),
         )
+
+    async def test_agent_timeout_always_verifies_deepswe_snapshot(self) -> None:
+        calls = 0
+
+        async def original(_trial: object) -> bool:
+            nonlocal calls
+            calls += 1
+            return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = self.make_deepswe_trial(Path(tmp))
+            patched = _deepswe_verify_after_agent_timeout(original)
+
+            self.assertTrue(await patched(trial))
+            self.assertEqual(calls, 0)
+
+        non_deepswe = SimpleNamespace(
+            _task=SimpleNamespace(
+                paths=SimpleNamespace(task_dir=Path("/does/not/exist"))
+            )
+        )
+        self.assertFalse(await patched(non_deepswe))
+        self.assertEqual(calls, 1)
 
     async def test_deepswe_suite_infra_retries_in_fresh_environment(self) -> None:
         calls = 0
@@ -699,6 +763,100 @@ class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
                 stop_current=True,
             )
         self.assertEqual(calls, ["once", "once"])
+
+    async def test_repeated_same_test_timeout_is_terminal_reward_zero(self) -> None:
+        from harbor.trial.trial import VerifierTimeoutError
+
+        calls = 0
+
+        async def verify_once(_trial: object) -> None:
+            nonlocal calls
+            calls += 1
+            raise VerifierTimeoutError("verifier timed out")
+
+        async def preserve_timeout_log(trial: object, *, label: str) -> None:
+            attempt_dir = trial._trial_paths.trial_dir / "verifier_attempts" / label
+            attempt_dir.mkdir(parents=True)
+            (attempt_dir / "test-stdout.txt").write_text(
+                "[verifier] base-mode smoke-import gate exit code: 0\n"
+                "Running new mode: hidden tests\n"
+                "tests/test_mux.py::TestBasicOperation::test_send_recv \n"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = self.make_deepswe_trial(Path(tmp))
+            with (
+                mock.patch(
+                    "scripts.run_benchmark._download_deepswe_verifier_logs_best_effort",
+                    side_effect=preserve_timeout_log,
+                ),
+                mock.patch(
+                    "scripts.run_benchmark._replace_deepswe_verifier_environment",
+                    new_callable=mock.AsyncMock,
+                ) as replace_environment,
+            ):
+                patched = _deepswe_fresh_environment_verifier_retry(verify_once)
+                await patched(trial)
+
+            self.assertEqual(trial.result.verifier_result.rewards, {"reward": 0})
+            audit = json.loads(
+                (
+                    trial._trial_paths.trial_dir
+                    / "verifier_attempts"
+                    / "terminal_timeout.json"
+                ).read_text()
+            )
+            self.assertEqual(
+                audit["repeated_pytest_node"],
+                "tests/test_mux.py::TestBasicOperation::test_send_recv",
+            )
+            replace_environment.assert_awaited_once_with(
+                trial,
+                retry_index=1,
+                stop_current=True,
+            )
+        self.assertEqual(calls, 2)
+
+    async def test_ambiguous_repeated_timeout_stays_fail_closed(self) -> None:
+        from harbor.trial.trial import VerifierTimeoutError
+
+        async def verify_once(_trial: object) -> None:
+            raise VerifierTimeoutError("verifier timed out")
+
+        async def preserve_different_logs(trial: object, *, label: str) -> None:
+            attempt_dir = trial._trial_paths.trial_dir / "verifier_attempts" / label
+            attempt_dir.mkdir(parents=True)
+            node = "test_one" if label.endswith("1") else "test_two"
+            (attempt_dir / "test-stdout.txt").write_text(
+                "[verifier] base-mode smoke-import gate exit code: 0\n"
+                "Running new mode: hidden tests\n"
+                f"tests/test_mux.py::TestBasicOperation::{node}\n"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = self.make_deepswe_trial(Path(tmp))
+            with (
+                mock.patch(
+                    "scripts.run_benchmark._download_deepswe_verifier_logs_best_effort",
+                    side_effect=preserve_different_logs,
+                ),
+                mock.patch(
+                    "scripts.run_benchmark._replace_deepswe_verifier_environment",
+                    new_callable=mock.AsyncMock,
+                ),
+            ):
+                patched = _deepswe_fresh_environment_verifier_retry(verify_once)
+                with self.assertRaises(VerifierTimeoutError):
+                    await patched(trial)
+
+            self.assertIsNone(trial.result.verifier_result)
+            self.assertFalse(
+                (
+                    trial._trial_paths.trial_dir
+                    / "verifier_attempts"
+                    / "terminal_timeout.json"
+                ).exists()
+            )
 
     async def test_negative_reward_retries_same_patch_in_fresh_environment(
         self,

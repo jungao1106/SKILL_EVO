@@ -21,6 +21,7 @@ from e2b.exceptions import (
     SandboxException,
     TemplateException,
 )
+from e2b.sandbox.commands.command_handle import CommandExitException
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -29,6 +30,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from harbor.environments.base import ExecResult
 from harbor.environments.e2b import E2BEnvironment
 from harbor.models.trial.paths import EnvironmentPaths
 
@@ -973,6 +975,11 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             return command
         return "\n".join([*exports, command])
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
     async def exec(
         self,
         command: str,
@@ -980,14 +987,39 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
         user: str | int | None = None,
-    ) -> Any:
+    ) -> ExecResult:
         command = self._command_with_dockerfile_env(command, env)
-        return await super().exec(
-            command=command,
-            cwd=cwd,
-            env=env,
-            timeout_sec=timeout_sec,
-            user=user,
+        user = self._resolve_user(user)
+        env = self._merge_env(env)
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        handle = await self._sandbox.commands.run(
+            cmd=command,
+            background=True,
+            cwd=cwd or self._workdir,
+            envs=env,
+            timeout=timeout_sec or 0,
+            user=str(user) if user is not None else "root",
+        )
+        try:
+            result = await handle.wait()
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(handle.kill())
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not stop cancelled E2B command before returning: %s",
+                    exc,
+                )
+            raise
+        except CommandExitException as exc:
+            result = exc
+
+        return ExecResult(
+            stdout=result.stdout,
+            stderr=result.stderr,
+            return_code=result.exit_code,
         )
 
     def _workdir_from_dockerfile(self) -> str | None:

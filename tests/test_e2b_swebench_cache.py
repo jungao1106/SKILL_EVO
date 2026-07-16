@@ -173,6 +173,33 @@ class TemplateLookupCacheTests(unittest.TestCase):
         previous_sandbox.kill.assert_awaited_once()
         self.assertIsNone(environment._sandbox)
 
+    def test_cancelled_exec_kills_remote_command_before_propagating(self) -> None:
+        environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+        handle = SimpleNamespace(
+            wait=AsyncMock(side_effect=asyncio.CancelledError()),
+            kill=AsyncMock(return_value=True),
+        )
+        commands = SimpleNamespace(run=AsyncMock(return_value=handle))
+        environment._sandbox = SimpleNamespace(commands=commands)
+        environment._workdir = "/app"
+        environment._dockerfile_declared_env = {}
+        environment._persistent_env = {}
+        environment.default_user = None
+        environment.logger = SimpleNamespace(warning=lambda *_args: None)
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(environment.exec("long-running-agent", user="root"))
+
+        handle.kill.assert_awaited_once_with()
+        commands.run.assert_awaited_once_with(
+            cmd="long-running-agent",
+            background=True,
+            cwd="/app",
+            envs=None,
+            timeout=0,
+            user="root",
+        )
+
     def test_dockerfile_runtime_env_resolves_against_base_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dockerfile = Path(temp_dir) / "Dockerfile"
@@ -679,24 +706,28 @@ ENV GOMODCACHE=/tmp/gomodcache GOCACHE=/tmp/gocache GOTOOLCHAIN=auto
             "VIRTUAL_ENV": "/opt/venv",
             "NOVITA_API_KEY": "provider-secret",
         }
+        handle = SimpleNamespace(
+            wait=AsyncMock(
+                return_value=SimpleNamespace(stdout="", stderr="", exit_code=0)
+            ),
+            kill=AsyncMock(),
+        )
+        commands = SimpleNamespace(run=AsyncMock(return_value=handle))
+        environment._sandbox = SimpleNamespace(commands=commands)
+        environment._workdir = "/app"
+        environment.default_user = None
 
-        with patch.object(
-            e2b_swebench.E2BEnvironment,
-            "exec",
-            new_callable=AsyncMock,
-            return_value=SimpleNamespace(return_code=0),
-        ) as base_exec:
-            asyncio.run(
-                environment.exec(
-                    "python -m pytest",
-                    env={
-                        "PATH": "/per-exec/bin",
-                        "OPENAI_COMPAT_API_KEY": "per-exec-secret",
-                    },
-                )
+        asyncio.run(
+            environment.exec(
+                "python -m pytest",
+                env={
+                    "PATH": "/per-exec/bin",
+                    "OPENAI_COMPAT_API_KEY": "per-exec-secret",
+                },
             )
+        )
 
-        command = base_exec.await_args.kwargs["command"]
+        command = commands.run.await_args.kwargs["cmd"]
         self.assertEqual(
             command,
             "\n".join(
@@ -713,9 +744,12 @@ ENV GOMODCACHE=/tmp/gomodcache GOCACHE=/tmp/gocache GOTOOLCHAIN=auto
         self.assertNotIn("OPENAI_COMPAT_API_KEY", command)
         self.assertNotIn("per-exec-secret", command)
         self.assertEqual(
-            base_exec.await_args.kwargs["env"],
+            commands.run.await_args.kwargs["envs"],
             {
                 "PATH": "/per-exec/bin",
+                "PYTHONPATH": "/configured/src",
+                "VIRTUAL_ENV": "/opt/venv",
+                "NOVITA_API_KEY": "provider-secret",
                 "OPENAI_COMPAT_API_KEY": "per-exec-secret",
             },
         )
@@ -724,17 +758,21 @@ ENV GOMODCACHE=/tmp/gomodcache GOCACHE=/tmp/gocache GOTOOLCHAIN=auto
         environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
         environment._dockerfile_declared_env = {}
         environment._persistent_env = {"NOVITA_API_KEY": "provider-secret"}
+        handle = SimpleNamespace(
+            wait=AsyncMock(
+                return_value=SimpleNamespace(stdout="", stderr="", exit_code=0)
+            ),
+            kill=AsyncMock(),
+        )
+        commands = SimpleNamespace(run=AsyncMock(return_value=handle))
+        environment._sandbox = SimpleNamespace(commands=commands)
+        environment._workdir = "/app"
+        environment.default_user = None
 
-        with patch.object(
-            e2b_swebench.E2BEnvironment,
-            "exec",
-            new_callable=AsyncMock,
-            return_value=SimpleNamespace(return_code=0),
-        ) as base_exec:
-            asyncio.run(environment.exec("python -m pytest"))
+        asyncio.run(environment.exec("python -m pytest"))
 
         self.assertEqual(
-            base_exec.await_args.kwargs["command"],
+            commands.run.await_args.kwargs["cmd"],
             "python -m pytest",
         )
 

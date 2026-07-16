@@ -187,6 +187,35 @@ def job_is_complete(job_dir: Path, expected_trials: int) -> bool:
     return True
 
 
+def job_invalid_fingerprint(job_dir: Path) -> tuple[tuple[str, str, str], ...]:
+    """Fingerprint invalid subset results to detect recovery no-ops."""
+
+    if not job_dir.is_dir():
+        return ()
+    fingerprint: list[tuple[str, str, str]] = []
+    for trial_dir in sorted(path for path in job_dir.iterdir() if path.is_dir()):
+        result_path = trial_dir / "result.json"
+        if not result_path.is_file():
+            fingerprint.append((trial_dir.name, "missing-result", "missing"))
+            continue
+        try:
+            payload = result_path.read_bytes()
+            result = json.loads(payload)
+        except (OSError, json.JSONDecodeError):
+            fingerprint.append((trial_dir.name, "invalid-result", "invalid"))
+            continue
+        reason = _deepswe_result_infra_reason(result)
+        if reason is not None:
+            fingerprint.append(
+                (
+                    trial_dir.name,
+                    reason,
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            )
+    return tuple(fingerprint)
+
+
 def gate_row(manifest: dict[str, Any], gate_index: int) -> dict[str, Any]:
     for gate in manifest.get("gates") or []:
         if int(gate.get("gate_index") or 0) == gate_index:
@@ -790,6 +819,7 @@ def run_subset_eval(
             ["--pi-version", execution["dependency_versions"]["pi-coding-agent"]]
         )
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    previous_invalid = job_invalid_fingerprint(job_dir)
     for recovery_round in range(1, args.recovery_rounds + 1):
         with log_path.open("a") as log:
             log.write(
@@ -809,6 +839,17 @@ def run_subset_eval(
             log.write(f"[{utc_now()}] command exit code={proc.returncode}\n")
         if job_is_complete(job_dir, expected_trials):
             return job_dir
+        current_invalid = job_invalid_fingerprint(job_dir)
+        if current_invalid and current_invalid == previous_invalid:
+            details = ", ".join(
+                f"{trial_name}:{reason}"
+                for trial_name, reason, _digest in current_invalid
+            )
+            raise SystemExit(
+                "Subset recovery made no progress and will not rerun the model: "
+                f"{details}"
+            )
+        previous_invalid = current_invalid
     current, total, finished_at = job_progress(job_dir)
     raise SystemExit(
         "Subset job did not complete after recovery rounds: "

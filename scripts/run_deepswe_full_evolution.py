@@ -153,6 +153,23 @@ def aggregate_is_complete(
     )
 
 
+def infra_invalid_fingerprint(job_dir: Path) -> tuple[tuple[str, str, str], ...]:
+    """Fingerprint invalid trial evidence so recovery cannot spin without work."""
+
+    fingerprint: list[tuple[str, str, str]] = []
+    for row in infra_invalid_trials(job_dir) if job_dir.is_dir() else []:
+        trial_name = str(row.get("trial_name") or "")
+        reason = str(row.get("reason") or "")
+        result_path = job_dir / trial_name / "result.json"
+        digest = (
+            hashlib.sha256(result_path.read_bytes()).hexdigest()
+            if result_path.is_file()
+            else "missing"
+        )
+        fingerprint.append((trial_name, reason, digest))
+    return tuple(sorted(fingerprint))
+
+
 def dataset_task_names(dataset: Path) -> list[str]:
     names: list[str] = []
     for task_path in sorted(dataset.glob("*/task.toml")):
@@ -412,6 +429,8 @@ def run_eval_until_valid(
     ]
     eval_env = dict(env)
     eval_env["PI_SKILL_PACK_ROOT"] = str(skill_root.resolve())
+    job_dir = ROOT / "jobs" / job_name
+    previous_invalid = infra_invalid_fingerprint(job_dir)
     for recovery_round in range(1, args.recovery_rounds + 1):
         run_logged(
             command=eval_command,
@@ -427,6 +446,17 @@ def run_eval_until_valid(
             report_path, expected_trials, job_name
         ):
             return report_path
+        current_invalid = infra_invalid_fingerprint(job_dir)
+        if current_invalid and current_invalid == previous_invalid:
+            details = ", ".join(
+                f"{trial_name}:{reason}"
+                for trial_name, reason, _digest in current_invalid
+            )
+            raise RuntimeError(
+                "DeepSWE recovery made no progress and will not rerun the model: "
+                f"{details}"
+            )
+        previous_invalid = current_invalid
         print(
             f"[{utc_now()}] {job_name} remains incomplete/infra-invalid after "
             f"recovery round {recovery_round}/{args.recovery_rounds}",

@@ -211,7 +211,7 @@ class JobResumeStateTest(unittest.TestCase):
         from harbor.models.agent.context import AgentContext
         from harbor.models.task.id import LocalTaskId
         from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
-        from harbor.models.trial.result import AgentInfo, TrialResult
+        from harbor.models.trial.result import AgentInfo, ExceptionInfo, TrialResult
         from harbor.models.verifier.result import VerifierResult
 
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -222,7 +222,13 @@ class JobResumeStateTest(unittest.TestCase):
             (task_dir / "pre_artifacts.sh").write_text("#!/bin/sh\n")
             job_dir.mkdir(parents=True)
 
-            def write_trial(name: str, reward: int, *, auth: bool = False) -> None:
+            def write_trial(
+                name: str,
+                reward: int | None,
+                *,
+                exception_type: str | None = None,
+                auth: bool = False,
+            ) -> Path:
                 trial_dir = job_dir / name
                 trial_dir.mkdir()
                 config = TrialConfig(
@@ -243,25 +249,71 @@ class JobResumeStateTest(unittest.TestCase):
                     config=config,
                     agent_info=AgentInfo(name="oracle", version="test"),
                     agent_result=AgentContext(),
-                    verifier_result=VerifierResult(rewards={"reward": reward}),
+                    verifier_result=(
+                        VerifierResult(rewards={"reward": reward})
+                        if reward is not None
+                        else None
+                    ),
                 )
-                if auth:
-                    from harbor.models.trial.result import ExceptionInfo
-
+                if auth or exception_type:
                     result.exception_info = ExceptionInfo(
-                        exception_type="NonZeroAgentExitCodeError",
-                        exception_message="Claude provider authentication failed",
+                        exception_type=(
+                            "NonZeroAgentExitCodeError" if auth else exception_type
+                        ),
+                        exception_message=(
+                            "Claude provider authentication failed"
+                            if auth
+                            else f"{exception_type} test fixture"
+                        ),
                         exception_traceback="",
                         occurred_at=__import__("datetime").datetime.now(),
                     )
                 (trial_dir / "result.json").write_text(
                     result.model_dump_json(indent=2)
                 )
+                return trial_dir
 
             write_trial("infra", -1)
             write_trial("failed", 0)
             write_trial("passed", 1)
             write_trial("auth", 0, auth=True)
+            agent_timeout = write_trial(
+                "agent-timeout",
+                None,
+                exception_type="AgentTimeoutError",
+            )
+            (agent_timeout / "trial.log").write_text(
+                "Skipping verifier after agent timeout because agent/sharegpt.json "
+                "is missing or invalid\n"
+            )
+            verifier_timeout = write_trial(
+                "verifier-timeout",
+                None,
+                exception_type="VerifierTimeoutError",
+            )
+            timeout_output = (
+                "[verifier] base-mode smoke-import gate exit code: 0\n"
+                "Running new mode: hidden tests\n"
+                "tests/test_mux.py::TestBasicOperation::test_send_recv \n"
+            )
+            for attempt in (1, 2):
+                attempt_dir = (
+                    verifier_timeout
+                    / "verifier_attempts"
+                    / f"timeout_attempt_{attempt}"
+                )
+                attempt_dir.mkdir(parents=True)
+                (attempt_dir / "test-stdout.txt").write_text(timeout_output)
+            ambiguous_timeout = write_trial(
+                "ambiguous-verifier-timeout",
+                None,
+                exception_type="VerifierTimeoutError",
+            )
+            transient = write_trial(
+                "provider-transient",
+                None,
+                exception_type="DeepSweProviderTransientError",
+            )
             partial = job_dir / "partial"
             partial.mkdir()
             (partial / "config.json").write_text("not json")
@@ -270,11 +322,29 @@ class JobResumeStateTest(unittest.TestCase):
 
             self.assertEqual(
                 {row["trial_name"] for row in archived},
-                {"partial"},
+                {"partial", "provider-transient"},
             )
             self.assertTrue((job_dir / "infra").exists())
             self.assertTrue((job_dir / "auth").exists())
             self.assertFalse((job_dir / "partial").exists())
+            self.assertFalse(transient.exists())
+            self.assertTrue(agent_timeout.exists())
+            self.assertTrue(verifier_timeout.exists())
+            self.assertTrue(ambiguous_timeout.exists())
+            for trial_dir in (agent_timeout, verifier_timeout):
+                normalized = json.loads((trial_dir / "result.json").read_text())
+                self.assertEqual(
+                    normalized["verifier_result"]["rewards"]["reward"],
+                    0,
+                )
+                self.assertTrue(
+                    (trial_dir / "result.pre-terminal-normalization.json").exists()
+                )
+                self.assertTrue((trial_dir / "terminal_outcome.json").exists())
+            ambiguous = json.loads(
+                (ambiguous_timeout / "result.json").read_text()
+            )
+            self.assertIsNone(ambiguous["verifier_result"])
             self.assertTrue((job_dir / "failed").exists())
             self.assertTrue((job_dir / "passed").exists())
             archive = root / "jobs" / ".skills-evo-infra-archive" / "job" / "resume"
@@ -321,6 +391,17 @@ class JobResumeStateTest(unittest.TestCase):
             "exception_info": {"exception_type": "AgentTimeoutError"},
         }
         self.assertIsNone(_deepswe_result_infra_reason(result))
+        result["exception_info"]["exception_type"] = "VerifierTimeoutError"
+        self.assertEqual(
+            _deepswe_result_infra_reason(result),
+            "exception:VerifierTimeoutError",
+        )
+        result["verifier_result"] = None
+        self.assertEqual(
+            _deepswe_result_infra_reason(result),
+            "invalid-verifier-result:missing",
+        )
+        result["verifier_result"] = {"rewards": {"reward": 0}}
         result["exception_info"]["exception_type"] = "DeepSweProviderRequestError"
         self.assertEqual(
             _deepswe_result_infra_reason(result),
@@ -593,6 +674,52 @@ class SubsetResumeTest(unittest.TestCase):
                 ("--max-retries", "3"),
             ):
                 self.assertEqual(command[command.index(option) + 1], expected)
+
+    def test_terminal_invalid_subset_does_not_spin_recovery_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            job_name = "terminal-invalid"
+            trial_dir = root / "jobs" / job_name / "task__trial"
+            trial_dir.mkdir(parents=True)
+            (trial_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "verifier_result": {"rewards": {"reward": -1}},
+                        "exception_info": None,
+                    }
+                )
+            )
+            task_file = root / "tasks.txt"
+            task_file.write_text("task-a\n")
+
+            with (
+                mock.patch.object(subset_loop, "ROOT", root),
+                mock.patch.object(subset_loop, "job_is_complete", return_value=False),
+                mock.patch.object(subset_loop, "job_is_running", return_value=False),
+                mock.patch.object(
+                    subset_loop,
+                    "job_progress",
+                    return_value=(1, 1, "finished"),
+                ),
+                mock.patch.object(
+                    subset_loop.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ) as run_mock,
+                self.assertRaisesRegex(SystemExit, "made no progress"),
+            ):
+                subset_loop.run_subset_eval(
+                    args=self._args(root),
+                    gate_index=2,
+                    previous_gate_index=1,
+                    gate_root=root / "gate",
+                    task_file=task_file,
+                    expected_trials=1,
+                    job_name=job_name,
+                    log_path=root / "resume.log",
+                )
+
+            run_mock.assert_called_once()
 
     def test_local_deepswe_logical_names_map_to_directory_filters(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:

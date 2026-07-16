@@ -273,5 +273,61 @@ class ExistingFrozenEvolutionFlowTest(unittest.TestCase):
             self.assertEqual(state["status"], "complete")
 
 
+class RecoveryProgressTest(unittest.TestCase):
+    def test_terminal_invalid_job_does_not_spin_all_recovery_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            job_name = "terminal-invalid"
+            job_dir = root / "jobs" / job_name
+            trial_dir = job_dir / "task__trial"
+            trial_dir.mkdir(parents=True)
+            (trial_dir / "result.json").write_text('{"stable": true}\n')
+            invalid = [
+                {
+                    "trial_name": "task__trial",
+                    "reason": "negative-reward:-1",
+                }
+            ]
+            args = SimpleNamespace(
+                python=Path("/python"),
+                dataset=Path("/dataset"),
+                provider="novita",
+                model="zai-org/glm-5.2",
+                concurrency=15,
+                agent_timeout_sec=7200,
+                agent_setup_timeout_sec=1200,
+                claude_sdk_version="0.2.116",
+                recovery_rounds=4,
+            )
+            skill_root = root / "skills"
+            skill_root.mkdir()
+
+            with (
+                mock.patch.object(full_evolution, "ROOT", root),
+                mock.patch.object(
+                    full_evolution,
+                    "infra_invalid_trials",
+                    return_value=invalid,
+                ),
+                mock.patch.object(
+                    full_evolution,
+                    "run_logged",
+                    return_value=1,
+                ) as run_logged,
+                self.assertRaisesRegex(RuntimeError, "made no progress"),
+            ):
+                full_evolution.run_eval_until_valid(
+                    args=args,
+                    env={},
+                    job_name=job_name,
+                    skill_root=skill_root,
+                    output_dir=root / "aggregate",
+                    log_dir=root / "logs",
+                    expected_trials=1,
+                )
+
+            self.assertEqual(run_logged.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

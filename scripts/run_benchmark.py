@@ -166,6 +166,15 @@ _DEEPSWE_DEPENDENCY_MANIFEST_NAMES = frozenset(
         "yarn.lock",
     }
 )
+_DEEPSWE_PYTEST_NODE = re.compile(r"\S+\.py(?:::[^\s:]+)+")
+
+
+def _deepswe_trial_exception_type(trial: Any) -> str:
+    result = getattr(trial, "result", None)
+    exception_info = getattr(result, "exception_info", None)
+    if isinstance(exception_info, dict):
+        return str(exception_info.get("exception_type") or "")
+    return str(getattr(exception_info, "exception_type", "") or "")
 
 
 def _required_deepswe_artifact_paths(
@@ -179,13 +188,15 @@ def _required_deepswe_artifact_paths(
 
     import_path = str(trial.config.agent.import_path or "")
     if "claude_sdk_agent" in import_path:
-        required.extend(
-            [
-                trial._trial_paths.agent_dir / "claude-agent-metadata.json",
-                trial._trial_paths.agent_dir / "claude-agent-sdk-result.json",
-                trial._trial_paths.agent_dir / "claude-agent-sdk.jsonl",
-            ]
-        )
+        required.append(trial._trial_paths.agent_dir / "claude-agent-metadata.json")
+        if _deepswe_trial_exception_type(trial) not in {
+            "AgentTimeoutError",
+            "NonZeroAgentExitCodeError",
+        }:
+            required.append(
+                trial._trial_paths.agent_dir / "claude-agent-sdk-result.json"
+            )
+        required.append(trial._trial_paths.agent_dir / "claude-agent-sdk.jsonl")
     elif "pi_agent" in import_path:
         required.extend(
             [
@@ -682,6 +693,77 @@ def _deepswe_artifact_hook_info(trial: Any) -> tuple[Path, str | None] | None:
     return pre_artifacts, base_commit
 
 
+def _deepswe_verify_after_agent_timeout(original: Any) -> Any:
+    """Always grade the DeepSWE workspace snapshot left at the time limit."""
+
+    @wraps(original)
+    async def verify_deepswe_timeout_snapshot(self: Any) -> bool:
+        if _deepswe_artifact_hook_info(self) is not None:
+            self._logger.info(
+                "DeepSWE agent timed out; verifying the final workspace snapshot"
+            )
+            return True
+        return await original(self)
+
+    verify_deepswe_timeout_snapshot._skills_evo_deepswe_timeout_verifier_patch = True  # type: ignore[attr-defined]
+    return verify_deepswe_timeout_snapshot
+
+
+def _deepswe_repeated_pytest_timeout_node(trial_dir: Path) -> str | None:
+    """Return a node only when two fresh verifiers visibly hang at the same test."""
+
+    outputs: list[str] = []
+    for attempt in (1, 2):
+        path = (
+            trial_dir
+            / "verifier_attempts"
+            / f"timeout_attempt_{attempt}"
+            / "test-stdout.txt"
+        )
+        try:
+            output = path.read_text(encoding="utf-8", errors="replace").rstrip()
+        except OSError:
+            return None
+        if (
+            not output
+            or "base-mode smoke-import gate exit code: 0" not in output
+            or "Running new mode:" not in output
+        ):
+            return None
+        outputs.append(output)
+    if outputs[0] != outputs[1]:
+        return None
+
+    final_line = outputs[0].splitlines()[-1].strip()
+    match = _DEEPSWE_PYTEST_NODE.fullmatch(final_line)
+    return match.group(0) if match is not None else None
+
+
+def _record_deepswe_terminal_verifier_timeout(trial: Any, node: str) -> None:
+    path = (
+        trial._trial_paths.trial_dir
+        / "verifier_attempts"
+        / "terminal_timeout.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "classification": "deterministic-model-test-timeout",
+                "assigned_reward": 0,
+                "fresh_verifier_attempts": 2,
+                "repeated_pytest_node": node,
+                "recorded_at": _utc_now(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _deepswe_fresh_environment_verifier_retry(
     original_verify_with_retry: Any,
 ) -> Any:
@@ -731,7 +813,23 @@ def _deepswe_fresh_environment_verifier_retry(
                     label=f"timeout_attempt_{attempt}",
                 )
                 if attempt >= 2:
-                    raise
+                    node = _deepswe_repeated_pytest_timeout_node(
+                        self._trial_paths.trial_dir
+                    )
+                    if node is None:
+                        raise
+                    from harbor.models.verifier.result import VerifierResult
+
+                    self.result.verifier_result = VerifierResult(
+                        rewards={"reward": 0}
+                    )
+                    _record_deepswe_terminal_verifier_timeout(self, node)
+                    self._logger.warning(
+                        "DeepSWE verifier timed out twice at the same hidden test "
+                        "%s; recording a model-outcome reward of 0",
+                        node,
+                    )
+                    return None
                 self._logger.warning(
                     "DeepSWE verifier timed out; retrying the same model.patch "
                     "once in a fresh verifier sandbox"
@@ -2110,6 +2208,20 @@ def _patch_harbor_runtime(
     from harbor.models.trial.paths import EnvironmentPaths
     from harbor.trial.trial import Trial
 
+    original_should_verify_after_timeout = getattr(
+        Trial,
+        "_should_verify_after_agent_timeout",
+        None,
+    )
+    if original_should_verify_after_timeout is not None and not getattr(
+        original_should_verify_after_timeout,
+        "_skills_evo_deepswe_timeout_verifier_patch",
+        False,
+    ):
+        Trial._should_verify_after_agent_timeout = (  # type: ignore[method-assign]
+            _deepswe_verify_after_agent_timeout(original_should_verify_after_timeout)
+        )
+
     original_verify_with_retry = Trial._verify_with_retry
     if not getattr(
         original_verify_with_retry,
@@ -2535,6 +2647,80 @@ def _deepswe_result_infra_reason(result: dict[str, Any]) -> str | None:
     return None
 
 
+def _normalize_legacy_deepswe_timeout_outcome(
+    trial_dir: Path,
+    result_text: str,
+    result: dict[str, Any],
+) -> str | None:
+    """Convert auditable legacy timeout states into terminal model reward zero."""
+
+    if isinstance(result.get("verifier_result"), dict):
+        return None
+    exception_info = result.get("exception_info")
+    exception_type = (
+        str(exception_info.get("exception_type") or "")
+        if isinstance(exception_info, dict)
+        else ""
+    )
+    evidence: dict[str, Any]
+    if exception_type == "AgentTimeoutError":
+        try:
+            trial_log = (trial_dir / "trial.log").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None
+        marker = "Skipping verifier after agent timeout because"
+        if marker not in trial_log:
+            return None
+        evidence = {
+            "classification": "agent-time-limit-with-verifier-skipped",
+            "log_marker": marker,
+        }
+    elif exception_type == "VerifierTimeoutError":
+        node = _deepswe_repeated_pytest_timeout_node(trial_dir)
+        if node is None:
+            return None
+        evidence = {
+            "classification": "deterministic-model-test-timeout",
+            "fresh_verifier_attempts": 2,
+            "repeated_pytest_node": node,
+        }
+    else:
+        return None
+
+    backup_path = trial_dir / "result.pre-terminal-normalization.json"
+    if not backup_path.exists():
+        _atomic_write_text(backup_path, result_text)
+    result["verifier_result"] = {"rewards": {"reward": 0}}
+    if exception_type == "VerifierTimeoutError":
+        # The immutable backup and sidecar retain the timeout evidence. The
+        # normalized result is a semantic model failure, not an infra error.
+        result["exception_info"] = None
+    _atomic_write_text(
+        trial_dir / "result.json",
+        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    _atomic_write_text(
+        trial_dir / "terminal_outcome.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "assigned_reward": 0,
+                "exception_type": exception_type,
+                "normalized_at": _utc_now(),
+                **evidence,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    return str(evidence["classification"])
+
+
 def _prepare_deepswe_root_result(
     job_dir: Path,
     *,
@@ -2634,12 +2820,19 @@ def _archive_deepswe_infra_trials(
             if isinstance(exception_info, dict)
             else ""
         )
-        if exception_type:
-            if exception_type in DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS:
-                candidates.append((trial_dir, f"exception:{exception_type}"))
-            continue
+        normalization = _normalize_legacy_deepswe_timeout_outcome(
+            trial_dir,
+            result_text,
+            result,
+        )
+        if normalization is not None:
+            result = json.loads(result_path.read_text(errors="replace"))
         reason = _deepswe_result_infra_reason(result)
-        if reason is not None and not reason.startswith("negative-reward:"):
+        if reason is None or reason.startswith("negative-reward:"):
+            continue
+        if exception_type in DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS:
+            candidates.append((trial_dir, f"exception:{exception_type}"))
+        elif not exception_type:
             candidates.append((trial_dir, reason))
 
     _prepare_deepswe_root_result(
