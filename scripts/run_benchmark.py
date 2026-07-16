@@ -11,7 +11,7 @@ import sys
 import tomllib
 from datetime import datetime, timezone
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from dotenv import load_dotenv
@@ -48,7 +48,7 @@ DEEPSWE_MIN_SANDBOX_TIMEOUT_SEC = 14400
 DEEPSWE_MIN_VERIFIER_BUFFER_SEC = 4800
 DEEPSWE_RESUME_CONTRACT_VERSION = 1
 DEEPSWE_ARTIFACT_HOOK_VERSION = (
-    "exact-official-test-paths-v7-fresh-verifier-retry-test-errata"
+    "exact-official-test-paths-v8-offline-suite-infra-detection"
 )
 AGENT_CHOICES = ("pi", "claude-code")
 DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS = {
@@ -93,6 +93,79 @@ class DeepSweArtifactDownloadError(RuntimeError):
 
 
 DEEPSWE_ARTIFACT_DOWNLOAD_ATTEMPTS = 3
+
+_DEEPSWE_OFFLINE_TOOLCHAIN_FETCH_PATTERNS = (
+    (
+        "go-toolchain",
+        re.compile(
+            r"\bgo:\s+download(?:ing)?\s+go\d[^\n]*\bgolang\.org/toolchain@",
+            re.IGNORECASE,
+        ),
+    ),
+)
+_DEEPSWE_OFFLINE_NETWORK_FAILURE_PATTERNS = (
+    (
+        "dns-timeout",
+        re.compile(
+            r"\bdial tcp[^\n]*\blookup\s+\S+[^\n]*\b(?:i/o timeout|no such host|server misbehaving)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "dns-resolution",
+        re.compile(
+            r"\b(?:temporary failure in name resolution|could not resolve host|"
+            r"getaddrinfo\s+(?:eai_again|enotfound))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "network-unreachable",
+        re.compile(r"\bnetwork is unreachable\b", re.IGNORECASE),
+    ),
+)
+_DEEPSWE_MISSING_TEST_RESULT_MARKER = (
+    "missing from report (test did not run or produced no result"
+)
+_DEEPSWE_DEPENDENCY_MANIFEST_NAMES = frozenset(
+    {
+        ".go-version",
+        ".npmrc",
+        ".python-version",
+        ".tool-versions",
+        "bun.lock",
+        "bun.lockb",
+        "cargo.lock",
+        "cargo.toml",
+        "composer.json",
+        "composer.lock",
+        "deno.lock",
+        "gemfile",
+        "gemfile.lock",
+        "go.env",
+        "go.mod",
+        "go.sum",
+        "go.work",
+        "go.work.sum",
+        "gradle.lockfile",
+        "mise.toml",
+        "npm-shrinkwrap.json",
+        "pip.conf",
+        "pipfile",
+        "pipfile.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "pom.xml",
+        "pyproject.toml",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "setup.cfg",
+        "setup.py",
+        "uv.lock",
+        "vcpkg.json",
+        "yarn.lock",
+    }
+)
 
 
 def _required_deepswe_artifact_paths(
@@ -612,7 +685,7 @@ def _deepswe_artifact_hook_info(trial: Any) -> tuple[Path, str | None] | None:
 def _deepswe_fresh_environment_verifier_retry(
     original_verify_with_retry: Any,
 ) -> Any:
-    """Retry a timed-out DeepSWE verifier once in a pristine sandbox."""
+    """Retry DeepSWE verifier infrastructure failures in a pristine sandbox."""
 
     from harbor.trial.trial import VerifierTimeoutError
 
@@ -633,6 +706,25 @@ def _deepswe_fresh_environment_verifier_retry(
         for attempt in range(1, 3):
             try:
                 result = await verify_once(self)
+            except DeepSweVerifierInfraError as exc:
+                await _download_deepswe_verifier_logs_best_effort(
+                    self,
+                    label=f"infra_attempt_{attempt}",
+                )
+                if attempt >= 2:
+                    raise
+                self._logger.warning(
+                    "DeepSWE verifier infrastructure failure (%s); retrying "
+                    "the same model.patch once in a fresh verifier sandbox",
+                    exc,
+                )
+                self.result.verifier_result = None
+                await _replace_deepswe_verifier_environment(
+                    self,
+                    retry_index=attempt,
+                    stop_current=True,
+                )
+                continue
             except VerifierTimeoutError:
                 await _download_deepswe_verifier_logs_best_effort(
                     self,
@@ -651,9 +743,7 @@ def _deepswe_fresh_environment_verifier_retry(
                     stop_current=True,
                 )
                 continue
-            negative_reward = _negative_deepswe_reward(
-                self.result.verifier_result
-            )
+            negative_reward = _negative_deepswe_reward(self.result.verifier_result)
             if negative_reward is None:
                 return result
             await _download_deepswe_verifier_logs_best_effort(
@@ -690,9 +780,7 @@ def _deepswe_verifier_task_environment(trial: Any) -> Any:
         raise DeepSweVerifierInfraError("DeepSWE task metadata is unavailable")
     task_dir = hook_info[0].parent
     try:
-        task_toml = tomllib.loads(
-            (task_dir / "task.toml").read_text(encoding="utf-8")
-        )
+        task_toml = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
     except Exception as exc:
         raise DeepSweVerifierInfraError(
             f"Could not load DeepSWE verifier environment metadata: {exc}"
@@ -964,6 +1052,99 @@ def _negative_deepswe_reward(result: Any) -> float | None:
     return float(value) if value < 0 else None
 
 
+def _deepswe_dependency_manifest_path(path: str) -> bool:
+    name = PurePosixPath(path).name.lower()
+    return (
+        name in _DEEPSWE_DEPENDENCY_MANIFEST_NAMES
+        or (name.startswith("package") and name.endswith(".json"))
+        or (name.startswith("requirements") and name.endswith(".txt"))
+        or (name.startswith("constraints") and name.endswith(".txt"))
+        or name.startswith("build.gradle")
+        or name.startswith("settings.gradle")
+        or name.endswith(".gemspec")
+    )
+
+
+def _deepswe_model_patch_dependency_paths(
+    model_patch_path: Path,
+) -> list[str] | None:
+    """Return dependency/toolchain manifests changed by a parsed git patch."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "apply", "--numstat", "-z", "--", str(model_patch_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    changed_paths: list[str] = []
+    for record in completed.stdout.split(b"\0"):
+        if not record:
+            continue
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3:
+            return None
+        path = fields[2].decode("utf-8", "surrogateescape")
+        if _deepswe_dependency_manifest_path(path):
+            changed_paths.append(path)
+    return changed_paths
+
+
+def _deepswe_verifier_suite_infra_reason(
+    verifier_dir: Path,
+    model_patch_path: Path,
+) -> str | None:
+    """Detect an offline dependency failure that prevented every scored test."""
+
+    changed_dependency_paths = _deepswe_model_patch_dependency_paths(model_patch_path)
+    if changed_dependency_paths is None or changed_dependency_paths:
+        return None
+
+    ctrf_path = verifier_dir / "ctrf.json"
+    try:
+        ctrf = json.loads(ctrf_path.read_text(encoding="utf-8"))
+        tests = ctrf["results"]["tests"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(tests, list) or not tests:
+        return None
+    if not all(
+        isinstance(test, dict)
+        and _DEEPSWE_MISSING_TEST_RESULT_MARKER
+        in str(test.get("message") or "").lower()
+        for test in tests
+    ):
+        return None
+
+    stdout_path = verifier_dir / "test-stdout.txt"
+    try:
+        with stdout_path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                for (
+                    fetch_label,
+                    fetch_pattern,
+                ) in _DEEPSWE_OFFLINE_TOOLCHAIN_FETCH_PATTERNS:
+                    if not fetch_pattern.search(line):
+                        continue
+                    for (
+                        failure_label,
+                        failure_pattern,
+                    ) in _DEEPSWE_OFFLINE_NETWORK_FAILURE_PATTERNS:
+                        if failure_pattern.search(line):
+                            return (
+                                "DeepSWE verifier suite did not run in the offline "
+                                f"sandbox because a {fetch_label} fetch failed "
+                                f"({failure_label}); every scored test was missing"
+                            )
+    except OSError:
+        return None
+    return None
+
+
 def _classify_deepswe_provider_auth_failure(result: Any) -> bool:
     exception_info = getattr(result, "exception_info", None)
     if exception_info is None:
@@ -974,7 +1155,10 @@ def _classify_deepswe_provider_auth_failure(result: Any) -> bool:
     classifications = (
         ("provider authentication failed", "DeepSweProviderAuthenticationError"),
         ("claude provider transient failure", "DeepSweProviderTransientError"),
-        ("claude agent stream ended without resultmessage", "DeepSweAgentIncompleteError"),
+        (
+            "claude agent stream ended without resultmessage",
+            "DeepSweAgentIncompleteError",
+        ),
         ("claude agent resultmessage reported an error", "DeepSweAgentIncompleteError"),
         ("claude agent sdk execution failed", "DeepSweAgentIncompleteError"),
     )
@@ -1014,9 +1198,7 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
     provider = resolve_provider(args.provider)
     agent = _agent_name(args.agent)
     endpoint = (
-        provider.anthropic_base_url
-        if agent == "claude-code"
-        else provider.base_url
+        provider.anthropic_base_url if agent == "claude-code" else provider.base_url
     )
     dataset = config.datasets[0] if config.datasets else None
     dataset_path = getattr(dataset, "path", None)
@@ -1039,7 +1221,9 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
             _iter_pi_skill_pack_files,
         )
 
-        skill_roots = [root.expanduser().resolve() for root in _active_task_skill_roots()]
+        skill_roots = [
+            root.expanduser().resolve() for root in _active_task_skill_roots()
+        ]
         missing_roots = [str(root) for root in skill_roots if not root.is_dir()]
         if missing_roots:
             raise RuntimeError(
@@ -1052,18 +1236,15 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
                     _sha256_tree(root, _iter_pi_skill_pack_files(root))
                     for root in skill_roots
                 ],
-                "discovered_count": len(
-                    _discover_pi_skills_from_roots(skill_roots)
-                ),
+                "discovered_count": len(_discover_pi_skills_from_roots(skill_roots)),
                 "retrieval_scope": os.getenv("PI_SKILL_RETRIEVAL_SCOPE", ""),
-                "pi_harness_memory": os.getenv(
-                    "PI_USE_SKILL_HARNESS_MEMORY", ""
-                ),
+                "pi_harness_memory": os.getenv("PI_USE_SKILL_HARNESS_MEMORY", ""),
                 "claude_harness_memory": os.getenv(
                     "CLAUDE_USE_SKILL_HARNESS_MEMORY", ""
                 ),
             }
         )
+
         def env_bool(name: str, default: bool) -> bool:
             value = os.getenv(name)
             if value is None:
@@ -1129,8 +1310,7 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
         "version": DEEPSWE_RESUME_CONTRACT_VERSION,
         "artifact_hook_version": DEEPSWE_ARTIFACT_HOOK_VERSION,
         "artifact_hook_enabled": bool(
-            args.enable_deepswe_pre_artifacts
-            and not args.disable_deepswe_pre_artifacts
+            args.enable_deepswe_pre_artifacts and not args.disable_deepswe_pre_artifacts
         ),
         "force_agent_internet": bool(args.force_agent_internet),
         "provider": {
@@ -1155,9 +1335,7 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
         ),
         "dataset": dataset_contract,
         "skills": skills_contract,
-        "runtime_knobs": {
-            name: os.getenv(name) for name in runtime_knob_names
-        },
+        "runtime_knobs": {name: os.getenv(name) for name in runtime_knob_names},
         "dependency_versions": dependency_versions,
         "code_sha256": {
             str(path.relative_to(ROOT)): _sha256_file(path) for path in code_paths
@@ -1175,17 +1353,13 @@ def _attach_deepswe_resume_contract(config: Any, contract: dict[str, Any]) -> An
                 "claude-agent-sdk"
             ]
         elif "pi_agent" in str(agent.import_path or ""):
-            kwargs["version"] = contract["dependency_versions"][
-                "pi-coding-agent"
-            ]
+            kwargs["version"] = contract["dependency_versions"]["pi-coding-agent"]
         agent.kwargs = kwargs
     return attached
 
 
 def _saved_deepswe_resume_contract(config: Any) -> dict[str, Any] | None:
-    contracts = [
-        (agent.kwargs or {}).get("resume_contract") for agent in config.agents
-    ]
+    contracts = [(agent.kwargs or {}).get("resume_contract") for agent in config.agents]
     contracts = [contract for contract in contracts if isinstance(contract, dict)]
     if not contracts:
         return None
@@ -1370,9 +1544,10 @@ def build_config(args: argparse.Namespace) -> Any:
             retry_exclusions -= DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS
         retry_kwargs["exclude_exceptions"] = retry_exclusions
     elif is_deepswe_dataset and args.max_retries > 0:
-        retry_kwargs["exclude_exceptions"] = set(
-            RetryConfig().exclude_exceptions or ()
-        ) - DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS
+        retry_kwargs["exclude_exceptions"] = (
+            set(RetryConfig().exclude_exceptions or ())
+            - DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS
+        )
 
     agent = _agent_name(args.agent)
     metrics = []
@@ -1404,7 +1579,9 @@ def build_config(args: argparse.Namespace) -> Any:
             },
             kwargs={
                 "template_namespace": args.e2b_template_namespace,
-                "pi_template_suffix": args.e2b_pi_template_suffix if agent == "pi" else "",
+                "pi_template_suffix": args.e2b_pi_template_suffix
+                if agent == "pi"
+                else "",
                 "strip_dockerfile_comments": not args.keep_dockerfile_comments,
                 "sandbox_timeout_sec": args.e2b_sandbox_timeout_sec,
                 "force_allow_internet": args.force_agent_internet,
@@ -1544,9 +1721,7 @@ def _apply_saved_config_to_args(args: argparse.Namespace, config: Any) -> None:
 def _enforce_deepswe_infra_args(args: argparse.Namespace) -> None:
     args.force_agent_internet = True
     args.override_cpus = max(args.override_cpus or 0, DEEPSWE_MIN_CPUS)
-    args.override_memory_mb = max(
-        args.override_memory_mb or 0, DEEPSWE_MIN_MEMORY_MB
-    )
+    args.override_memory_mb = max(args.override_memory_mb or 0, DEEPSWE_MIN_MEMORY_MB)
     args.override_storage_mb = max(
         args.override_storage_mb or 0, DEEPSWE_MIN_STORAGE_MB
     )
@@ -1566,16 +1741,12 @@ def _enforce_deepswe_infra_args(args: argparse.Namespace) -> None:
         else args.timeout_multiplier
     )
     requested_agent_timeout = (args.agent_timeout_sec or 0) * agent_multiplier
-    requested_setup_timeout = (
-        args.agent_setup_timeout_sec or 0
-    ) * setup_multiplier
+    requested_setup_timeout = (args.agent_setup_timeout_sec or 0) * setup_multiplier
     args.e2b_sandbox_timeout_sec = max(
         args.e2b_sandbox_timeout_sec or 0,
         DEEPSWE_MIN_SANDBOX_TIMEOUT_SEC,
         int(
-            requested_setup_timeout
-            + requested_agent_timeout
-            + args.verifier_buffer_sec
+            requested_setup_timeout + requested_agent_timeout + args.verifier_buffer_sec
         ),
     )
 
@@ -1602,9 +1773,9 @@ def _upgrade_deepswe_resume_config(
     retry_include.update(DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS)
     upgraded.retry.include_exceptions = retry_include
     if upgraded.retry.exclude_exceptions is not None:
-        upgraded.retry.exclude_exceptions = set(
-            upgraded.retry.exclude_exceptions
-        ) - DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS
+        upgraded.retry.exclude_exceptions = (
+            set(upgraded.retry.exclude_exceptions) - DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS
+        )
     environment_kwargs = dict(upgraded.environment.kwargs or {})
     configured_agent_timeout = max(
         (agent.override_timeout_sec or 0 for agent in upgraded.agents),
@@ -1744,12 +1915,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _resume_archive_dir(job_dir: Path, run_id: str) -> Path:
-    return (
-        job_dir.parent
-        / ".skills-evo-infra-archive"
-        / job_dir.name
-        / run_id
-    )
+    return job_dir.parent / ".skills-evo-infra-archive" / job_dir.name / run_id
 
 
 def _migrate_deepswe_root_config(
@@ -1761,9 +1927,9 @@ def _migrate_deepswe_root_config(
 ) -> Path | None:
     if previous.model_dump(mode="json") == upgraded.model_dump(mode="json"):
         return None
-    if _job_config_without_deepswe_infra(
-        previous
-    ) != _job_config_without_deepswe_infra(upgraded):
+    if _job_config_without_deepswe_infra(previous) != _job_config_without_deepswe_infra(
+        upgraded
+    ):
         raise RuntimeError(
             "Refusing DeepSWE resume migration with non-infrastructure config changes"
         )
@@ -1891,8 +2057,7 @@ def _patch_harbor_runtime(
             self._trial_paths.verifier_dir.mkdir(parents=True, exist_ok=True)
             self._trial_paths.test_stdout_path.parent.mkdir(parents=True, exist_ok=True)
             is_deepswe = (
-                deepswe_pre_artifacts
-                and _deepswe_artifact_hook_info(self) is not None
+                deepswe_pre_artifacts and _deepswe_artifact_hook_info(self) is not None
             )
             original_task_dir = self._task.paths.task_dir
             prepared_task_dir: Path | None = None
@@ -1926,6 +2091,13 @@ def _patch_harbor_runtime(
                     )
             try:
                 result = await original_verify(self)
+                if is_deepswe:
+                    infra_reason = _deepswe_verifier_suite_infra_reason(
+                        self._trial_paths.verifier_dir,
+                        self._trial_paths.artifacts_dir / "model.patch",
+                    )
+                    if infra_reason is not None:
+                        raise DeepSweVerifierInfraError(infra_reason)
             finally:
                 self._task.paths.task_dir = original_task_dir
                 if prepared_task_dir is not None:
@@ -1988,7 +2160,9 @@ def _patch_harbor_runtime(
             Trial._maybe_upload_agent_logs = skip_agent_log_upload
 
         original_populate_context = Trial._maybe_populate_agent_context
-        if not getattr(original_populate_context, "_skills_evo_result_only_patch", False):
+        if not getattr(
+            original_populate_context, "_skills_evo_result_only_patch", False
+        ):
 
             def skip_agent_context_population(self: Any) -> None:
                 return None
@@ -2002,7 +2176,9 @@ def _patch_harbor_runtime(
     from harbor.metrics.mean import Mean
 
     original_mean_compute = Mean.compute
-    if not getattr(original_mean_compute, "_skills_evo_deepswe_multi_reward_patch", False):
+    if not getattr(
+        original_mean_compute, "_skills_evo_deepswe_multi_reward_patch", False
+    ):
 
         def compute_with_deepswe_reward_key(
             self: Any,
@@ -2051,12 +2227,9 @@ def _patch_harbor_runtime(
                 convention_source: str,
             ) -> list[Any]:
                 normalized = task_artifacts.normalize_artifact_entries(entries)
-                if (
-                    convention_source.rstrip("/") == "/logs/artifacts"
-                    and any(
-                        is_main_deepswe_model_patch_artifact(artifact)
-                        for artifact in normalized
-                    )
+                if convention_source.rstrip("/") == "/logs/artifacts" and any(
+                    is_main_deepswe_model_patch_artifact(artifact)
+                    for artifact in normalized
                 ):
                     return normalized
                 return original_with_convention_entry(
@@ -2097,7 +2270,7 @@ def _patch_harbor_runtime(
                     result = await environment.exec(
                         command=(
                             "set -euo pipefail\n"
-                            "if [ -n \"${DEEPSWE_BASE_COMMIT:-}\" ] && "
+                            'if [ -n "${DEEPSWE_BASE_COMMIT:-}" ] && '
                             "git -C /app rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n"
                             "  mkdir -p /logs/agent /logs/artifacts\n"
                             "  cd /app || exit 0\n"
@@ -2113,17 +2286,17 @@ def _patch_harbor_runtime(
                             "PY\n"
                             "  git add -A . 2>/dev/null || true\n"
                             "  tree=$(git write-tree)\n"
-                            "  if git rev-parse --verify \"${DEEPSWE_BASE_COMMIT}^{commit}\" "
+                            '  if git rev-parse --verify "${DEEPSWE_BASE_COMMIT}^{commit}" '
                             ">/dev/null 2>&1; then\n"
                             "    commit=$(printf 'DeepSWE initial worktree snapshot\\n' | "
-                            "git commit-tree \"$tree\" -p \"${DEEPSWE_BASE_COMMIT}\")\n"
+                            'git commit-tree "$tree" -p "${DEEPSWE_BASE_COMMIT}")\n'
                             "  else\n"
                             "    commit=$(printf 'DeepSWE initial worktree snapshot\\n' | "
-                            "git commit-tree \"$tree\")\n"
+                            'git commit-tree "$tree")\n'
                             "  fi\n"
                             "  printf '%s\\n' \"$commit\" > /logs/agent/deepswe_baseline_commit\n"
                             "  git reset -q 2>/dev/null || true\n"
-                            "  echo \"[deepswe_pre_artifacts] baseline_commit=$commit\"\n"
+                            '  echo "[deepswe_pre_artifacts] baseline_commit=$commit"\n'
                             "fi\n"
                             "test -s /logs/agent/deepswe_baseline_commit\n"
                         ),
@@ -2218,7 +2391,9 @@ def _patch_harbor_runtime(
         environment = trial_environment(self)
         logger = trial_logger(self)
 
-        remote_script = f"{EnvironmentPaths.agent_dir.as_posix()}/deepswe_pre_artifacts.sh"
+        remote_script = (
+            f"{EnvironmentPaths.agent_dir.as_posix()}/deepswe_pre_artifacts.sh"
+        )
         try:
             await environment.upload_file(
                 source_path=pre_artifacts,
@@ -2230,8 +2405,8 @@ def _patch_harbor_runtime(
                     "mkdir -p /logs/artifacts\n"
                     f"chmod +x {remote_script}\n"
                     f"/bin/bash {remote_script}\n"
-                    "if [ -n \"${DEEPSWE_BASE_COMMIT:-}\" ] && "
-                    "git -C /app rev-parse --verify \"${DEEPSWE_BASE_COMMIT}^{commit}\" "
+                    'if [ -n "${DEEPSWE_BASE_COMMIT:-}" ] && '
+                    'git -C /app rev-parse --verify "${DEEPSWE_BASE_COMMIT}^{commit}" '
                     ">/dev/null 2>&1; then\n"
                     "  cd /app || exit 0\n"
                     "  git config --global --add safe.directory /app 2>/dev/null || true\n"
@@ -2247,9 +2422,7 @@ def _patch_harbor_runtime(
                 cwd="/app",
                 env={
                     "DEEPSWE_BASE_COMMIT": base_commit or "",
-                    "DEEPSWE_OFFICIAL_TEST_PATHS_JSON": json.dumps(
-                        official_test_paths
-                    ),
+                    "DEEPSWE_OFFICIAL_TEST_PATHS_JSON": json.dumps(official_test_paths),
                 },
                 timeout_sec=120,
                 user="root",
@@ -2311,19 +2484,17 @@ def _patch_harbor_runtime(
                 **kwargs: Any,
             ) -> Any:
                 await run_deepswe_pre_artifacts(self)
-                return await original_collect_artifacts_phased(
-                    self, *args, **kwargs
-                )
+                return await original_collect_artifacts_phased(self, *args, **kwargs)
 
             collect_artifacts_after_deepswe_pre_artifacts._skills_evo_deepswe_pre_artifacts_patch = True  # type: ignore[attr-defined]
-            Trial._collect_artifacts_phased = collect_artifacts_after_deepswe_pre_artifacts
+            Trial._collect_artifacts_phased = (
+                collect_artifacts_after_deepswe_pre_artifacts
+            )
 
 
 def _existing_job_progress(job_dir: Path) -> tuple[int, int | None, str | None]:
     trial_count = sum(
-        1
-        for path in job_dir.glob("*/result.json")
-        if path.parent != job_dir
+        1 for path in job_dir.glob("*/result.json") if path.parent != job_dir
     )
     root_path = job_dir / "result.json"
     if not root_path.exists():
@@ -2350,10 +2521,7 @@ def _deepswe_result_infra_reason(result: dict[str, Any]) -> str | None:
     reward = rewards.get("reward") if isinstance(rewards, dict) else None
     if isinstance(reward, bool) or not isinstance(reward, (int, float)):
         return "invalid-verifier-result:non-numeric-reward"
-    if (
-        isinstance(reward, (int, float))
-        and reward < 0
-    ):
+    if isinstance(reward, (int, float)) and reward < 0:
         return f"negative-reward:{reward}"
     if float(reward) not in {0.0, 1.0}:
         return f"invalid-verifier-result:out-of-domain-reward:{reward}"
@@ -2677,16 +2845,11 @@ async def run_job(args: argparse.Namespace) -> Path:
     )
     job_dir = config.jobs_dir / config.job_name
     resume_run_id = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        + f"-pid{os.getpid()}"
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + f"-pid{os.getpid()}"
     )
     try:
         with exclusive_job_run(job_dir):
-            if (
-                args.resume_existing
-                and is_deepswe_job
-                and previous_config is not None
-            ):
+            if args.resume_existing and is_deepswe_job and previous_config is not None:
                 backup = _migrate_deepswe_root_config(
                     job_dir,
                     previous_config,
@@ -2695,8 +2858,7 @@ async def run_job(args: argparse.Namespace) -> Path:
                 )
                 if backup is not None:
                     _log(
-                        "RESUME migrated DeepSWE infrastructure config "
-                        f"backup={backup}"
+                        f"RESUME migrated DeepSWE infrastructure config backup={backup}"
                     )
                 archived = _archive_deepswe_infra_trials(
                     job_dir,
@@ -2730,23 +2892,17 @@ def _validate_timeout_budget(args: argparse.Namespace) -> None:
         else args.timeout_multiplier
     )
     setup_reserve = (
-        (args.agent_setup_timeout_sec or 0) * setup_multiplier
-        if is_deepswe
-        else 0
+        (args.agent_setup_timeout_sec or 0) * setup_multiplier if is_deepswe else 0
     )
     max_effective_agent_timeout = (
-        args.e2b_sandbox_timeout_sec
-        - args.verifier_buffer_sec
-        - setup_reserve
+        args.e2b_sandbox_timeout_sec - args.verifier_buffer_sec - setup_reserve
     )
     if max_effective_agent_timeout < 60:
         raise SystemExit(
             "Invalid timeout configuration: sandbox timeout must exceed the "
             "verifier and agent-setup reserves by at least 60 seconds."
         )
-    effective_agent_timeout = (
-        (args.agent_timeout_sec or 0) * agent_multiplier
-    )
+    effective_agent_timeout = (args.agent_timeout_sec or 0) * agent_multiplier
     if (
         args.agent_timeout_sec is not None
         and effective_agent_timeout > max_effective_agent_timeout
@@ -2780,7 +2936,9 @@ def parse_args() -> argparse.Namespace:
             "Claude Code harnesses."
         )
     )
-    parser.add_argument("--dataset", default=os.getenv("HARBOR_DATASET", DEFAULT_DATASET))
+    parser.add_argument(
+        "--dataset", default=os.getenv("HARBOR_DATASET", DEFAULT_DATASET)
+    )
     parser.add_argument(
         "--benchmark-name",
         default=os.getenv("BENCHMARK_NAME", "swe-bench"),
@@ -2790,7 +2948,9 @@ def parse_args() -> argparse.Namespace:
         "--agent",
         "--harness",
         choices=AGENT_CHOICES,
-        default=_agent_name(os.getenv("BENCHMARK_AGENT", os.getenv("HARBOR_AGENT", "pi"))),
+        default=_agent_name(
+            os.getenv("BENCHMARK_AGENT", os.getenv("HARBOR_AGENT", "pi"))
+        ),
         help="Agent harness: pi or claude-code.",
     )
     parser.add_argument(
@@ -2842,10 +3002,22 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("PROVIDER_API"),
         help="Pi provider API shape, for example openai-completions or openai-responses.",
     )
-    parser.add_argument("--concurrency", type=int, default=int(os.getenv("E2B_CONCURRENCY", "10")))
-    parser.add_argument("--max-retries", type=int, default=int(os.getenv("HARBOR_MAX_RETRIES", "0")))
-    parser.add_argument("--retry-min-wait-sec", type=float, default=_float_env("HARBOR_RETRY_MIN_WAIT_SEC", "5"))
-    parser.add_argument("--retry-max-wait-sec", type=float, default=_float_env("HARBOR_RETRY_MAX_WAIT_SEC", "60"))
+    parser.add_argument(
+        "--concurrency", type=int, default=int(os.getenv("E2B_CONCURRENCY", "10"))
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=int(os.getenv("HARBOR_MAX_RETRIES", "0"))
+    )
+    parser.add_argument(
+        "--retry-min-wait-sec",
+        type=float,
+        default=_float_env("HARBOR_RETRY_MIN_WAIT_SEC", "5"),
+    )
+    parser.add_argument(
+        "--retry-max-wait-sec",
+        type=float,
+        default=_float_env("HARBOR_RETRY_MAX_WAIT_SEC", "60"),
+    )
     parser.add_argument(
         "--retry-include",
         action="append",
@@ -2859,7 +3031,9 @@ def parse_args() -> argparse.Namespace:
         help="Exception type to exclude from retry. Repeatable; comma-separated values are accepted.",
     )
     n_tasks_env = os.getenv("N_TASKS")
-    parser.add_argument("--n-tasks", type=int, default=int(n_tasks_env) if n_tasks_env else None)
+    parser.add_argument(
+        "--n-tasks", type=int, default=int(n_tasks_env) if n_tasks_env else None
+    )
     parser.add_argument("--include-task-name", action="append", default=None)
     parser.add_argument(
         "--task-names-file",
@@ -2943,26 +3117,68 @@ def parse_args() -> argparse.Namespace:
         default=_bool_env("DISABLE_DEEPSWE_PRE_ARTIFACTS"),
         help="Disable the DeepSWE-only pre_artifacts hook.",
     )
-    parser.add_argument("--timeout-multiplier", type=float, default=_float_env("TIMEOUT_MULTIPLIER", "1.0"))
-    parser.add_argument("--agent-timeout-multiplier", type=float, default=_optional_float_env("AGENT_TIMEOUT_MULTIPLIER"))
-    parser.add_argument("--verifier-timeout-multiplier", type=float, default=_optional_float_env("VERIFIER_TIMEOUT_MULTIPLIER"))
-    parser.add_argument("--agent-setup-timeout-multiplier", type=float, default=_float_env("AGENT_SETUP_TIMEOUT_MULTIPLIER", "2.0"))
-    parser.add_argument("--environment-build-timeout-multiplier", type=float, default=_float_env("ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER", "2.0"))
-    parser.add_argument("--agent-setup-timeout-sec", type=float, default=_float_env("AGENT_SETUP_TIMEOUT_SEC", "1200"))
-    parser.add_argument("--agent-timeout-sec", type=float, default=_optional_float_env("AGENT_TIMEOUT_SEC"))
+    parser.add_argument(
+        "--timeout-multiplier",
+        type=float,
+        default=_float_env("TIMEOUT_MULTIPLIER", "1.0"),
+    )
+    parser.add_argument(
+        "--agent-timeout-multiplier",
+        type=float,
+        default=_optional_float_env("AGENT_TIMEOUT_MULTIPLIER"),
+    )
+    parser.add_argument(
+        "--verifier-timeout-multiplier",
+        type=float,
+        default=_optional_float_env("VERIFIER_TIMEOUT_MULTIPLIER"),
+    )
+    parser.add_argument(
+        "--agent-setup-timeout-multiplier",
+        type=float,
+        default=_float_env("AGENT_SETUP_TIMEOUT_MULTIPLIER", "2.0"),
+    )
+    parser.add_argument(
+        "--environment-build-timeout-multiplier",
+        type=float,
+        default=_float_env("ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER", "2.0"),
+    )
+    parser.add_argument(
+        "--agent-setup-timeout-sec",
+        type=float,
+        default=_float_env("AGENT_SETUP_TIMEOUT_SEC", "1200"),
+    )
+    parser.add_argument(
+        "--agent-timeout-sec",
+        type=float,
+        default=_optional_float_env("AGENT_TIMEOUT_SEC"),
+    )
     parser.add_argument(
         "--verifier-buffer-sec",
         type=float,
         default=_float_env("VERIFIER_BUFFER_SEC", str(DEFAULT_VERIFIER_BUFFER_SEC)),
         help="Seconds reserved at the end of each sandbox lifetime for uploading tests and running the verifier.",
     )
-    parser.add_argument("--override-cpus", type=int, default=int(os.getenv("E2B_OVERRIDE_CPUS", str(DEFAULT_E2B_CPUS))))
-    parser.add_argument("--override-memory-mb", type=int, default=int(os.getenv("E2B_OVERRIDE_MEMORY_MB", str(DEFAULT_E2B_MEMORY_MB))))
-    parser.add_argument("--override-storage-mb", type=int, default=int(os.getenv("E2B_OVERRIDE_STORAGE_MB", str(DEFAULT_E2B_STORAGE_MB))))
+    parser.add_argument(
+        "--override-cpus",
+        type=int,
+        default=int(os.getenv("E2B_OVERRIDE_CPUS", str(DEFAULT_E2B_CPUS))),
+    )
+    parser.add_argument(
+        "--override-memory-mb",
+        type=int,
+        default=int(os.getenv("E2B_OVERRIDE_MEMORY_MB", str(DEFAULT_E2B_MEMORY_MB))),
+    )
+    parser.add_argument(
+        "--override-storage-mb",
+        type=int,
+        default=int(os.getenv("E2B_OVERRIDE_STORAGE_MB", str(DEFAULT_E2B_STORAGE_MB))),
+    )
     parser.add_argument("--model-context-window", type=int, default=None)
     parser.add_argument("--model-max-tokens", type=int, default=None)
     parser.add_argument("--thinking", default=os.getenv("PI_THINKING", "off"))
-    parser.add_argument("--tools", default=os.getenv("PI_TOOLS", "read,write,edit,bash,grep,find,ls"))
+    parser.add_argument(
+        "--tools", default=os.getenv("PI_TOOLS", "read,write,edit,bash,grep,find,ls")
+    )
     parser.add_argument(
         "--claude-max-turns",
         type=int,
@@ -2993,9 +3209,7 @@ def parse_args() -> argparse.Namespace:
     args.include_task_name = list(dict.fromkeys(task_names)) or None
     args._requested_provider = args.provider if supplied("--provider") else None
     args._requested_dataset = args.dataset if supplied("--dataset") else None
-    args._requested_agent = (
-        args.agent if supplied("--agent", "--harness") else None
-    )
+    args._requested_agent = args.agent if supplied("--agent", "--harness") else None
     args._requested_use_skills = (
         args.use_skills if supplied("--use-skills", "--no-skills") else None
     )
@@ -3012,9 +3226,13 @@ def parse_args() -> argparse.Namespace:
         agent_slug = args.agent.replace("-", "_")
         args.job_name = f"{agent_slug}_{selected_provider.name}_{skill_suffix}"
     if args.model_context_window is None:
-        args.model_context_window = _provider_int_env(selected_provider, "CONTEXT_WINDOW", "128000")
+        args.model_context_window = _provider_int_env(
+            selected_provider, "CONTEXT_WINDOW", "128000"
+        )
     if args.model_max_tokens is None:
-        args.model_max_tokens = _provider_int_env(selected_provider, "MAX_TOKENS", "32000")
+        args.model_max_tokens = _provider_int_env(
+            selected_provider, "MAX_TOKENS", "32000"
+        )
     if _is_local_deepswe_dataset(args.dataset):
         _enforce_deepswe_infra_args(args)
     _validate_timeout_budget(args)
@@ -3040,7 +3258,9 @@ def _apply_provider_overrides(args: argparse.Namespace) -> None:
         and provider.default_anthropic_base_url
         and not os.environ.get(provider.anthropic_base_url_env)
     ):
-        os.environ[provider.anthropic_base_url_env] = provider.default_anthropic_base_url
+        os.environ[provider.anthropic_base_url_env] = (
+            provider.default_anthropic_base_url
+        )
     if args.provider_model:
         os.environ[provider.model_env] = args.provider_model
     elif provider.default_model and not os.environ.get(provider.model_env):

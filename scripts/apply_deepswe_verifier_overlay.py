@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from scripts.job_run_lock import exclusive_job_run  # noqa: E402
 from scripts.run_benchmark import (  # noqa: E402
     _deepswe_result_infra_reason,
+    _deepswe_verifier_suite_infra_reason,
     _sha256_file,
     _sha256_tree,
 )
@@ -174,6 +175,15 @@ def _validate_replay_result(
         raise ValueError(f"Missing copied replay model.patch: {replay_patch_path}")
     if _sha256_file(replay_patch_path) != guard["model_patch_sha256"]:
         raise ValueError("Copied replay model.patch hash does not match overlay guard")
+    verifier_infra_reason = _deepswe_verifier_suite_infra_reason(
+        replay_result_path.parent / "verifier",
+        replay_patch_path,
+    )
+    if verifier_infra_reason is not None:
+        raise ValueError(
+            "Replay verifier result is infrastructure-invalid and cannot be "
+            f"applied: {verifier_infra_reason}"
+        )
     expected_pairs = (
         (source.get("trial_dir"), guard["trial_dir"], "source trial_dir"),
         (source.get("trial_name"), guard["trial_name"], "source trial_name"),

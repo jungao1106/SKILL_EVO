@@ -343,6 +343,80 @@ allow_internet = false
         )
         self.assertFalse(overlay["eligible"])
 
+    def test_overlay_rejects_offline_toolchain_failure_despite_binary_zero(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            replay_dir = Path(raw_dir)
+            patch_path = replay_dir / "artifacts" / "model.patch"
+            patch_path.parent.mkdir()
+            patch_path.write_text(
+                """\
+diff --git a/file.go b/file.go
+--- a/file.go
++++ b/file.go
+@@ -1 +1 @@
+-old
++new
+"""
+            )
+            verifier_dir = replay_dir / "verifier"
+            verifier_dir.mkdir()
+            (verifier_dir / "ctrf.json").write_text(
+                json.dumps(
+                    {
+                        "results": {
+                            "tests": [
+                                {
+                                    "name": "scored-test",
+                                    "status": "failed",
+                                    "message": (
+                                        "missing from report (test did not run or "
+                                        "produced no result)"
+                                    ),
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+            (verifier_dir / "test-stdout.txt").write_text(
+                "go: download go1.26.1: "
+                "golang.org/toolchain@v0.0.1-go1.26.1.linux-amd64: Get "
+                '"https://proxy.golang.org/toolchain.zip": dial tcp: lookup '
+                "proxy.golang.org: i/o timeout\n"
+            )
+            request = {
+                "source": {
+                    "trial_dir": "/source/trial",
+                    "trial_name": "trial",
+                    "task_name": "datacurve/task",
+                    "config_sha256": "config",
+                    "result_sha256": "result",
+                    "infra_reason": "negative-reward:-1",
+                },
+                "model_patch": {
+                    "sha256": "patch",
+                    "replay_path": str(patch_path),
+                },
+                "task": {"tree_sha256": "task", "tests_tree_sha256": "tests"},
+                "runner": {"commit": "commit"},
+            }
+
+            overlay = build_overlay(
+                request=request,
+                replay_result_path=replay_dir / "replay_result.json",
+                verifier_result={"rewards": {"reward": 0}},
+                exception=None,
+            )
+
+            self.assertFalse(overlay["eligible"])
+            self.assertIn(
+                "verifier-infrastructure",
+                overlay["eligibility_reason"],
+            )
+            self.assertIn("go-toolchain", overlay["verifier_infra_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

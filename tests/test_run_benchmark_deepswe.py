@@ -21,6 +21,7 @@ from scripts.run_benchmark import (
     _deepswe_fresh_environment_verifier_retry,
     _download_deepswe_artifacts_with_retry,
     _deepswe_official_test_patch_paths,
+    _deepswe_verifier_suite_infra_reason,
     _ensure_deepswe_agent_logs_before_isolation,
     _move_deepswe_verification_to_fresh_environment,
     _preserve_go_build_events_in_raw_log,
@@ -266,8 +267,7 @@ go test -json ./pkg \
         self.assertEqual(count, 2)
         self.assertEqual(
             transformed.count(
-                "| tee -a \"$RUN_LOG\" | grep -v "
-                "'\"Action\":\"build-' | reporter"
+                '| tee -a "$RUN_LOG" | grep -v \'"Action":"build-\' | reporter'
             ),
             2,
         )
@@ -313,6 +313,136 @@ go test -json ./pkg \
                 ),
             ):
                 _apply_deepswe_verifier_test_errata(task_dir, tests_dir)
+
+
+class DeepSweVerifierInfraDetectionTest(unittest.TestCase):
+    def write_model_patch(self, root: Path, path: str = "file.go") -> Path:
+        patch_path = root / "model.patch"
+        patch_path.write_text(
+            f"""\
+diff --git a/{path} b/{path}
+--- a/{path}
++++ b/{path}
+@@ -1 +1 @@
+-old
++new
+"""
+        )
+        return patch_path
+
+    def write_ctrf(self, verifier_dir: Path, messages: list[str]) -> None:
+        payload = {
+            "results": {
+                "tests": [
+                    {"name": f"test-{index}", "status": "failed", "message": message}
+                    for index, message in enumerate(messages)
+                ]
+            }
+        }
+        (verifier_dir / "ctrf.json").write_text(json.dumps(payload))
+
+    def test_detects_dns_timeout_when_every_scored_test_was_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier_dir = Path(tmp)
+            missing = (
+                "missing from report (test did not run or produced no result "
+                "- see raw output)"
+            )
+            self.write_ctrf(verifier_dir, [missing, missing])
+            (verifier_dir / "test-stdout.txt").write_text(
+                "go: downloading go1.26.1 (linux/amd64)\n"
+                "go: download go1.26.1: "
+                "golang.org/toolchain@v0.0.1-go1.26.1.linux-amd64: Get "
+                '"https://proxy.golang.org/toolchain.zip": dial tcp: lookup '
+                "proxy.golang.org on 8.8.8.8:53: i/o timeout\n"
+            )
+
+            reason = _deepswe_verifier_suite_infra_reason(
+                verifier_dir,
+                self.write_model_patch(verifier_dir),
+            )
+
+            self.assertIsNotNone(reason)
+            self.assertIn("dns-timeout", reason or "")
+            self.assertIn("every scored test was missing", reason or "")
+
+    def test_does_not_reclassify_a_real_test_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier_dir = Path(tmp)
+            self.write_ctrf(
+                verifier_dir,
+                [
+                    "missing from report (test did not run or produced no result)",
+                    "AssertionError: expected retry count 2, got 1",
+                ],
+            )
+            (verifier_dir / "test-stdout.txt").write_text(
+                "application log: dial tcp: lookup proxy.golang.org on "
+                "8.8.8.8:53: i/o timeout\n"
+            )
+
+            self.assertIsNone(
+                _deepswe_verifier_suite_infra_reason(
+                    verifier_dir,
+                    self.write_model_patch(verifier_dir),
+                )
+            )
+
+    def test_does_not_infer_infra_from_a_model_compile_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier_dir = Path(tmp)
+            self.write_ctrf(
+                verifier_dir,
+                ["missing from report (test did not run or produced no result)"],
+            )
+            (verifier_dir / "test-stdout.txt").write_text(
+                "compile error: undefined: NewRetryPolicy\n"
+            )
+
+            self.assertIsNone(
+                _deepswe_verifier_suite_infra_reason(
+                    verifier_dir,
+                    self.write_model_patch(verifier_dir),
+                )
+            )
+
+    def test_model_changed_toolchain_manifest_remains_a_model_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier_dir = Path(tmp)
+            self.write_ctrf(
+                verifier_dir,
+                ["missing from report (test did not run or produced no result)"],
+            )
+            (verifier_dir / "test-stdout.txt").write_text(
+                "go: download go1.26.1: golang.org/toolchain@v0.0.1-go1.26.1: "
+                "dial tcp: lookup proxy.golang.org on 8.8.8.8:53: i/o timeout\n"
+            )
+
+            reason = _deepswe_verifier_suite_infra_reason(
+                verifier_dir,
+                self.write_model_patch(verifier_dir, "go.mod"),
+            )
+
+            self.assertIsNone(reason)
+
+    def test_model_introduced_package_fetch_remains_a_model_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier_dir = Path(tmp)
+            self.write_ctrf(
+                verifier_dir,
+                ["missing from report (test did not run or produced no result)"],
+            )
+            (verifier_dir / "test-stdout.txt").write_text(
+                "go: downloading example.com/model-added v1.0.0: "
+                "dial tcp: lookup proxy.golang.org on 8.8.8.8:53: i/o timeout\n"
+            )
+
+            reason = _deepswe_verifier_suite_infra_reason(
+                verifier_dir,
+                self.write_model_patch(verifier_dir),
+            )
+
+            self.assertIsNone(reason)
 
 
 class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
@@ -381,7 +511,9 @@ class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_exhaustion_stays_fail_closed_and_is_not_model_retryable(self) -> None:
+    async def test_exhaustion_stays_fail_closed_and_is_not_model_retryable(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             trial = SimpleNamespace(
@@ -424,7 +556,98 @@ class DeepSweArtifactDownloadRetryTest(unittest.IsolatedAsyncioTestCase):
 
 
 class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
-    async def test_deepswe_timeout_retries_same_patch_in_fresh_environment(self) -> None:
+    def make_deepswe_trial(self, task_dir: Path) -> SimpleNamespace:
+        (task_dir / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+        return SimpleNamespace(
+            _task=SimpleNamespace(paths=SimpleNamespace(task_dir=task_dir)),
+            _logger=mock.Mock(),
+            _skills_evo_deepswe_fresh_verifier_environment=True,
+            result=SimpleNamespace(verifier_result=None),
+        )
+
+    async def test_deepswe_suite_infra_retries_in_fresh_environment(self) -> None:
+        calls = 0
+
+        async def verify_once(trial: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise DeepSweVerifierInfraError("dependency DNS timeout")
+            trial.result.verifier_result = SimpleNamespace(  # type: ignore[attr-defined]
+                rewards={"reward": 0}
+            )
+
+        async def verify_with_retry(_trial: object) -> None:
+            raise AssertionError("Harbor retry wrapper should not run")
+
+        verify_with_retry.__wrapped__ = verify_once  # type: ignore[attr-defined]
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = self.make_deepswe_trial(Path(tmp))
+            with (
+                mock.patch(
+                    "scripts.run_benchmark._download_deepswe_verifier_logs_best_effort",
+                    new_callable=mock.AsyncMock,
+                ) as download_logs,
+                mock.patch(
+                    "scripts.run_benchmark._replace_deepswe_verifier_environment",
+                    new_callable=mock.AsyncMock,
+                ) as replace_environment,
+            ):
+                patched = _deepswe_fresh_environment_verifier_retry(verify_with_retry)
+                await patched(trial)
+
+            download_logs.assert_awaited_once_with(
+                trial,
+                label="infra_attempt_1",
+            )
+            replace_environment.assert_awaited_once_with(
+                trial,
+                retry_index=1,
+                stop_current=True,
+            )
+        self.assertEqual(calls, 2)
+
+    async def test_repeated_suite_infra_fails_closed(self) -> None:
+        calls = 0
+
+        async def verify_once(_trial: object) -> None:
+            nonlocal calls
+            calls += 1
+            raise DeepSweVerifierInfraError("dependency DNS timeout")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = self.make_deepswe_trial(Path(tmp))
+            with (
+                mock.patch(
+                    "scripts.run_benchmark._download_deepswe_verifier_logs_best_effort",
+                    new_callable=mock.AsyncMock,
+                ) as download_logs,
+                mock.patch(
+                    "scripts.run_benchmark._replace_deepswe_verifier_environment",
+                    new_callable=mock.AsyncMock,
+                ) as replace_environment,
+            ):
+                patched = _deepswe_fresh_environment_verifier_retry(verify_once)
+                with self.assertRaisesRegex(
+                    DeepSweVerifierInfraError,
+                    "dependency DNS timeout",
+                ):
+                    await patched(trial)
+
+            self.assertEqual(
+                [call.kwargs["label"] for call in download_logs.await_args_list],
+                ["infra_attempt_1", "infra_attempt_2"],
+            )
+            replace_environment.assert_awaited_once_with(
+                trial,
+                retry_index=1,
+                stop_current=True,
+            )
+        self.assertEqual(calls, 2)
+
+    async def test_deepswe_timeout_retries_same_patch_in_fresh_environment(
+        self,
+    ) -> None:
         from harbor.trial.trial import VerifierTimeoutError
 
         calls: list[str] = []
@@ -455,19 +678,15 @@ class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
             with (
                 mock.patch(
-                    "scripts.run_benchmark."
-                    "_download_deepswe_verifier_logs_best_effort",
+                    "scripts.run_benchmark._download_deepswe_verifier_logs_best_effort",
                     new_callable=mock.AsyncMock,
                 ) as download_logs,
                 mock.patch(
-                    "scripts.run_benchmark."
-                    "_replace_deepswe_verifier_environment",
+                    "scripts.run_benchmark._replace_deepswe_verifier_environment",
                     new_callable=mock.AsyncMock,
                 ) as replace_environment,
             ):
-                patched = _deepswe_fresh_environment_verifier_retry(
-                    verify_with_retry
-                )
+                patched = _deepswe_fresh_environment_verifier_retry(verify_with_retry)
                 await patched(trial)
 
             download_logs.assert_awaited_once_with(
@@ -481,7 +700,9 @@ class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(calls, ["once", "once"])
 
-    async def test_negative_reward_retries_same_patch_in_fresh_environment(self) -> None:
+    async def test_negative_reward_retries_same_patch_in_fresh_environment(
+        self,
+    ) -> None:
         calls = 0
 
         async def verify_once(trial: object) -> None:
@@ -508,19 +729,15 @@ class DeepSweVerifierRetryPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
             with (
                 mock.patch(
-                    "scripts.run_benchmark."
-                    "_download_deepswe_verifier_logs_best_effort",
+                    "scripts.run_benchmark._download_deepswe_verifier_logs_best_effort",
                     new_callable=mock.AsyncMock,
                 ) as download_logs,
                 mock.patch(
-                    "scripts.run_benchmark."
-                    "_replace_deepswe_verifier_environment",
+                    "scripts.run_benchmark._replace_deepswe_verifier_environment",
                     new_callable=mock.AsyncMock,
                 ) as replace_environment,
             ):
-                patched = _deepswe_fresh_environment_verifier_retry(
-                    verify_with_retry
-                )
+                patched = _deepswe_fresh_environment_verifier_retry(verify_with_retry)
                 await patched(trial)
 
             download_logs.assert_awaited_once_with(
@@ -599,9 +816,7 @@ allow_internet = false
                 default_user=None,
                 start=mock.AsyncMock(),
                 stop=mock.AsyncMock(),
-                exec=mock.AsyncMock(
-                    return_value=SimpleNamespace(return_code=0)
-                ),
+                exec=mock.AsyncMock(return_value=SimpleNamespace(return_code=0)),
                 upload_file=mock.AsyncMock(),
             )
             trial_environment = TrialEnvironmentConfig(

@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import tempfile
@@ -40,7 +41,16 @@ _TEMPLATE_LOOKUP_CACHE_DIRS: dict[tuple[str, ...], Path | None] = {}
 _SANDBOX_CREATE_RATE_LOCK = threading.Lock()
 _SANDBOX_CREATE_NEXT_AT = 0.0
 E2B_TEMPLATE_BUILD_POLICY_VERSION = "r3"
+E2B_IMPORTED_GO_CACHE_POLICY_VERSION = "go-cache-v1"
 PI_CODING_AGENT_VERSION = "0.80.6"
+
+_IMPORTED_GO_CACHE_DESTINATIONS = {
+    "GOMODCACHE": "/opt/skills-evo/imported-go-cache-v1/mod",
+    "GOCACHE": "/opt/skills-evo/imported-go-cache-v1/build",
+}
+_IMPORTED_GO_CACHE_ROOT = "/opt/skills-evo/imported-go-cache-v1"
+_IMPORTED_GO_TOOLCHAIN = f"{_IMPORTED_GO_CACHE_ROOT}/toolchain"
+_IMPORTED_GO_CACHE_READY = f"{_IMPORTED_GO_CACHE_ROOT}/READY"
 
 
 class E2BResourceMismatchError(RuntimeError):
@@ -56,10 +66,7 @@ def _template_build_semaphore() -> asyncio.Semaphore:
         limit = 20
     limit = max(1, limit)
 
-    if (
-        _TEMPLATE_BUILD_SEMAPHORE is None
-        or _TEMPLATE_BUILD_SEMAPHORE_LIMIT != limit
-    ):
+    if _TEMPLATE_BUILD_SEMAPHORE is None or _TEMPLATE_BUILD_SEMAPHORE_LIMIT != limit:
         _TEMPLATE_BUILD_SEMAPHORE = asyncio.Semaphore(limit)
         _TEMPLATE_BUILD_SEMAPHORE_LIMIT = limit
 
@@ -138,9 +145,7 @@ def _template_lookup_cache_dir_candidates(preferred: Path) -> list[Path]:
         )
     else:
         try:
-            candidates.append(
-                Path.home() / ".cache/skill-evo/e2b_template_lookup"
-            )
+            candidates.append(Path.home() / ".cache/skill-evo/e2b_template_lookup")
         except RuntimeError:
             pass
 
@@ -185,12 +190,16 @@ def _template_resource_identity(
     storage_mb: int,
     *,
     strip_dockerfile_comments: bool,
+    imported_go_cache: bool = False,
 ) -> str:
     comment_policy = "strip" if strip_dockerfile_comments else "keep"
-    return (
+    identity = (
         f"c{cpus}-m{memory_mb}-s{storage_mb}-"
         f"{E2B_TEMPLATE_BUILD_POLICY_VERSION}-{comment_policy}"
     )
+    if imported_go_cache:
+        identity += f"-{E2B_IMPORTED_GO_CACHE_POLICY_VERSION}"
+    return identity
 
 
 def _benchmark_log(message: str) -> None:
@@ -282,11 +291,7 @@ def _dockerfile_runtime_env(
         if "=" not in tokens[0]:
             assignments = [(tokens[0], " ".join(tokens[1:]))]
         else:
-            assignments = [
-                token.split("=", 1)
-                for token in tokens
-                if "=" in token
-            ]
+            assignments = [token.split("=", 1) for token in tokens if "=" in token]
         before_instruction = dict(resolved)
         pending: list[tuple[str, str]] = []
         for key, raw_value in assignments:
@@ -304,6 +309,203 @@ def _dockerfile_runtime_env(
         for stage_key in current_stage_keys:
             stage_envs[stage_key] = dict(declared)
     return declared
+
+
+def _is_volatile_tmp_path(value: str) -> bool:
+    if not value.startswith("/"):
+        return False
+    normalized = posixpath.normpath(value)
+    return normalized == "/tmp" or normalized.startswith("/tmp/")
+
+
+def _imported_image_go_cache_paths(
+    dockerfile_path: Path,
+    docker_image: str | None,
+) -> dict[str, tuple[str, str]]:
+    """Map volatile imported-image Go caches to persistent template paths."""
+
+    if not docker_image:
+        return {}
+    declared_env = _dockerfile_runtime_env(dockerfile_path, {})
+    gomodcache = declared_env.get("GOMODCACHE")
+    if gomodcache is None or not _is_volatile_tmp_path(gomodcache):
+        return {}
+    return {
+        key: (declared_env[key], destination)
+        for key, destination in _IMPORTED_GO_CACHE_DESTINATIONS.items()
+        if key in declared_env and _is_volatile_tmp_path(declared_env[key])
+    }
+
+
+def _imported_go_cache_build_command(
+    workdir: str,
+    cache_paths: dict[str, tuple[str, str]],
+) -> str:
+    """Build an image layer containing a complete, non-volatile Go cache."""
+
+    if not cache_paths:
+        raise ValueError("Imported Go cache preparation requires at least one cache")
+
+    lines = [
+        "set -eu",
+        f"cd {shlex.quote(workdir)}",
+        "command -v go >/dev/null",
+        "test -f go.mod",
+        'backup_dir="$(mktemp -d /tmp/skills-evo-go-cache.XXXXXX)"',
+        'cp -a -- go.mod "$backup_dir/go.mod"',
+        "had_go_sum=0",
+        'if [ -e go.sum ]; then cp -a -- go.sum "$backup_dir/go.sum"; had_go_sum=1; fi',
+        "restore_go_manifests() {",
+        '  cp -a -- "$backup_dir/go.mod" go.mod',
+        '  if [ "$had_go_sum" -eq 1 ]; then cp -a -- "$backup_dir/go.sum" go.sum; else rm -f -- go.sum; fi',
+        "}",
+        "trap restore_go_manifests EXIT",
+    ]
+    for source, destination in cache_paths.values():
+        quoted_source = shlex.quote(source)
+        quoted_destination = shlex.quote(destination)
+        lines.extend(
+            [
+                f"mkdir -p -- {quoted_destination}",
+                f"if [ -d {quoted_source} ]; then cp -a -- {quoted_source}/. {quoted_destination}/; fi",
+            ]
+        )
+
+    cache_env = " ".join(
+        f"{key}={shlex.quote(destination)}"
+        for key, (_source, destination) in sorted(cache_paths.items())
+    )
+    lines.extend(
+        [
+            f"ROOT={shlex.quote(_IMPORTED_GO_CACHE_ROOT)}",
+            f"MOD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOMODCACHE'])}",
+            f"BUILD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOCACHE'])}",
+            f"TOOLCHAIN={shlex.quote(_IMPORTED_GO_TOOLCHAIN)}",
+            f"READY={shlex.quote(_IMPORTED_GO_CACHE_READY)}",
+            'mkdir -p -- "$MOD" "$BUILD"',
+            "go_mod_sha256=\"$(sha256sum go.mod | awk '{print $1}')\"",
+            'if [ "$had_go_sum" -eq 1 ]; then go_sum_sha256="$(sha256sum go.sum | awk \'{print $1}\')"; else go_sum_sha256=absent; fi',
+            'git_head="$(git rev-parse HEAD)"',
+            f"env {cache_env} GOTOOLCHAIN=auto GOFLAGS= GOWORK=off go version >/dev/null",
+            f"env {cache_env} GOTOOLCHAIN=auto GOFLAGS= GOWORK=off go mod download all",
+            f'selected_goroot="$(env {cache_env} GOTOOLCHAIN=auto GOFLAGS= GOWORK=off go env GOROOT)"',
+            'toolchain_target="$(realpath -e "$selected_goroot")"',
+            'mod_target="$(realpath -e "$MOD")"',
+            'test -x "$toolchain_target/bin/go"',
+            'case "$toolchain_target" in "$mod_target"/*|/usr/local/go) ;; *) exit 1 ;; esac',
+            'rm -f -- "$TOOLCHAIN"',
+            'ln -s -- "$toolchain_target" "$TOOLCHAIN"',
+            'test -x "$TOOLCHAIN/bin/go"',
+            'local_path="$TOOLCHAIN/bin:$PATH"',
+            'selected_go_version="$(env PATH="$local_path" GOMODCACHE="$MOD" GOCACHE="$BUILD" GOTOOLCHAIN=local GOFLAGS= GOWORK=off go version)"',
+            'toolchain_bin_sha256="$(sha256sum "$TOOLCHAIN/bin/go" | awk \'{print $1}\')"',
+        ]
+    )
+    if "GOMODCACHE" in cache_paths:
+        module_cache = shlex.quote(cache_paths["GOMODCACHE"][1])
+        lines.append(f'test -n "$(find {module_cache} -mindepth 1 -print -quit)"')
+    lines.extend(
+        [
+            "restore_go_manifests",
+            'cmp -s -- "$backup_dir/go.mod" go.mod',
+            'if [ "$had_go_sum" -eq 1 ]; then cmp -s -- "$backup_dir/go.sum" go.sum; else test ! -e go.sum; fi',
+            'ready_tmp="$READY.tmp"',
+            "{",
+            f"  printf '%s\\n' {shlex.quote(f'policy_version={E2B_IMPORTED_GO_CACHE_POLICY_VERSION}')}",
+            f"  printf '%s\\n' {shlex.quote(f'workdir={workdir}')}",
+            "  printf 'git_head=%s\\n' \"$git_head\"",
+            "  printf 'go_mod_sha256=%s\\n' \"$go_mod_sha256\"",
+            "  printf 'go_sum_present=%s\\n' \"$had_go_sum\"",
+            "  printf 'go_sum_sha256=%s\\n' \"$go_sum_sha256\"",
+            "  printf 'selected_go_version=%s\\n' \"$selected_go_version\"",
+            "  printf 'toolchain_link_target=%s\\n' \"$toolchain_target\"",
+            "  printf 'toolchain_bin_sha256=%s\\n' \"$toolchain_bin_sha256\"",
+            "  printf 'gomodcache=%s\\n' \"$MOD\"",
+            "  printf 'gocache=%s\\n' \"$BUILD\"",
+            '} > "$ready_tmp"',
+            'mv -f -- "$ready_tmp" "$READY"',
+            'test -s "$READY"',
+            "trap - EXIT",
+            'rm -rf -- "$backup_dir"',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _imported_go_cache_runtime_check_command(
+    workdir: str,
+    cache_paths: dict[str, tuple[str, str]],
+) -> str:
+    """Verify an imported Go cache without allowing a network fallback."""
+
+    if not cache_paths:
+        raise ValueError("Imported Go cache validation requires at least one cache")
+    destinations = [destination for _source, destination in cache_paths.values()]
+    lines = [
+        "set -eu",
+        f"ROOT={shlex.quote(_IMPORTED_GO_CACHE_ROOT)}",
+        f"MOD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOMODCACHE'])}",
+        f"BUILD={shlex.quote(_IMPORTED_GO_CACHE_DESTINATIONS['GOCACHE'])}",
+        f"TOOLCHAIN={shlex.quote(_IMPORTED_GO_TOOLCHAIN)}",
+        f"READY={shlex.quote(_IMPORTED_GO_CACHE_READY)}",
+    ]
+    lines.extend(f"test -d {shlex.quote(path)}" for path in destinations)
+    lines.extend(
+        [
+            'test -d "$MOD"',
+            'test -d "$BUILD"',
+            'test -s "$READY"',
+            'test -L "$TOOLCHAIN"',
+            'toolchain_target="$(realpath -e "$TOOLCHAIN")"',
+            'mod_target="$(realpath -e "$MOD")"',
+            'case "$toolchain_target" in "$mod_target"/*|/usr/local/go) ;; *) exit 1 ;; esac',
+            'test -x "$TOOLCHAIN/bin/go"',
+            f"cd {shlex.quote(workdir)}",
+            "test -f go.mod",
+            'require_ready() { grep -Fqx -- "$1" "$READY"; }',
+            f"require_ready {shlex.quote(f'policy_version={E2B_IMPORTED_GO_CACHE_POLICY_VERSION}')}",
+            f"require_ready {shlex.quote(f'workdir={workdir}')}",
+            'require_ready "git_head=$(git rev-parse HEAD)"',
+            "require_ready \"go_mod_sha256=$(sha256sum go.mod | awk '{print $1}')\"",
+            "if [ -e go.sum ]; then had_go_sum=1; go_sum_sha256=\"$(sha256sum go.sum | awk '{print $1}')\"; else had_go_sum=0; go_sum_sha256=absent; fi",
+            'require_ready "go_sum_present=$had_go_sum"',
+            'require_ready "go_sum_sha256=$go_sum_sha256"',
+            'require_ready "toolchain_link_target=$toolchain_target"',
+            'require_ready "toolchain_bin_sha256=$(sha256sum "$TOOLCHAIN/bin/go" | awk \'{print $1}\')"',
+            'require_ready "gomodcache=$MOD"',
+            'require_ready "gocache=$BUILD"',
+            'local_path="$TOOLCHAIN/bin:$PATH"',
+            'selected_go_version="$(env PATH="$local_path" GOMODCACHE="$MOD" GOCACHE="$BUILD" GOTOOLCHAIN=local GOFLAGS= GOWORK=off go version)"',
+            'require_ready "selected_go_version=$selected_go_version"',
+            'backup_dir="$(mktemp -d /tmp/skills-evo-go-preflight.XXXXXX)"',
+            'cp -a -- go.mod "$backup_dir/go.mod"',
+            'if [ -e go.sum ]; then cp -a -- go.sum "$backup_dir/go.sum"; had_go_sum=1; fi',
+            "restore_go_manifests() {",
+            '  cp -a -- "$backup_dir/go.mod" go.mod',
+            '  if [ "$had_go_sum" -eq 1 ]; then cp -a -- "$backup_dir/go.sum" go.sum; else rm -f -- go.sum; fi',
+            "}",
+            "trap restore_go_manifests EXIT",
+        ]
+    )
+    cache_env = " ".join(
+        f"{key}={shlex.quote(destination)}"
+        for key, (_source, destination) in sorted(cache_paths.items())
+    )
+    offline_env = (
+        f'env PATH="$local_path" {cache_env} GOTOOLCHAIN=local '
+        "GOPROXY=off GOSUMDB=off GOFLAGS= GOWORK=off"
+    )
+    lines.extend(
+        [
+            f"{offline_env} go mod download all",
+            "restore_go_manifests",
+            'cmp -s -- "$backup_dir/go.mod" go.mod',
+            'if [ "$had_go_sum" -eq 1 ]; then cmp -s -- "$backup_dir/go.sum" go.sum; else test ! -e go.sum; fi',
+            "trap - EXIT",
+            'rm -rf -- "$backup_dir"',
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _is_missing_or_unlaunchable_template_error(exc: SandboxException) -> bool:
@@ -347,11 +549,16 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         self._template_namespace = namespace
         self._environment_hash = digest
         self._strip_dockerfile_comments = strip_dockerfile_comments
+        self._imported_go_cache_paths = _imported_image_go_cache_paths(
+            self._environment_definition_path,
+            self.task_env_config.docker_image,
+        )
         self._template_resource_identity = _template_resource_identity(
             self.task_env_config.cpus,
             self.task_env_config.memory_mb,
             self.task_env_config.storage_mb,
             strip_dockerfile_comments=strip_dockerfile_comments,
+            imported_go_cache=bool(self._imported_go_cache_paths),
         )
         self._pi_template_suffix = (
             pi_template_suffix
@@ -366,7 +573,9 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         self._dockerfile_declared_env: dict[str, str] = {}
 
     def _allow_internet_access(self) -> bool:
-        return True if self._force_allow_internet else self.task_env_config.allow_internet
+        return (
+            True if self._force_allow_internet else self.task_env_config.allow_internet
+        )
 
     def _legacy_template_base(self) -> str:
         return self.environment_name.replace("/", "__").replace(".", "-")
@@ -529,6 +738,15 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             template = Template().from_image(
                 image=self.task_env_config.docker_image,
             )
+            imported_go_cache_paths = getattr(self, "_imported_go_cache_paths", {})
+            if imported_go_cache_paths:
+                template = template.run_cmd(
+                    _imported_go_cache_build_command(
+                        self._workdir_from_dockerfile() or "/app",
+                        imported_go_cache_paths,
+                    ),
+                    user="root",
+                )
         else:
             template = Template(
                 file_context_path=str(Path(self.environment_dir).resolve())
@@ -567,7 +785,11 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         if cached_template in candidates:
             candidates = [
                 cached_template,
-                *(candidate for candidate in candidates if candidate != cached_template),
+                *(
+                    candidate
+                    for candidate in candidates
+                    if candidate != cached_template
+                ),
             ]
 
         for template_name in candidates:
@@ -597,9 +819,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             async with _AsyncFileLock(self._template_lookup_build_lock_file()):
                 for template_name in self._candidate_template_names():
                     self._template_name = template_name
-                    if not await AsyncTemplate.exists(
-                        template_name.rsplit("/", 1)[-1]
-                    ):
+                    if not await AsyncTemplate.exists(template_name.rsplit("/", 1)[-1]):
                         continue
                     try:
                         await self._create_sandbox_from_current_template()
@@ -669,11 +889,57 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             self._environment_definition_path,
             base_env,
         )
+        imported_go_cache_paths = getattr(self, "_imported_go_cache_paths", {})
+        imported_go_runtime_env: dict[str, str] = {}
+        if imported_go_cache_paths:
+            for key, (_source, destination) in imported_go_cache_paths.items():
+                imported_go_runtime_env[key] = destination
+            restored_path = self._persistent_env.get(
+                "PATH",
+                dockerfile_env.get("PATH", base_env.get("PATH", "")),
+            )
+            imported_go_runtime_env.update(
+                {
+                    "PATH": f"{_IMPORTED_GO_TOOLCHAIN}/bin:{restored_path}",
+                    "GOTOOLCHAIN": "local",
+                }
+            )
+            if not self._allow_internet_access():
+                imported_go_runtime_env.update(
+                    {
+                        "GOPROXY": "off",
+                        "GOSUMDB": "off",
+                    }
+                )
+            dockerfile_env.update(imported_go_runtime_env)
         self._dockerfile_declared_env = dockerfile_env
         self._persistent_env = {
             **dockerfile_env,
             **self._persistent_env,
         }
+        self._persistent_env.update(imported_go_runtime_env)
+        if imported_go_cache_paths:
+            check = await self._sandbox.commands.run(
+                _imported_go_cache_runtime_check_command(
+                    self._workdir_from_dockerfile() or "/app",
+                    imported_go_cache_paths,
+                ),
+                user="root",
+                timeout=300,
+            )
+            if check.exit_code != 0:
+                output_tail = "\n".join(
+                    part
+                    for part in (
+                        str(getattr(check, "stdout", "") or "").strip(),
+                        str(getattr(check, "stderr", "") or "").strip(),
+                    )
+                    if part
+                )[-2000:]
+                raise RuntimeError(
+                    "Imported-image Go cache is unavailable for offline execution: "
+                    f"return_code={check.exit_code}, output_tail={output_tail!r}"
+                )
         if dockerfile_env:
             _benchmark_log(
                 "E2B_ENV_RESTORE "
@@ -820,9 +1086,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             "Discarding an existing E2B sandbox before retrying environment start"
         )
         _benchmark_log(
-            "E2B_SANDBOX "
-            f"task={self.environment_name} "
-            "status=cleanup_before_restart"
+            f"E2B_SANDBOX task={self.environment_name} status=cleanup_before_restart"
         )
         await self.stop(delete=True)
 
@@ -830,7 +1094,9 @@ class E2BSwebenchEnvironment(E2BEnvironment):
         await self._cleanup_sandbox_before_restart()
         if force_build:
             self._forget_template_lookup()
-            self._template_name = self._pi_template_name() or self._build_template_name()
+            self._template_name = (
+                self._pi_template_name() or self._build_template_name()
+            )
             self.logger.info(
                 "E2B template check: force_build=true; building template=%s",
                 self._template_name,

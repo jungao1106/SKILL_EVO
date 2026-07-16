@@ -26,6 +26,7 @@ from scripts.run_benchmark import (  # noqa: E402
     DeepSweVerifierInfraError,
     _deepswe_fresh_environment_verifier_retry,
     _deepswe_result_infra_reason,
+    _deepswe_verifier_suite_infra_reason,
     _patch_e2b_disable_http2,
     _patch_harbor_runtime,
     _replace_deepswe_verifier_environment,
@@ -397,8 +398,16 @@ def build_overlay(
 ) -> dict[str, Any]:
     rewards = verifier_result.get("rewards") if verifier_result else None
     reward = rewards.get("reward") if isinstance(rewards, dict) else None
+    verifier_infra_reason: str | None = None
+    replay_patch_value = request.get("model_patch", {}).get("replay_path")
+    if isinstance(replay_patch_value, str):
+        verifier_infra_reason = _deepswe_verifier_suite_infra_reason(
+            replay_result_path.parent / "verifier",
+            Path(replay_patch_value),
+        )
     eligible = (
         exception is None
+        and verifier_infra_reason is None
         and isinstance(reward, (int, float))
         and not isinstance(reward, bool)
         and float(reward) in {0.0, 1.0}
@@ -410,8 +419,13 @@ def build_overlay(
         "eligibility_reason": (
             "clean-binary-verifier-result"
             if eligible
-            else "replay-did-not-produce-clean-binary-verifier-result"
+            else (
+                f"verifier-infrastructure:{verifier_infra_reason}"
+                if verifier_infra_reason is not None
+                else "replay-did-not-produce-clean-binary-verifier-result"
+            )
         ),
+        "verifier_infra_reason": verifier_infra_reason,
         "source_guard": {
             "trial_dir": request["source"]["trial_dir"],
             "trial_name": request["source"]["trial_name"],

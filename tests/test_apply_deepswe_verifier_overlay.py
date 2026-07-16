@@ -66,6 +66,11 @@ allow_internet = false
         (trial_dir / "artifacts").mkdir(parents=True)
         (trial_dir / "artifacts" / "model.patch").write_bytes(
             b"diff --git a/file.go b/file.go\n"
+            b"--- a/file.go\n"
+            b"+++ b/file.go\n"
+            b"@@ -1 +1 @@\n"
+            b"-old\n"
+            b"+new\n"
         )
         config = TrialConfig(
             task=TaskConfig(path=task_dir, source="tasks"),
@@ -235,6 +240,48 @@ allow_internet = false
                 (overlay_path.parent / "application.json").read_bytes(),
                 application_after_first,
             )
+
+    def test_rejects_old_eligible_overlay_for_offline_toolchain_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            trial_dir, overlay_path = self.create_fixture(root)
+            verifier_dir = overlay_path.parent / "verifier"
+            verifier_dir.mkdir()
+            (verifier_dir / "ctrf.json").write_text(
+                json.dumps(
+                    {
+                        "results": {
+                            "tests": [
+                                {
+                                    "name": "scored-test",
+                                    "status": "failed",
+                                    "message": (
+                                        "missing from report (test did not run or "
+                                        "produced no result)"
+                                    ),
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+            (verifier_dir / "test-stdout.txt").write_text(
+                "go: download go1.26.1: "
+                "golang.org/toolchain@v0.0.1-go1.26.1.linux-amd64: Get "
+                '"https://proxy.golang.org/toolchain.zip": dial tcp: lookup '
+                "proxy.golang.org: i/o timeout\n"
+            )
+            result_path = trial_dir / "result.json"
+            before = result_path.read_bytes()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "infrastructure-invalid",
+            ):
+                apply_overlay(overlay_path)
+
+            self.assertEqual(result_path.read_bytes(), before)
+            self.assertFalse((overlay_path.parent / "application.json").exists())
 
     def test_idempotence_fails_closed_after_result_or_application_drift(self) -> None:
         for case in ("result", "application"):
