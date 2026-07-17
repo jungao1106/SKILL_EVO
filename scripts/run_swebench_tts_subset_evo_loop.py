@@ -34,7 +34,10 @@ from providers import (  # noqa: E402
     resolve_provider,
 )
 from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
-from scripts.run_benchmark import _deepswe_result_infra_reason  # noqa: E402
+from scripts.run_benchmark import (  # noqa: E402
+    _deepswe_result_infra_reason,
+    _sha256_tree as benchmark_contract_tree_sha256,
+)
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
     DEFAULT_PYTHON,
     load_evaluator_policy,
@@ -344,7 +347,7 @@ def subset_execution_payload(
         "gate_tree_sha256": sha256_tree(gate_root),
         "benchmark_name": args.benchmark_name,
         "dataset": str(Path(args.dataset).expanduser().resolve()),
-        "dataset_tree_sha256": sha256_tree(
+        "dataset_tree_sha256": benchmark_contract_tree_sha256(
             Path(args.dataset).expanduser().resolve()
         ),
         "provider": {
@@ -718,7 +721,20 @@ def run_subset_eval(
     if job_dir.exists() and job_is_running(job_dir):
         print(f"[tts-subset-loop] waiting for active job {job_name}", flush=True)
         last_progress: tuple[int, int | None, str | None] | None = None
+        wait_started = time.monotonic()
+        active_job_wait_timeout_sec = float(
+            getattr(
+                args,
+                "active_job_wait_timeout_sec",
+                getattr(args, "wait_timeout_sec", 259200),
+            )
+        )
         while job_is_running(job_dir):
+            if time.monotonic() - wait_started > active_job_wait_timeout_sec:
+                raise SystemExit(
+                    "Timed out waiting for an active subset job: "
+                    f"job={job_name} timeout={active_job_wait_timeout_sec:g}s"
+                )
             if job_is_complete(job_dir, expected_trials):
                 return job_dir
             progress = job_progress(job_dir)
@@ -843,6 +859,13 @@ def run_subset_eval(
         )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     previous_invalid = job_invalid_fingerprint(job_dir)
+    job_wall_timeout_sec = float(
+        getattr(
+            args,
+            "job_wall_timeout_sec",
+            getattr(args, "wait_timeout_sec", 259200),
+        )
+    )
     for recovery_round in range(1, args.recovery_rounds + 1):
         with log_path.open("a") as log:
             log.write(
@@ -851,14 +874,21 @@ def run_subset_eval(
                 f"recovery_round={recovery_round}/{args.recovery_rounds}\n"
             )
             log.flush()
-            proc = subprocess.run(
-                command,
-                cwd=ROOT,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
+            try:
+                proc = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    timeout=job_wall_timeout_sec,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise SystemExit(
+                    "Subset benchmark command exceeded its wall timeout: "
+                    f"job={job_name} timeout={job_wall_timeout_sec:g}s"
+                ) from exc
             log.write(f"[{utc_now()}] command exit code={proc.returncode}\n")
         if job_is_complete(job_dir, expected_trials):
             return job_dir
@@ -918,6 +948,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e2b-sandbox-timeout-sec", type=int, default=7200)
     parser.add_argument("--poll-sec", type=int, default=60)
     parser.add_argument("--recovery-rounds", type=int, default=4)
+    parser.add_argument("--active-job-wait-timeout-sec", type=float, default=259200)
+    parser.add_argument("--job-wall-timeout-sec", type=float, default=259200)
     return parser.parse_args()
 
 
