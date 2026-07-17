@@ -809,6 +809,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--no-wait", action="store_true")
+    parser.add_argument(
+        "--allow-paused-source",
+        action="store_true",
+        help=(
+            "Allow --no-wait while the source launcher remains active. The operator "
+            "must pause its evaluation coordinator so benchmark concurrency is not shared."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -866,9 +874,19 @@ def run(args: argparse.Namespace) -> None:
         state_file = output_root / "state.json"
         try:
             source_state = read_json(state_path)
-            if args.no_wait and source_state.get("status") != "complete":
+            if (
+                args.no_wait
+                and source_state.get("status") != "complete"
+                and not args.allow_paused_source
+            ):
                 raise RuntimeError(
                     "--no-wait is allowed only after the source evolution is complete"
+                )
+            if args.allow_paused_source and not args.no_wait:
+                raise RuntimeError("--allow-paused-source requires --no-wait")
+            if args.allow_paused_source and source_state.get("status") != "running":
+                raise RuntimeError(
+                    "--allow-paused-source requires a source evolution marked running"
                 )
             if not args.no_wait:
                 write_json_atomic(

@@ -10,6 +10,7 @@ from scripts.run_benchmark import _sha256_tree
 from scripts.run_deepswe_setting_bon import (
     combine_task_rows,
     normalized_job_config,
+    parse_args,
     retry_task_names,
 )
 from scripts.run_swebench_tts_subset_evo_loop import subset_execution_payload
@@ -139,3 +140,27 @@ def test_subset_execution_uses_resume_contract_dataset_hash(tmp_path) -> None:
 
     assert payload["dataset_tree_sha256"] == _sha256_tree(dataset)
     assert payload["dataset_tree_sha256"] != sha256_tree(dataset)
+
+
+def test_allow_paused_source_is_explicit_cli_opt_in(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_deepswe_setting_bon.py",
+            "--launcher-dir",
+            "/launcher",
+            "--tts-run-dir",
+            "/tts",
+            "--dataset",
+            "/dataset",
+            "--env-file",
+            "/env",
+            "--no-wait",
+            "--allow-paused-source",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.no_wait is True
+    assert args.allow_paused_source is True
