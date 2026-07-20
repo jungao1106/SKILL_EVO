@@ -31,6 +31,17 @@ from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
 from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
 
 
+TASKWISE_OR_AGGREGATE_KIND = "deepswe_same_setting_or_aggregate"
+TASKWISE_OR_SAMPLING_POLICY = {
+    "n": 2,
+    "sample_2_subset": "sample_1_valid_reward_equal_to_0",
+    "aggregation": "maximum reward per task within the same skill setting",
+    "cross_gate_aggregation": False,
+    "infra_retries_count_as_samples": False,
+    "tts_feedback": False,
+}
+
+
 def render_report_md(manifest: dict[str, Any]) -> str:
     summary = manifest["summary"]
     lines = [
@@ -84,12 +95,408 @@ def sha256_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _task_rows(report: dict[str, Any], *, label: str) -> list[dict[str, Any]]:
+    rows = report.get("tasks") or (report.get("evaluation") or {}).get("tasks")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ValueError(f"{label} has no valid task rows")
+    names = [row.get("task_name") for row in rows]
+    if not all(isinstance(name, str) and name for name in names):
+        raise ValueError(f"{label} has an invalid task_name")
+    if len(names) != len(set(names)):
+        raise ValueError(f"{label} contains duplicate tasks")
+    return rows
+
+
+def _binary_attempt(row: dict[str, Any], *, label: str) -> dict[str, Any]:
+    raw_reward = row.get("reward")
+    reward = (
+        float(raw_reward)
+        if not isinstance(raw_reward, bool) and isinstance(raw_reward, (int, float))
+        else None
+    )
+    if reward not in {0.0, 1.0}:
+        raise ValueError(f"{label} has a non-binary reward: {raw_reward!r}")
+    trial_name = row.get("trial_name")
+    result_path = row.get("result_path")
+    exception_type = row.get("exception_type")
+    if not isinstance(trial_name, str) or not trial_name:
+        raise ValueError(f"{label} has no trial_name")
+    if not isinstance(result_path, str) or not result_path:
+        raise ValueError(f"{label} has no result_path")
+    if exception_type is not None and not isinstance(exception_type, str):
+        raise ValueError(f"{label} has an invalid exception_type")
+    return {
+        "trial_name": trial_name,
+        "reward": reward,
+        "exception_type": exception_type,
+        "result_path": result_path,
+    }
+
+
+def _task_map(
+    report: dict[str, Any],
+    *,
+    label: str,
+) -> dict[str, dict[str, Any]]:
+    return {
+        str(row["task_name"]): _binary_attempt(row, label=f"{label} {row['task_name']}")
+        for row in _task_rows(report, label=label)
+    }
+
+
+def _normalized_same_setting_job_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(config))
+    normalized["job_name"] = "<same-setting-job>"
+    retry = normalized.get("retry") or {}
+    for key in ("include_exceptions", "exclude_exceptions"):
+        if isinstance(retry.get(key), list):
+            retry[key] = sorted(retry[key])
+    for dataset in normalized.get("datasets") or []:
+        dataset["task_names"] = []
+    for agent in normalized.get("agents") or []:
+        contract = (agent.get("kwargs") or {}).get("resume_contract") or {}
+        dataset = contract.get("dataset") or {}
+        dataset["task_names"] = []
+    return normalized
+
+
+def _config_resume_contract(config: dict[str, Any], *, label: str) -> dict[str, Any]:
+    agents = config.get("agents")
+    if not isinstance(agents, list) or not agents:
+        raise ValueError(f"{label} has no agents")
+    contracts: list[dict[str, Any]] = []
+    for agent in agents:
+        if not isinstance(agent, dict):
+            raise ValueError(f"{label} has an invalid agent")
+        contract = (agent.get("kwargs") or {}).get("resume_contract")
+        if not isinstance(contract, dict):
+            raise ValueError(f"{label} agent has no resume contract")
+        contracts.append(contract)
+    if any(contract != contracts[0] for contract in contracts[1:]):
+        raise ValueError(f"{label} agents have inconsistent resume contracts")
+    return contracts[0]
+
+
+def _validate_expected_skill_root(
+    report: dict[str, Any],
+    expected_skill_root: Path,
+) -> None:
+    provenance = report.get("provenance") or {}
+    contract = provenance.get("resume_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("aggregate report has no resume contract")
+    skills = contract.get("skills") or {}
+    roots = skills.get("roots") or []
+    hashes = skills.get("tree_sha256") or []
+    expected_skill_root = expected_skill_root.expanduser().resolve()
+    try:
+        resolved_roots = [str(Path(str(root)).expanduser().resolve()) for root in roots]
+    except (OSError, ValueError) as exc:
+        raise ValueError("aggregate report has an invalid skill root") from exc
+    if resolved_roots != [str(expected_skill_root)]:
+        raise ValueError(
+            "aggregate skill root differs from the requested base skill root"
+        )
+    current_hash = sha256_tree(expected_skill_root)
+    if hashes != [current_hash]:
+        raise ValueError("aggregate skill tree differs from the requested base skills")
+
+
+def validate_taskwise_or_aggregate(
+    report: dict[str, Any],
+    path: Path,
+    *,
+    expected_skill_root: Path | None = None,
+) -> list[tuple[dict[str, Any], Path, dict[str, Any]]]:
+    """Validate a taskwise OR report against both immutable source reports."""
+
+    if report.get("kind") != TASKWISE_OR_AGGREGATE_KIND:
+        raise ValueError("report is not a taskwise OR aggregate")
+    evaluation = report.get("evaluation")
+    top_level_rows = report.get("tasks")
+    evaluation_rows = evaluation.get("tasks") if isinstance(evaluation, dict) else None
+    if (
+        not isinstance(top_level_rows, list)
+        or not top_level_rows
+        or not all(isinstance(row, dict) for row in top_level_rows)
+        or evaluation_rows != top_level_rows
+    ):
+        raise ValueError(
+            "taskwise OR top-level tasks must be non-empty and equal evaluation.tasks"
+        )
+    ordered_task_names = [str(row.get("task_name") or "") for row in top_level_rows]
+    if ordered_task_names != sorted(ordered_task_names):
+        raise ValueError("taskwise OR tasks are not in canonical task-name order")
+    if report.get("sampling_policy") != TASKWISE_OR_SAMPLING_POLICY:
+        raise ValueError("taskwise OR sampling policy changed")
+    lineage = report.get("lineage")
+    if not isinstance(lineage, dict):
+        raise ValueError("taskwise OR report has no lineage")
+    if lineage.get("aggregation") != "taskwise_max_binary_reward":
+        raise ValueError("taskwise OR report has an invalid aggregation policy")
+    if lineage.get("tie_breaker") != "prefer_sample_1":
+        raise ValueError("taskwise OR report has an invalid tie breaker")
+    sources = lineage.get("sources")
+    if not isinstance(sources, list) or len(sources) != 2:
+        raise ValueError("taskwise OR report must have exactly two sources")
+    if (
+        not all(isinstance(source, dict) for source in sources)
+        or [source.get("sample") for source in sources] != [1, 2]
+        or any(type(source.get("sample")) is not int for source in sources)
+    ):
+        raise ValueError("taskwise OR sources must be ordered samples 1 and 2")
+
+    loaded_sources: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            raise ValueError("taskwise OR source metadata must be an object")
+        source_path_value = source.get("report_path")
+        if not isinstance(source_path_value, str) or not source_path_value:
+            raise ValueError("taskwise OR source has no report_path")
+        source_path = Path(source_path_value).expanduser().resolve()
+        if source_path == path.expanduser().resolve():
+            raise ValueError("taskwise OR report cannot reference itself")
+        if not source_path.is_file():
+            raise ValueError(f"taskwise OR source report is missing: {source_path}")
+        if source.get("report_sha256") != sha256_file(source_path):
+            raise ValueError(f"taskwise OR source report hash changed: {source_path}")
+        try:
+            source_report = json.loads(source_path.read_text(errors="strict"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid taskwise OR source report: {source_path}"
+            ) from exc
+        if not isinstance(source_report, dict):
+            raise ValueError(
+                f"taskwise OR source report is not an object: {source_path}"
+            )
+        if source_report.get("kind") == TASKWISE_OR_AGGREGATE_KIND:
+            raise ValueError("nested taskwise OR source reports are unsupported")
+        if source.get("run_id") != source_report.get("run_id"):
+            raise ValueError("taskwise OR source run_id changed")
+        source_rows = _task_rows(source_report, label=f"Source {source['sample']}")
+        if type(source.get("n_tasks")) is not int or source.get("n_tasks") != len(
+            source_rows
+        ):
+            raise ValueError("taskwise OR source task count changed")
+        source_job_dir = (source_report.get("evaluation") or {}).get("job_dir")
+        if not isinstance(source_job_dir, str) or not source_job_dir:
+            raise ValueError("taskwise OR source has no evaluation.job_dir")
+        if (
+            Path(str(source.get("job_dir") or "")).expanduser().resolve()
+            != Path(source_job_dir).expanduser().resolve()
+        ):
+            raise ValueError("taskwise OR source job_dir changed")
+        validate_source_aggregate(
+            source_report,
+            source_path,
+            expected_run_id=str(source["run_id"]),
+            expected_benchmark_name="deepswe",
+        )
+        loaded_sources.append((source, source_path, source_report))
+
+    expected_lineage_sha256 = hashlib.sha256(
+        json.dumps(lineage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("taskwise OR report has no provenance")
+    if provenance.get("benchmark_name") != "deepswe":
+        raise ValueError("taskwise OR provenance benchmark changed")
+    if provenance.get("lineage_sha256") != expected_lineage_sha256:
+        raise ValueError("taskwise OR lineage hash mismatch")
+    source_contracts = [
+        (source_report.get("provenance") or {}).get("resume_contract")
+        for _source, _source_path, source_report in loaded_sources
+    ]
+    if provenance.get("resume_contract") != source_contracts[0]:
+        raise ValueError("taskwise OR provenance resume contract changed")
+    if not all(isinstance(contract, dict) for contract in source_contracts):
+        raise ValueError("taskwise OR source resume contract is missing")
+    for key in (
+        "version",
+        "artifact_hook_version",
+        "artifact_hook_enabled",
+        "force_agent_internet",
+        "provider",
+        "agent_parameters",
+        "skills",
+        "runtime_knobs",
+        "dependency_versions",
+        "code_sha256",
+    ):
+        if source_contracts[1].get(key) != source_contracts[0].get(key):
+            raise ValueError(f"taskwise OR source contract differs at {key}")
+    first_dataset = source_contracts[0].get("dataset") or {}
+    second_dataset = source_contracts[1].get("dataset") or {}
+    for key in ("path", "tree_sha256"):
+        if second_dataset.get(key) != first_dataset.get(key):
+            raise ValueError(f"taskwise OR source dataset differs at {key}")
+    contract_skills = source_contracts[0].get("skills") or {}
+    skill_roots = contract_skills.get("roots") or []
+    skill_hashes = contract_skills.get("tree_sha256") or []
+    if (
+        len(skill_roots) != 1
+        or len(skill_hashes) != 1
+        or report.get("skills")
+        != {
+            "root": skill_roots[0],
+            "tree_sha256": skill_hashes[0],
+        }
+    ):
+        raise ValueError("taskwise OR skill identity changed")
+    skill_root = Path(str(skill_roots[0])).expanduser().resolve()
+    if not skill_root.is_dir() or sha256_tree(skill_root) != skill_hashes[0]:
+        raise ValueError("taskwise OR skill tree changed")
+    if (
+        expected_skill_root is not None
+        and skill_root != expected_skill_root.expanduser().resolve()
+    ):
+        raise ValueError(
+            "taskwise OR skill root differs from the requested base skill root"
+        )
+
+    source_configs: list[dict[str, Any]] = []
+    for index, (source, _source_path, source_report) in enumerate(loaded_sources):
+        job_dir = Path(str(source["job_dir"])).expanduser().resolve()
+        config_path = job_dir / "config.json"
+        if not config_path.is_file():
+            raise ValueError(f"taskwise OR source config is missing: {config_path}")
+        source_provenance = source_report.get("provenance") or {}
+        if source_provenance.get("job_config_sha256") != sha256_file(config_path):
+            raise ValueError(f"taskwise OR source config hash changed: {config_path}")
+        try:
+            config = json.loads(config_path.read_text(errors="strict"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid taskwise OR source config: {config_path}"
+            ) from exc
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"taskwise OR source config is not an object: {config_path}"
+            )
+        if (
+            _config_resume_contract(
+                config,
+                label=f"Taskwise OR source {source['sample']} config",
+            )
+            != source_contracts[index]
+        ):
+            raise ValueError(
+                f"taskwise OR source {source['sample']} report contract "
+                "differs from its job config"
+            )
+        source_configs.append(_normalized_same_setting_job_config(config))
+    if source_configs[0] != source_configs[1]:
+        raise ValueError("taskwise OR job configs differ beyond job/task identity")
+
+    first = _task_map(loaded_sources[0][2], label="Sample 1")
+    second = _task_map(loaded_sources[1][2], label="Sample 2")
+    expected_second = {
+        task_name for task_name, attempt in first.items() if attempt["reward"] == 0.0
+    }
+    if set(second) != expected_second:
+        raise ValueError(
+            "taskwise OR sample 2 task set is not sample 1 reward-zero set"
+        )
+    merged_rows = _task_rows(report, label="Taskwise OR report")
+    if {str(row["task_name"]) for row in merged_rows} != set(first):
+        raise ValueError("taskwise OR merged task set differs from sample 1")
+
+    resolved = 0
+    selected_exceptions = 0
+    for row in merged_rows:
+        task_name = str(row["task_name"])
+        first_attempt = first[task_name]
+        second_attempt = second.get(task_name)
+        attempts = row.get("attempts")
+        if not isinstance(attempts, dict):
+            raise ValueError(f"taskwise OR row has no attempts: {task_name}")
+        nested_first = attempts.get("sample_1")
+        nested_second = attempts.get("sample_2")
+        if (
+            not isinstance(nested_first, dict)
+            or _binary_attempt(nested_first, label=f"Merged sample 1 {task_name}")
+            != first_attempt
+        ):
+            raise ValueError(f"taskwise OR sample 1 attempt changed: {task_name}")
+        if nested_second is not None and not isinstance(nested_second, dict):
+            raise ValueError(f"taskwise OR sample 2 attempt is invalid: {task_name}")
+        normalized_second = (
+            _binary_attempt(nested_second, label=f"Merged sample 2 {task_name}")
+            if isinstance(nested_second, dict)
+            else None
+        )
+        if normalized_second != second_attempt:
+            raise ValueError(f"taskwise OR sample 2 attempt changed: {task_name}")
+        selected_sample = (
+            2
+            if second_attempt is not None
+            and second_attempt["reward"] > first_attempt["reward"]
+            else 1
+        )
+        selected = second_attempt if selected_sample == 2 else first_attempt
+        if (
+            type(row.get("selected_sample")) is not int
+            or row.get("selected_sample") != selected_sample
+        ):
+            raise ValueError(f"taskwise OR selected_sample changed: {task_name}")
+        if _binary_attempt(row, label=f"Merged row {task_name}") != selected:
+            raise ValueError(f"taskwise OR selected result changed: {task_name}")
+        resolved += int(selected["reward"] == 1.0)
+        selected_exceptions += int(selected["exception_type"] is not None)
+
+    task_names = sorted(first)
+    expected_task_hash = hashlib.sha256(
+        ("\n".join(task_names) + "\n").encode("utf-8")
+    ).hexdigest()
+    if provenance.get("task_set_sha256") != expected_task_hash:
+        raise ValueError("taskwise OR task set hash mismatch")
+    if not isinstance(evaluation, dict):
+        raise ValueError("taskwise OR report has no evaluation")
+    total = len(first)
+    expected_mean = resolved / total if total else 0.0
+    if (
+        type(evaluation.get("n_trials")) is not int
+        or evaluation.get("n_trials") != total
+        or type(evaluation.get("resolved")) is not int
+        or evaluation.get("resolved") != resolved
+        or type(evaluation.get("n_errors")) is not int
+        or evaluation.get("n_errors") != selected_exceptions
+        or isinstance(evaluation.get("mean_reward"), bool)
+        or evaluation.get("mean_reward") != expected_mean
+        or evaluation.get("tasks") != merged_rows
+    ):
+        raise ValueError("taskwise OR evaluation summary is inconsistent")
+    if (
+        evaluation.get("job_name") != report.get("run_id")
+        or evaluation.get("job_dir_role") != "sample_1_config_anchor"
+        or Path(str(evaluation.get("job_dir") or "")).expanduser().resolve()
+        != Path(str(sources[0]["job_dir"])).expanduser().resolve()
+    ):
+        raise ValueError("taskwise OR evaluation source anchor changed")
+    completeness = report.get("completeness")
+    if not isinstance(completeness, dict) or (
+        type(completeness.get("expected_trials")) is not int
+        or completeness.get("expected_trials") != total
+        or type(completeness.get("trial_result_files")) is not int
+        or completeness.get("trial_result_files") != total
+        or type(completeness.get("infra_invalid_trials")) is not int
+        or completeness.get("infra_invalid_trials") != 0
+        or not completeness.get("aggregated_at")
+        or completeness.get("aggregated_at") != report.get("created_at")
+    ):
+        raise ValueError("taskwise OR completeness is inconsistent")
+    return loaded_sources
+
+
 def validate_source_aggregate(
     report: dict[str, Any],
     path: Path,
     *,
     expected_run_id: str | None = None,
     expected_benchmark_name: str | None = None,
+    expected_skill_root: Path | None = None,
 ) -> None:
     invalid = list(report.get("infra_invalid_trials") or [])
     rows = report.get("tasks") or (report.get("evaluation") or {}).get("tasks") or []
@@ -138,6 +545,24 @@ def validate_source_aggregate(
             f" benchmark={report.get('benchmark_name')!r} "
             f"expected_benchmark={expected_benchmark_name!r}"
         )
+    if report.get("kind") == TASKWISE_OR_AGGREGATE_KIND:
+        try:
+            validate_taskwise_or_aggregate(
+                report,
+                path,
+                expected_skill_root=expected_skill_root,
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                f"Refusing invalid taskwise OR aggregate {path}: {exc}"
+            ) from exc
+    elif expected_skill_root is not None:
+        try:
+            _validate_expected_skill_root(report, expected_skill_root)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Refusing aggregate with a different base skill setting {path}: {exc}"
+            ) from exc
 
 
 def materialization_is_reusable(
@@ -273,6 +698,7 @@ def run_materialization(args: argparse.Namespace) -> None:
         args.source_aggregate,
         expected_run_id=args.source_run_id,
         expected_benchmark_name=args.benchmark_name,
+        expected_skill_root=args.base_skill_root,
     )
 
     input_fingerprints = {

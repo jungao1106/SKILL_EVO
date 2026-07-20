@@ -13,6 +13,15 @@ from unittest import mock
 from evolution.score import summarize_job
 from providers import populate_anthropic_provider_env, resolve_provider
 from scripts import run_deepswe_full_evolution as full_evolution
+from scripts.materialize_deepswe_tts_evolution_gates import (
+    TASKWISE_OR_SAMPLING_POLICY,
+    sha256_tree,
+)
+from scripts.run_deepswe_setting_bon import (
+    Setting,
+    build_merged_score_report,
+    combine_task_rows,
+)
 
 
 class AnthropicProviderEnvironmentTest(unittest.TestCase):
@@ -160,6 +169,132 @@ class ExistingFrozenReportTest(unittest.TestCase):
 
             self.assertEqual(validated, report_path.resolve())
 
+    def test_accepts_taskwise_or_after_validating_both_source_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            (root / "first").mkdir()
+            (root / "second").mkdir()
+            first_path, first_tasks, first_report, first_job = self._fixture(
+                root / "first",
+                run_id="sample-1",
+                n_trials=3,
+            )
+            second_path, _, second_report, second_job = self._fixture(
+                root / "second",
+                run_id="sample-2",
+                n_trials=2,
+            )
+            second_results = sorted(second_job.glob("*/result.json"))
+            for result_path, task_name, reward in (
+                (second_results[0], first_tasks[0], 1),
+                (second_results[1], first_tasks[2], 0),
+            ):
+                result = json.loads(result_path.read_text())
+                result["task_name"] = task_name
+                result["verifier_result"]["rewards"]["reward"] = reward
+                result_path.write_text(json.dumps(result))
+            second_evaluation = summarize_job(second_job)
+            second_report["evaluation"] = second_evaluation
+            second_report["tasks"] = second_evaluation["tasks"]
+            second_report["provenance"]["task_set_sha256"] = (
+                full_evolution.task_set_sha256(
+                    [row["task_name"] for row in second_evaluation["tasks"]]
+                )
+            )
+
+            skill_root = root / "skills"
+            skill_root.mkdir()
+            contract = {
+                "version": 1,
+                "skills": {
+                    "roots": [str(skill_root)],
+                    "tree_sha256": [sha256_tree(skill_root)],
+                },
+                "dataset": {"path": "dataset", "tree_sha256": "dataset-hash"},
+            }
+            first_report["provenance"]["resume_contract"] = contract
+            second_report["provenance"]["resume_contract"] = contract
+            for job_dir, source_report in (
+                (first_job, first_report),
+                (second_job, second_report),
+            ):
+                source_tasks = [
+                    row["task_name"] for row in source_report["evaluation"]["tasks"]
+                ]
+                config_path = job_dir / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "job_name": job_dir.name,
+                            "retry": {
+                                "include_exceptions": [],
+                                "exclude_exceptions": [],
+                            },
+                            "datasets": [{"task_names": source_tasks}],
+                            "agents": [{"kwargs": {"resume_contract": contract}}],
+                        }
+                    )
+                )
+                source_report["provenance"]["job_config_sha256"] = hashlib.sha256(
+                    config_path.read_bytes()
+                ).hexdigest()
+            first_path.write_text(json.dumps(first_report))
+            second_path.write_text(json.dumps(second_report))
+            combined = combine_task_rows(first_report["tasks"], second_report["tasks"])
+            merged = build_merged_score_report(
+                setting=Setting("frozen", 0, first_path, skill_root),
+                source_report=first_report,
+                skill_tree_sha256=sha256_tree(skill_root),
+                sample_2_report=second_report,
+                sample_2_report_path=second_path,
+                best_of_2_report={
+                    "kind": "deepswe_same_setting_best_of_2",
+                    "complete": True,
+                    "setting": "frozen",
+                    "sampling_policy": dict(TASKWISE_OR_SAMPLING_POLICY),
+                    "tasks": combined,
+                },
+            )
+            merged_path = root / "merged_score_report.json"
+            merged_path.write_text(json.dumps(merged))
+
+            def identity(job_dir: Path) -> tuple[list[str], int]:
+                return [], len(list(job_dir.glob("*/result.json")))
+
+            with (
+                mock.patch.object(
+                    full_evolution,
+                    "infra_invalid_trials",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    full_evolution,
+                    "job_identity_issues",
+                    side_effect=identity,
+                ),
+            ):
+                validated = full_evolution.validate_existing_frozen_report(
+                    merged_path,
+                    expected_trials=3,
+                    expected_run_id=str(merged["run_id"]),
+                    expected_task_names=first_tasks,
+                    expected_skill_root=skill_root,
+                )
+
+                other_skill_root = root / "other-skills"
+                other_skill_root.mkdir()
+                with self.assertRaisesRegex(ValueError, "requested base skill root"):
+                    full_evolution.validate_existing_frozen_report(
+                        merged_path,
+                        expected_trials=3,
+                        expected_run_id=str(merged["run_id"]),
+                        expected_task_names=first_tasks,
+                        expected_skill_root=other_skill_root,
+                    )
+
+            self.assertEqual(validated, merged_path.resolve())
+            self.assertEqual(merged["evaluation"]["resolved"], 2)
+
     def test_rejects_incomplete_mismatched_or_infra_invalid_report(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             report_path, task_names, report, _ = self._fixture(Path(raw_dir))
@@ -226,6 +361,25 @@ class ExistingFrozenReportTest(unittest.TestCase):
 
 
 class ExistingFrozenEvolutionFlowTest(unittest.TestCase):
+    def test_code_change_allowance_requires_an_existing_frozen_report(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            args = SimpleNamespace(
+                dataset=root / "dataset",
+                base_skill_root=root / "skills",
+                policy_state=root / "policy.json",
+                env_file=root / ".env",
+                python=root / "python",
+                existing_frozen_report=None,
+                allow_run_benchmark_code_change=True,
+            )
+
+            with self.assertRaisesRegex(
+                SystemExit,
+                "requires --existing-frozen-report",
+            ):
+                full_evolution.run_full(args, root / "state.json")
+
     def test_reusing_frozen_report_still_runs_gate_1_and_later_gates(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -266,6 +420,7 @@ class ExistingFrozenEvolutionFlowTest(unittest.TestCase):
                 recovery_rounds=4,
                 max_gate=4,
                 existing_frozen_report=existing_report,
+                allow_run_benchmark_code_change=False,
             )
             state_path = root / "run" / "state.json"
             gate1_report = root / "gate1" / "score_report.json"
@@ -291,6 +446,11 @@ class ExistingFrozenEvolutionFlowTest(unittest.TestCase):
                 ) as validate_report,
                 mock.patch.object(
                     full_evolution,
+                    "validate_reused_frozen_execution",
+                    return_value={"code_mismatches": {}},
+                ) as validate_execution,
+                mock.patch.object(
+                    full_evolution,
                     "run_eval_until_valid",
                     return_value=gate1_report,
                 ) as run_eval,
@@ -303,6 +463,19 @@ class ExistingFrozenEvolutionFlowTest(unittest.TestCase):
                 full_evolution.run_full(args, state_path)
 
             validate_report.assert_called_once()
+            validate_execution.assert_called_once()
+            self.assertEqual(
+                validate_execution.call_args.args[:2],
+                (args, existing_report.resolve()),
+            )
+            runtime_environment = validate_execution.call_args.kwargs[
+                "runtime_environment"
+            ]
+            self.assertEqual(runtime_environment["TIMEOUT_MULTIPLIER"], "1.0")
+            self.assertEqual(
+                runtime_environment["AGENT_SETUP_TIMEOUT_MULTIPLIER"],
+                "2.0",
+            )
             self.assertEqual(run_eval.call_count, 1)
             self.assertEqual(
                 run_eval.call_args.kwargs["job_name"], "tts-run_gate001_eval"
@@ -329,6 +502,10 @@ class ExistingFrozenEvolutionFlowTest(unittest.TestCase):
             self.assertEqual(subset[subset.index("--max-gate") + 1], "4")
             state = json.loads(state_path.read_text())
             self.assertTrue(state["frozen_report_reused"])
+            self.assertEqual(
+                state["frozen_execution_contract"],
+                {"code_mismatches": {}},
+            )
             self.assertEqual(state["status"], "complete")
 
 

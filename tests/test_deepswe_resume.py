@@ -17,6 +17,7 @@ from scripts.materialize_deepswe_tts_evolution_gates import (
 from scripts.attach_deepswe_gate_report import attach_gate_report
 from scripts.aggregate_benchmark_job import reconcile_root_job_stats
 from scripts.run_benchmark import (
+    DEEPSWE_RESUME_INTERRUPTED_EXCEPTIONS,
     DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS,
     _deepswe_result_infra_reason,
     _archive_deepswe_infra_trials,
@@ -339,6 +340,30 @@ class JobResumeStateTest(unittest.TestCase):
                 None,
                 exception_type="DeepSweProviderTransientError",
             )
+            cancelled_missing = write_trial(
+                "cancelled-missing",
+                None,
+                exception_type="CancelledError",
+            )
+            cancelled_failed = write_trial(
+                "cancelled-failed",
+                0,
+                exception_type="CancelledError",
+            )
+            cancelled_negative = write_trial(
+                "cancelled-negative",
+                -1,
+                exception_type="CancelledError",
+            )
+            cancelled_passed = write_trial(
+                "cancelled-passed",
+                1,
+                exception_type="CancelledError",
+            )
+            cancelled_binary_bytes = {
+                path.name: (path / "result.json").read_bytes()
+                for path in (cancelled_failed, cancelled_passed)
+            }
             partial = job_dir / "partial"
             partial.mkdir()
             (partial / "config.json").write_text("not json")
@@ -347,12 +372,41 @@ class JobResumeStateTest(unittest.TestCase):
 
             self.assertEqual(
                 {row["trial_name"] for row in archived},
-                {"partial", "provider-transient"},
+                {
+                    "cancelled-missing",
+                    "cancelled-negative",
+                    "partial",
+                    "provider-transient",
+                },
+            )
+            self.assertEqual(
+                next(
+                    row["reason"]
+                    for row in archived
+                    if row["trial_name"] == "cancelled-missing"
+                ),
+                "interrupted:CancelledError:invalid-verifier-result:missing",
             )
             self.assertTrue((job_dir / "infra").exists())
             self.assertTrue((job_dir / "auth").exists())
             self.assertFalse((job_dir / "partial").exists())
             self.assertFalse(transient.exists())
+            self.assertFalse(cancelled_missing.exists())
+            self.assertFalse(cancelled_negative.exists())
+            self.assertEqual(
+                next(
+                    row["reason"]
+                    for row in archived
+                    if row["trial_name"] == "cancelled-negative"
+                ),
+                "interrupted:CancelledError:negative-reward:-1",
+            )
+            for path in (cancelled_failed, cancelled_passed):
+                self.assertTrue(path.exists())
+                self.assertEqual(
+                    (path / "result.json").read_bytes(),
+                    cancelled_binary_bytes[path.name],
+                )
             self.assertTrue(agent_timeout.exists())
             self.assertTrue(verifier_timeout.exists())
             self.assertTrue(ambiguous_timeout.exists())
@@ -432,6 +486,39 @@ class JobResumeStateTest(unittest.TestCase):
             _deepswe_result_infra_reason(result),
             "exception:DeepSweProviderRequestError",
         )
+
+    def test_cancelled_result_is_resumed_only_without_binary_reward(self) -> None:
+        self.assertIn("CancelledError", DEEPSWE_RESUME_INTERRUPTED_EXCEPTIONS)
+        self.assertTrue(
+            DEEPSWE_RESUME_INTERRUPTED_EXCEPTIONS.isdisjoint(
+                DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS
+            )
+        )
+        for reward in (0, 0.0, 1, 1.0):
+            result = {
+                "verifier_result": {"rewards": {"reward": reward}},
+                "exception_info": {"exception_type": "CancelledError"},
+            }
+            self.assertIsNone(_deepswe_result_infra_reason(result))
+
+        for verifier_result, expected in (
+            (None, "invalid-verifier-result:missing"),
+            ({"rewards": {}}, "invalid-verifier-result:non-numeric-reward"),
+            (
+                {"rewards": {"reward": True}},
+                "invalid-verifier-result:non-numeric-reward",
+            ),
+            (
+                {"rewards": {"reward": 0.5}},
+                "invalid-verifier-result:out-of-domain-reward:0.5",
+            ),
+            ({"rewards": {"reward": -1}}, "negative-reward:-1"),
+        ):
+            result = {
+                "verifier_result": verifier_result,
+                "exception_info": {"exception_type": "CancelledError"},
+            }
+            self.assertEqual(_deepswe_result_infra_reason(result), expected)
 
 
 class DeepSweConfigMigrationTest(unittest.TestCase):

@@ -75,8 +75,12 @@ DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS = {
     "TimeoutException",
     "WriteError",
 }
+DEEPSWE_RESUME_INTERRUPTED_EXCEPTIONS = {
+    "CancelledError",
+}
 DEEPSWE_VALID_AGENT_OUTCOME_EXCEPTIONS = {
     "AgentTimeoutError",
+    "CancelledError",
     "NonZeroAgentExitCodeError",
 }
 
@@ -2829,9 +2833,16 @@ def _archive_deepswe_infra_trials(
         if normalization is not None:
             result = json.loads(result_path.read_text(errors="replace"))
         reason = _deepswe_result_infra_reason(result)
-        if reason is None or reason.startswith("negative-reward:"):
+        if reason is None:
             continue
-        if exception_type in DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS:
+        if (
+            exception_type in DEEPSWE_RESUME_INTERRUPTED_EXCEPTIONS
+            and reason.startswith(("invalid-verifier-result:", "negative-reward:"))
+        ):
+            candidates.append((trial_dir, f"interrupted:{exception_type}:{reason}"))
+        elif reason.startswith("negative-reward:"):
+            continue
+        elif exception_type in DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS:
             candidates.append((trial_dir, f"exception:{exception_type}"))
         elif not exception_type:
             candidates.append((trial_dir, reason))

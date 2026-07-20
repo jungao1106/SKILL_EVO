@@ -26,6 +26,14 @@ from scripts.aggregate_benchmark_job import (  # noqa: E402
     job_identity_issues,
 )
 from scripts.job_run_lock import exclusive_job_run  # noqa: E402
+from scripts.materialize_deepswe_tts_evolution_gates import (  # noqa: E402
+    TASKWISE_OR_AGGREGATE_KIND,
+    validate_taskwise_or_aggregate,
+)
+from scripts.run_deepswe_setting_bon import (  # noqa: E402
+    validate_requested_execution,
+    validate_skill_contract,
+)
 
 
 DEFAULT_PYTHON = Path(
@@ -201,12 +209,73 @@ def task_set_sha256(task_names: list[str]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def validate_reused_frozen_execution(
+    args: argparse.Namespace,
+    report_path: Path,
+    *,
+    runtime_environment: dict[str, str],
+) -> dict[str, Any]:
+    """Bind a reused frozen report to the exact downstream execution settings."""
+
+    try:
+        report = json.loads(report_path.read_text(errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid frozen execution report: {report_path}: {exc}") from exc
+    if not isinstance(report, dict):
+        raise ValueError("Frozen execution report must contain a JSON object")
+    skill_tree_sha256 = validate_skill_contract(report, args.base_skill_root)
+    requested = argparse.Namespace(
+        benchmark_name="deepswe",
+        harness="claude-code",
+        provider=args.provider,
+        provider_model=args.model,
+        provider_anthropic_base_url=None,
+        provider_base_url=None,
+        provider_api=None,
+        dataset=args.dataset,
+        env_file=args.env_file,
+        claude_max_turns=None,
+        claude_max_budget_usd=None,
+        agent_timeout_sec=args.agent_timeout_sec,
+        agent_setup_timeout_sec=args.agent_setup_timeout_sec,
+        e2b_sandbox_timeout_sec=14400,
+        claude_sdk_version=args.claude_sdk_version,
+        pi_version=args.pi_version,
+        concurrency=args.concurrency,
+    )
+    allowed_code_changes = (
+        frozenset({"scripts/run_benchmark.py"})
+        if getattr(args, "allow_run_benchmark_code_change", False)
+        else frozenset()
+    )
+    audit = validate_requested_execution(
+        requested,
+        report,
+        args.base_skill_root,
+        allowed_code_changes=allowed_code_changes,
+        runtime_environment=runtime_environment,
+    )
+    return {
+        "report_path": str(report_path),
+        "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "base_skill_root": str(args.base_skill_root),
+        "base_skill_tree_sha256": skill_tree_sha256,
+        "code_change_reason": (
+            "explicit run_benchmark infrastructure repair"
+            if allowed_code_changes
+            else None
+        ),
+        **audit,
+    }
+
+
 def validate_existing_frozen_report(
     path: Path,
     *,
     expected_trials: int,
     expected_run_id: str,
     expected_task_names: list[str],
+    expected_skill_root: Path | None = None,
 ) -> Path:
     """Validate a frozen aggregate and its authoritative trial results."""
 
@@ -238,6 +307,7 @@ def validate_existing_frozen_report(
     require(report.get("run_id") == expected_run_id, "run_id mismatch")
     require(report.get("benchmark_name") == "deepswe", "benchmark must be deepswe")
     require(report.get("infra_invalid_trials") == [], "infra-invalid trials remain")
+    is_taskwise_or = report.get("kind") == TASKWISE_OR_AGGREGATE_KIND
 
     completeness = report.get("completeness")
     require(isinstance(completeness, dict), "missing completeness object")
@@ -256,7 +326,16 @@ def validate_existing_frozen_report(
         and completeness["infra_invalid_trials"] == 0,
         "completeness.infra_invalid_trials must be 0",
     )
-    require(bool(completeness.get("finished_at")), "missing completeness.finished_at")
+    if is_taskwise_or:
+        require(
+            bool(completeness.get("aggregated_at")),
+            "missing completeness.aggregated_at",
+        )
+    else:
+        require(
+            bool(completeness.get("finished_at")),
+            "missing completeness.finished_at",
+        )
 
     evaluation = report.get("evaluation")
     require(isinstance(evaluation, dict), "missing evaluation object")
@@ -302,6 +381,36 @@ def validate_existing_frozen_report(
         sorted(observed_task_names) == sorted(expected_task_names),
         "task set does not match the requested dataset",
     )
+
+    if is_taskwise_or:
+        try:
+            source_reports = validate_taskwise_or_aggregate(
+                report,
+                report_path,
+                expected_skill_root=expected_skill_root,
+            )
+        except (ValueError, SystemExit) as exc:
+            raise ValueError(
+                "Existing frozen score report failed validation: "
+                f"invalid taskwise OR lineage: {exc}"
+            ) from exc
+        for source, source_path, source_report in source_reports:
+            source_rows = source_report.get("tasks") or (
+                source_report.get("evaluation") or {}
+            ).get("tasks")
+            require(
+                isinstance(source_rows, list)
+                and all(isinstance(row, dict) for row in source_rows),
+                f"sample {source['sample']} source tasks are invalid",
+            )
+            source_task_names = [str(row.get("task_name") or "") for row in source_rows]
+            validate_existing_frozen_report(
+                source_path,
+                expected_trials=len(source_task_names),
+                expected_run_id=str(source["run_id"]),
+                expected_task_names=source_task_names,
+            )
+        return report_path
 
     job_dir_value = evaluation.get("job_dir")
     require(
@@ -513,6 +622,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-setup-timeout-sec", type=int, default=1200)
     parser.add_argument("--recovery-rounds", type=int, default=4)
     parser.add_argument("--max-gate", type=int, default=4)
+    parser.add_argument(
+        "--allow-run-benchmark-code-change",
+        action="store_true",
+        help=(
+            "Allow exactly scripts/run_benchmark.py to differ from a reused frozen "
+            "report, for an explicitly audited infrastructure repair."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -524,6 +641,13 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     args.python = absolute_path_preserving_symlinks(args.python)
     if args.existing_frozen_report is not None:
         args.existing_frozen_report = args.existing_frozen_report.expanduser().resolve()
+    if (
+        getattr(args, "allow_run_benchmark_code_change", False)
+        and args.existing_frozen_report is None
+    ):
+        raise SystemExit(
+            "--allow-run-benchmark-code-change requires --existing-frozen-report"
+        )
     if not 2 <= args.max_gate <= 4:
         raise SystemExit("--max-gate must be between 2 and 4.")
     for path, label in (
@@ -564,12 +688,18 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
             "PI_THINKING": "off",
             "OPENAI_COMPAT_REASONING_EFFORT": "none",
             "OPENAI_COMPAT_ENABLE_THINKING": "false",
-            "NOVITA_REASONING_EFFORT": "none",
-            "NOVITA_ENABLE_THINKING": "false",
+            f"{provider.env_prefix}_REASONING_EFFORT": "none",
+            f"{provider.env_prefix}_ENABLE_THINKING": "false",
             "FORCE_AGENT_INTERNET": "1",
             "PI_USE_SKILL_HARNESS_MEMORY": "false",
             "CLAUDE_USE_SKILL_HARNESS_MEMORY": "false",
             "PI_SKILL_RETRIEVAL_SCOPE": "transfer",
+            "TIMEOUT_MULTIPLIER": "1.0",
+            "AGENT_TIMEOUT_MULTIPLIER": "",
+            "VERIFIER_TIMEOUT_MULTIPLIER": "",
+            "AGENT_SETUP_TIMEOUT_MULTIPLIER": "2.0",
+            "ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER": "2.0",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "",
             "CLAUDE_AGENT_SDK_VERSION": args.claude_sdk_version,
             "PI_CODING_AGENT_VERSION": args.pi_version,
             "E2B_CONCURRENCY": str(args.concurrency),
@@ -618,6 +748,12 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
             expected_trials=expected_trials,
             expected_run_id=args.frozen_run_id,
             expected_task_names=expected_task_names,
+            expected_skill_root=args.base_skill_root,
+        )
+        state["frozen_execution_contract"] = validate_reused_frozen_execution(
+            args,
+            frozen_report,
+            runtime_environment=env,
         )
         state["frozen_report_reused"] = True
     else:

@@ -21,6 +21,7 @@ if str(ROOT) not in os.sys.path:
 
 from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
 from scripts.materialize_deepswe_tts_evolution_gates import (  # noqa: E402
+    TASKWISE_OR_SAMPLING_POLICY,
     sha256_file,
     sha256_tree,
     validate_source_aggregate,
@@ -217,13 +218,23 @@ def validate_requested_execution(
     args: argparse.Namespace,
     source_report: dict[str, Any],
     skill_root: Path,
-) -> None:
+    *,
+    allowed_code_changes: frozenset[str] = frozenset(),
+    runtime_environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
     source_contract = source_resume_contract(source_report)
     requested = subset_execution_payload(args, skill_root)
+    if runtime_environment is not None:
+        requested["runtime_knobs"] = {
+            name: runtime_environment.get(name)
+            for name in requested.get("runtime_knobs") or {}
+        }
     if source_contract.get("artifact_hook_version") != DEEPSWE_ARTIFACT_HOOK_VERSION:
         raise ValueError("Current artifact hook differs from the source setting")
     if source_contract.get("artifact_hook_enabled") is not True:
         raise ValueError("Source setting did not enable the required artifact hook")
+    if source_contract.get("force_agent_internet") is not True:
+        raise ValueError("Source setting did not force agent internet access")
     if source_contract.get("provider") != requested.get("provider"):
         raise ValueError(
             "Requested provider/endpoint/model differs from source setting"
@@ -258,11 +269,40 @@ def validate_requested_execution(
         "providers/specs.py",
         "scripts/run_benchmark.py",
     }
-    if any(
-        source_code.get(path) != requested_code.get(path)
+    unknown_allowed_paths = set(allowed_code_changes) - contract_code_paths
+    if unknown_allowed_paths:
+        raise ValueError(
+            "Code-change allowlist contains unprotected paths: "
+            + ", ".join(sorted(unknown_allowed_paths))
+        )
+    invalid_code_hashes = {
+        path
         for path in contract_code_paths
-    ):
-        raise ValueError("Current benchmark code differs from the source setting")
+        if not isinstance(source_code.get(path), str)
+        or len(source_code[path]) != 64
+        or not isinstance(requested_code.get(path), str)
+        or len(requested_code[path]) != 64
+    }
+    if invalid_code_hashes:
+        raise ValueError(
+            "Source or current execution has invalid protected code hashes: "
+            + ", ".join(sorted(invalid_code_hashes))
+        )
+    code_mismatches = {
+        path: {
+            "source_sha256": source_code[path],
+            "current_sha256": requested_code[path],
+        }
+        for path in contract_code_paths
+        if source_code[path] != requested_code[path]
+    }
+    if set(code_mismatches) != set(allowed_code_changes):
+        raise ValueError(
+            "Current benchmark code changes do not exactly match the explicit "
+            "allowlist: "
+            f"changed={sorted(code_mismatches)} "
+            f"allowed={sorted(allowed_code_changes)}"
+        )
 
     source_config = read_json(source_job_dir(source_report) / "config.json")
     agents = source_config.get("agents") or []
@@ -293,6 +333,27 @@ def validate_requested_execution(
                 f"Requested {label} differs from source setting: "
                 f"source={source_value} requested={requested_value}"
             )
+    return {
+        "protected_code_paths": sorted(contract_code_paths),
+        "allowed_code_changes": sorted(allowed_code_changes),
+        "code_mismatches": code_mismatches,
+        "requested_execution": {
+            "benchmark_name": requested.get("benchmark_name"),
+            "provider": requested.get("provider"),
+            "agent_parameters": requested.get("agent_parameters"),
+            "dataset": requested.get("dataset"),
+            "dataset_tree_sha256": requested.get("dataset_tree_sha256"),
+            "dependency_versions": requested.get("dependency_versions"),
+            "runtime_knobs": requested.get("runtime_knobs"),
+            "concurrency": args.concurrency,
+            "agent_timeout_sec": args.agent_timeout_sec,
+            "agent_setup_timeout_sec": args.agent_setup_timeout_sec,
+            "e2b_sandbox_timeout_sec": args.e2b_sandbox_timeout_sec,
+            "cpus": 2,
+            "memory_mb": 8192,
+            "storage_mb": 20480,
+        },
+    }
 
 
 def discover_settings(
@@ -426,14 +487,53 @@ def validate_source_report(report: dict[str, Any], path: Path) -> None:
         raise ValueError(f"Source report contains duplicate tasks: {path}")
 
 
+def binary_attempt(row: dict[str, Any], *, label: str) -> dict[str, Any]:
+    identity = str(row.get("task_name") or label)
+    reward = reward_value(row)
+    if reward not in {0.0, 1.0}:
+        raise ValueError(
+            f"{label} contains a non-binary reward: "
+            f"task={identity} reward={row.get('reward')!r}"
+        )
+    trial_name = row.get("trial_name")
+    result_path = row.get("result_path")
+    exception_type = row.get("exception_type")
+    if not isinstance(trial_name, str) or not trial_name:
+        raise ValueError(f"{label} task {identity} has no trial_name")
+    if not isinstance(result_path, str) or not result_path:
+        raise ValueError(f"{label} task {identity} has no result_path")
+    if exception_type is not None and not isinstance(exception_type, str):
+        raise ValueError(f"{label} task {identity} has an invalid exception_type")
+    return {
+        "trial_name": trial_name,
+        "reward": reward,
+        "exception_type": exception_type,
+        "result_path": result_path,
+    }
+
+
+def unique_task_rows(
+    rows: list[dict[str, Any]],
+    *,
+    label: str,
+) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    by_task: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for row in rows:
+        name = task_name(row)
+        if name in by_task:
+            raise ValueError(f"{label} contains duplicate task: {name}")
+        by_task[name] = (row, binary_attempt(row, label=label))
+    return by_task
+
+
 def combine_task_rows(
     first_rows: list[dict[str, Any]],
     second_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    first_by_task = {task_name(row): row for row in first_rows}
-    second_by_task = {task_name(row): row for row in second_rows}
+    first_by_task = unique_task_rows(first_rows, label="Sample 1")
+    second_by_task = unique_task_rows(second_rows, label="Sample 2")
     expected_second = {
-        name for name, row in first_by_task.items() if not is_reward_one(row)
+        name for name, (_, attempt) in first_by_task.items() if attempt["reward"] == 0.0
     }
     if set(second_by_task) != expected_second:
         missing = sorted(expected_second - set(second_by_task))
@@ -445,10 +545,11 @@ def combine_task_rows(
 
     combined: list[dict[str, Any]] = []
     for name in sorted(first_by_task):
-        first = first_by_task[name]
-        second = second_by_task.get(name)
-        first_reward = reward_value(first)
-        second_reward = reward_value(second) if second is not None else None
+        _, first = first_by_task[name]
+        second_pair = second_by_task.get(name)
+        second = second_pair[1] if second_pair is not None else None
+        first_reward = first["reward"]
+        second_reward = second["reward"] if second is not None else None
         rewards = [
             value for value in (first_reward, second_reward) if value is not None
         ]
@@ -456,27 +557,229 @@ def combine_task_rows(
         combined.append(
             {
                 "task_name": name,
-                "sample_1": {
-                    "trial_name": first.get("trial_name"),
-                    "reward": first_reward,
-                    "exception_type": first.get("exception_type"),
-                    "result_path": first.get("result_path"),
-                },
-                "sample_2": (
-                    {
-                        "trial_name": second.get("trial_name"),
-                        "reward": second_reward,
-                        "exception_type": second.get("exception_type"),
-                        "result_path": second.get("result_path"),
-                    }
-                    if second is not None
-                    else None
-                ),
+                "sample_1": first,
+                "sample_2": second,
                 "best_reward": best_reward,
                 "passed": best_reward == 1.0,
             }
         )
     return combined
+
+
+def merged_task_rows(combined_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    observed: set[str] = set()
+    for row in combined_rows:
+        name = task_name(row)
+        if name in observed:
+            raise ValueError(f"Combined report contains duplicate task: {name}")
+        observed.add(name)
+        first = row.get("sample_1")
+        second = row.get("sample_2")
+        if not isinstance(first, dict):
+            raise ValueError(f"Combined task {name} has no sample_1 attempt")
+        first_attempt = binary_attempt(first, label=f"Combined task {name} sample_1")
+        second_attempt = None
+        if second is not None:
+            if not isinstance(second, dict):
+                raise ValueError(f"Combined task {name} has invalid sample_2 attempt")
+            second_attempt = binary_attempt(
+                second,
+                label=f"Combined task {name} sample_2",
+            )
+
+        # Prefer sample 1 on a tie so a retry only replaces the source result when it
+        # strictly improves the binary reward.
+        selected_sample = 1
+        selected = first_attempt
+        if (
+            second_attempt is not None
+            and second_attempt["reward"] > first_attempt["reward"]
+        ):
+            selected_sample = 2
+            selected = second_attempt
+        best_reward = selected["reward"]
+        if "reward" in row:
+            raise ValueError(f"Combined task {name} unexpectedly has a raw reward")
+        if reward_value({"reward": row.get("best_reward")}) != best_reward:
+            raise ValueError(f"Combined task {name} has an inconsistent best_reward")
+        if row.get("passed") is not (best_reward == 1.0):
+            raise ValueError(f"Combined task {name} has an inconsistent passed flag")
+
+        merged.append(
+            {
+                "task_name": name,
+                "trial_name": selected["trial_name"],
+                "reward": best_reward,
+                "exception_type": selected["exception_type"],
+                "result_path": selected["result_path"],
+                "selected_sample": selected_sample,
+                "attempts": {
+                    "sample_1": first_attempt,
+                    "sample_2": second_attempt,
+                },
+            }
+        )
+    return merged
+
+
+def report_run_id(report: dict[str, Any], *, label: str) -> str:
+    value = report.get("run_id")
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} report has no run_id")
+    return value
+
+
+def task_set_sha256(rows: list[dict[str, Any]]) -> str:
+    names = sorted(task_name(row) for row in rows)
+    return hashlib.sha256(("\n".join(names) + "\n").encode("utf-8")).hexdigest()
+
+
+def validate_report_snapshot(
+    report: dict[str, Any],
+    path: Path,
+    *,
+    label: str,
+) -> Path:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"{label} report does not exist: {path}")
+    if read_json(path) != report:
+        raise ValueError(f"{label} report differs from its on-disk snapshot: {path}")
+    validate_source_report(report, path)
+    return path
+
+
+def build_merged_score_report(
+    *,
+    setting: Setting,
+    source_report: dict[str, Any],
+    skill_tree_sha256: str,
+    sample_2_report: dict[str, Any],
+    sample_2_report_path: Path,
+    best_of_2_report: dict[str, Any],
+) -> dict[str, Any]:
+    validate_attempt_contract(source_report, sample_2_report)
+    current_skill_hash = validate_skill_contract(source_report, setting.skill_root)
+    if skill_tree_sha256 != current_skill_hash:
+        raise ValueError(
+            "Requested merged-report skill hash differs from the source contract"
+        )
+    source_report_path = validate_report_snapshot(
+        source_report,
+        setting.source_report_path,
+        label="Sample 1",
+    )
+    sample_2_report_path = validate_report_snapshot(
+        sample_2_report,
+        sample_2_report_path,
+        label="Sample 2",
+    )
+    if best_of_2_report.get("kind") != "deepswe_same_setting_best_of_2":
+        raise ValueError("Best-of-2 report has an unexpected kind")
+    if best_of_2_report.get("complete") is not True:
+        raise ValueError("Best-of-2 report is incomplete")
+    if best_of_2_report.get("setting") != setting.name:
+        raise ValueError("Best-of-2 report setting does not match")
+    reported_combined = best_of_2_report.get("tasks")
+    if not isinstance(reported_combined, list) or not all(
+        isinstance(row, dict) for row in reported_combined
+    ):
+        raise ValueError("Best-of-2 report does not contain task rows")
+    expected_combined = combine_task_rows(
+        report_rows(source_report),
+        report_rows(sample_2_report),
+    )
+    if reported_combined != expected_combined:
+        raise ValueError("Best-of-2 task rows differ from their source reports")
+
+    source_run_id = report_run_id(source_report, label="Sample 1")
+    sample_2_run_id = report_run_id(sample_2_report, label="Sample 2")
+    source_report_sha256 = sha256_file(source_report_path)
+    sample_2_report_sha256 = sha256_file(sample_2_report_path)
+    rows = merged_task_rows(expected_combined)
+    resolved = sum(1 for row in rows if is_reward_one(row))
+    total = len(rows)
+    lineage = {
+        "aggregation": "taskwise_max_binary_reward",
+        "tie_breaker": "prefer_sample_1",
+        "sources": [
+            {
+                "sample": 1,
+                "run_id": source_run_id,
+                "report_path": str(source_report_path),
+                "report_sha256": source_report_sha256,
+                "job_dir": str(source_job_dir(source_report)),
+                "n_tasks": len(report_rows(source_report)),
+            },
+            {
+                "sample": 2,
+                "run_id": sample_2_run_id,
+                "report_path": str(sample_2_report_path),
+                "report_sha256": sample_2_report_sha256,
+                "job_dir": str(source_job_dir(sample_2_report)),
+                "n_tasks": len(report_rows(sample_2_report)),
+            },
+        ],
+    }
+    lineage_sha256 = hashlib.sha256(
+        json.dumps(lineage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    identity = hashlib.sha256(
+        json.dumps(
+            {
+                "setting": setting.name,
+                "skill_tree_sha256": skill_tree_sha256,
+                "lineage_sha256": lineage_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    run_id = safe_slug(f"{source_run_id}_same_setting_or_{identity}", limit=180)
+    created_at = utc_now()
+    evaluation = {
+        "job_dir": str(source_job_dir(source_report)),
+        "job_dir_role": "sample_1_config_anchor",
+        "job_name": run_id,
+        "n_trials": total,
+        "n_errors": sum(row["exception_type"] is not None for row in rows),
+        "resolved": resolved,
+        "mean_reward": resolved / total if total else 0.0,
+        "tasks": rows,
+    }
+    return {
+        "schema_version": 1,
+        "kind": "deepswe_same_setting_or_aggregate",
+        "run_id": run_id,
+        "created_at": created_at,
+        "complete": True,
+        "benchmark_name": "deepswe",
+        "setting": setting.name,
+        "gate_index": setting.gate_index,
+        "skills": {
+            "root": str(setting.skill_root),
+            "tree_sha256": skill_tree_sha256,
+        },
+        "sampling_policy": best_of_2_report.get("sampling_policy"),
+        "lineage": lineage,
+        "provenance": {
+            "benchmark_name": "deepswe",
+            "job_config_sha256": None,
+            "task_set_sha256": task_set_sha256(rows),
+            "resume_contract": source_resume_contract(source_report),
+            "lineage_sha256": lineage_sha256,
+        },
+        "infra_invalid_trials": [],
+        "evaluation": evaluation,
+        "tasks": rows,
+        "completeness": {
+            "expected_trials": total,
+            "trial_result_files": total,
+            "aggregated_at": created_at,
+            "infra_invalid_trials": 0,
+        },
+    }
 
 
 def setting_report(
@@ -508,14 +811,7 @@ def setting_report(
         "setting": setting.name,
         "gate_index": setting.gate_index,
         "complete": True,
-        "sampling_policy": {
-            "n": 2,
-            "sample_2_subset": "sample_1_valid_reward_equal_to_0",
-            "aggregation": "maximum reward per task within the same skill setting",
-            "cross_gate_aggregation": False,
-            "infra_retries_count_as_samples": False,
-            "tts_feedback": False,
-        },
+        "sampling_policy": dict(TASKWISE_OR_SAMPLING_POLICY),
         "source": {
             "report_path": str(setting.source_report_path),
             "report_sha256": sha256_file(setting.source_report_path),
@@ -731,7 +1027,24 @@ def run_setting(
         sample_2_report_path=sample_2_report_path,
         task_file=task_file,
     )
+    merged_report = build_merged_score_report(
+        setting=setting,
+        source_report=source_report,
+        skill_tree_sha256=skill_hash,
+        sample_2_report=sample_2_report,
+        sample_2_report_path=sample_2_report_path,
+        best_of_2_report=report,
+    )
+    merged_report_path = setting_dir / "merged_score_report.json"
+    validate_source_report(merged_report, merged_report_path)
+    validate_source_aggregate(
+        merged_report,
+        merged_report_path,
+        expected_run_id=str(merged_report["run_id"]),
+        expected_benchmark_name="deepswe",
+    )
     write_json_atomic(setting_dir / "best_of_2_report.json", report)
+    write_json_atomic(merged_report_path, merged_report)
     return report
 
 
