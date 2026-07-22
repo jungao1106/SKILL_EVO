@@ -142,6 +142,30 @@ docker_image = "example.invalid/sample"
             with self.assertRaisesRegex(ValueError, "does not prove"):
                 normalize_trial(trial_dir)
 
+    def test_rejects_incomplete_timeout_without_junit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            trial_dir = self.create_trial(Path(raw_dir))
+            source_result = (trial_dir / "result.json").read_bytes()
+            for attempt in (1, 2):
+                attempt_dir = (
+                    trial_dir / "verifier_attempts" / f"timeout_attempt_{attempt}"
+                )
+                (attempt_dir / "base.xml").unlink()
+                (attempt_dir / "new.xml").unlink()
+                (attempt_dir / "test-stdout.txt").write_text(
+                    "collected 871 items\n"
+                    "tests/test_appsync_websockets.py ... [ 56%]\n"
+                )
+
+            with self.assertRaisesRegex(ValueError, "Invalid completed JUnit XML"):
+                normalize_trial(trial_dir)
+
+            self.assertEqual((trial_dir / "result.json").read_bytes(), source_result)
+            self.assertFalse(
+                (trial_dir / "result.pre-terminal-normalization.json").exists()
+            )
+            self.assertFalse((trial_dir / "terminal_outcome.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
