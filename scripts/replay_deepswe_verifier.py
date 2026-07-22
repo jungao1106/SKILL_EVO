@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -128,6 +129,7 @@ def prepare_replay(
     source_trial_dir: Path,
     output_root: Path | None = None,
     replay_id: str | None = None,
+    verifier_timeout_multiplier: float | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Create an immutable-input replay sidecar and its provenance request."""
 
@@ -136,6 +138,11 @@ def prepare_replay(
     from harbor.models.trial.result import TrialResult
 
     source_trial_dir = source_trial_dir.expanduser().resolve()
+    if verifier_timeout_multiplier is not None and (
+        not math.isfinite(verifier_timeout_multiplier)
+        or verifier_timeout_multiplier <= 0
+    ):
+        raise ValueError("verifier_timeout_multiplier must be finite and positive")
     config_path = source_trial_dir / "config.json"
     result_path = source_trial_dir / "result.json"
     patch_path = source_trial_dir / "artifacts" / "model.patch"
@@ -267,6 +274,9 @@ def prepare_replay(
             "task_toml_sha256": _sha256_file(task.paths.config_path),
         },
         "runner": runner,
+        "replay_parameters": {
+            "verifier_timeout_multiplier": verifier_timeout_multiplier,
+        },
         "safety": {
             "agent_executed": False,
             "source_trial_mutated": False,
@@ -338,6 +348,25 @@ async def run_isolated_verifier(
     replay_config.trial_name = replay_dir.name
     replay_config.trials_dir = replay_dir.parent
     replay_config.environment.delete = True
+    replay_parameters = request.get("replay_parameters") or {}
+    if not isinstance(replay_parameters, dict):
+        raise ValueError("Replay parameters must be an object")
+    verifier_timeout_multiplier = replay_parameters.get(
+        "verifier_timeout_multiplier"
+    )
+    if verifier_timeout_multiplier is not None:
+        if (
+            isinstance(verifier_timeout_multiplier, bool)
+            or not isinstance(verifier_timeout_multiplier, (int, float))
+            or not math.isfinite(float(verifier_timeout_multiplier))
+            or float(verifier_timeout_multiplier) <= 0
+        ):
+            raise ValueError(
+                "Replay verifier_timeout_multiplier must be finite and positive"
+            )
+        replay_config.verifier_timeout_multiplier = float(
+            verifier_timeout_multiplier
+        )
     paths = TrialPaths(replay_dir)
     paths.mkdir()
     logger = logging.getLogger(f"deepswe-verifier-replay.{replay_dir.name}")
@@ -513,6 +542,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--replay-id", default=None)
     parser.add_argument(
+        "--verifier-timeout-multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Override only the isolated verifier replay timeout multiplier; "
+            "the source trial and saved model patch remain unchanged."
+        ),
+    )
+    parser.add_argument(
         "--prepare-only",
         action="store_true",
         help="Write and validate the sidecar request without starting E2B.",
@@ -526,6 +564,7 @@ def main() -> None:
         source_trial_dir=args.source_trial_dir,
         output_root=args.output_root,
         replay_id=args.replay_id,
+        verifier_timeout_multiplier=args.verifier_timeout_multiplier,
     )
     if args.prepare_only:
         print(

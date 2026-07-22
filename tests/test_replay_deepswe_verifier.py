@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -222,6 +223,40 @@ allow_internet = false
             )
             self.assertTrue((replay_dir / "artifacts" / "model.patch").is_file())
 
+    def test_prepare_records_audited_verifier_timeout_multiplier(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            source = self.create_source_trial(root)
+            source_config = (source / "config.json").read_bytes()
+
+            _replay_dir, request = prepare_replay(
+                source_trial_dir=source,
+                output_root=root / "replays",
+                replay_id="long-verifier",
+                verifier_timeout_multiplier=3.0,
+            )
+
+            self.assertEqual(
+                request["replay_parameters"]["verifier_timeout_multiplier"],
+                3.0,
+            )
+            self.assertEqual((source / "config.json").read_bytes(), source_config)
+
+    def test_prepare_rejects_invalid_verifier_timeout_multiplier(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            source = self.create_source_trial(root)
+            for index, value in enumerate((0.0, -1.0, math.inf, math.nan)):
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "finite and positive"
+                ):
+                    prepare_replay(
+                        source_trial_dir=source,
+                        output_root=root / "replays",
+                        replay_id=f"invalid-{index}",
+                        verifier_timeout_multiplier=value,
+                    )
+
     def test_prepare_rejects_incomplete_agent_and_empty_patch(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -285,10 +320,14 @@ allow_internet = false
                 source_trial_dir=source,
                 output_root=root / "replays",
                 replay_id="isolated",
+                verifier_timeout_multiplier=3.0,
             )
             environment = mock.AsyncMock()
+            observed_timeout_multiplier = None
 
             async def install_environment(context, **_kwargs):
+                nonlocal observed_timeout_multiplier
+                observed_timeout_multiplier = context.config.verifier_timeout_multiplier
                 context._environment = environment
 
             verifier = mock.Mock()
@@ -324,6 +363,7 @@ allow_internet = false
             verifier.verify.assert_awaited_once()
             environment.stop.assert_awaited_once_with(delete=True)
             agent_factory.assert_not_called()
+            self.assertEqual(observed_timeout_multiplier, 3.0)
 
     def test_failed_replay_is_recorded_but_not_overlay_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
