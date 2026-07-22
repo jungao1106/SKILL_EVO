@@ -124,8 +124,9 @@ def repeated_completed_suite_evidence(trial_dir: Path) -> list[dict[str, Any]]:
     for key in ("tests", "passed", "failure", "error", "skipped", "outcomes_sha256"):
         if evidence[0]["base"][key] != evidence[1]["base"][key]:
             raise ValueError(f"Fresh verifier base outcomes differ at {key}")
+    for key in ("tests", "error", "skipped"):
         if evidence[0]["new"][key] != evidence[1]["new"][key]:
-            raise ValueError(f"Fresh verifier new outcomes differ at {key}")
+            raise ValueError(f"Fresh verifier new suite coverage differs at {key}")
     return evidence
 
 
@@ -213,6 +214,9 @@ def normalize_trial(trial_dir: Path) -> dict[str, Any]:
             "normalized_result_sha256": sha256_file(result_path),
             "model_patch_sha256": sha256_file(patch_path),
             "model_patch_size_bytes": patch_path.stat().st_size,
+            "reward_conclusion": (
+                "both completed fresh verifier attempts contain new-suite failures"
+            ),
             "fresh_verifier_attempts": evidence,
         }
         write_json_atomic(outcome_path, outcome)

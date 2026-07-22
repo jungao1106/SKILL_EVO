@@ -110,7 +110,7 @@ docker_image = "example.invalid/sample"
             self.assertIsNone(root["finished_at"])
             self.assertEqual(normalize_trial(trial_dir), outcome)
 
-    def test_rejects_disagreeing_fresh_attempts(self) -> None:
+    def test_accepts_different_failures_when_both_attempts_prove_zero(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             trial_dir = self.create_trial(Path(raw_dir))
             second = (
@@ -118,7 +118,28 @@ docker_image = "example.invalid/sample"
             )
             second.write_text(second.read_text().replace('name="a"', 'name="c"', 1))
 
-            with self.assertRaisesRegex(ValueError, "outcomes differ"):
+            outcome = normalize_trial(trial_dir)
+
+            attempts = outcome["fresh_verifier_attempts"]
+            self.assertNotEqual(
+                attempts[0]["new"]["outcomes_sha256"],
+                attempts[1]["new"]["outcomes_sha256"],
+            )
+            self.assertEqual(outcome["assigned_reward"], 0)
+
+    def test_rejects_attempt_that_does_not_prove_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            trial_dir = self.create_trial(Path(raw_dir))
+            second = (
+                trial_dir / "verifier_attempts" / "timeout_attempt_2" / "new.xml"
+            )
+            second.write_text(
+                second.read_text()
+                .replace('failures="1"', 'failures="0"')
+                .replace("<failure>bad</failure>", "")
+            )
+
+            with self.assertRaisesRegex(ValueError, "does not prove"):
                 normalize_trial(trial_dir)
 
 
