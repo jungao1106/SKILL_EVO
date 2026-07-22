@@ -181,11 +181,16 @@ allow_internet = false
     def resign_source_result(trial_dir: Path, overlay_path: Path) -> None:
         result_path = trial_dir / "result.json"
         new_hash = _sha256_file(result_path)
+        infra_reason = _deepswe_result_infra_reason(
+            json.loads(result_path.read_text())
+        )
         overlay = json.loads(overlay_path.read_text())
         overlay["source_guard"]["source_result_sha256"] = new_hash
+        overlay["source_guard"]["source_infra_reason"] = infra_reason
         replay_path = Path(overlay["replay_result_path"])
         replay = json.loads(replay_path.read_text())
         replay["source"]["result_sha256"] = new_hash
+        replay["source"]["infra_reason"] = infra_reason
         replay_path.write_text(json.dumps(replay))
         overlay_path.write_text(json.dumps(overlay))
 
@@ -219,6 +224,28 @@ allow_internet = false
             self.assertEqual(
                 json.loads((overlay_path.parent / "application.json").read_text()),
                 application,
+            )
+
+    def test_applies_replay_to_completed_agent_verifier_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            trial_dir, overlay_path = self.create_fixture(root)
+            result_path = trial_dir / "result.json"
+            result = json.loads(result_path.read_text())
+            result["verifier_result"] = None
+            result["exception_info"]["exception_type"] = "VerifierTimeoutError"
+            result["exception_info"]["exception_message"] = "verifier timed out"
+            result_path.write_text(json.dumps(result))
+            self.resign_source_result(trial_dir, overlay_path)
+
+            application = apply_overlay(overlay_path)
+
+            updated = json.loads(result_path.read_text())
+            self.assertEqual(updated["verifier_result"], {"rewards": {"reward": 1}})
+            self.assertIsNone(updated["exception_info"])
+            history = json.loads(Path(application["before"]["history_path"]).read_text())
+            self.assertEqual(
+                history["exception_info"]["exception_type"], "VerifierTimeoutError"
             )
 
     def test_application_is_idempotent(self) -> None:

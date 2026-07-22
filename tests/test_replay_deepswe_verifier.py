@@ -196,6 +196,32 @@ allow_internet = false
                     replay_id="provider-failure",
                 )
 
+    def test_prepare_accepts_completed_agent_with_verifier_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            source = self.create_source_trial(root)
+            result_path = source / "result.json"
+            result = json.loads(result_path.read_text())
+            result["verifier_result"] = None
+            result["exception_info"]["exception_type"] = "VerifierTimeoutError"
+            result["exception_info"]["exception_message"] = "verifier timed out"
+            result_path.write_text(json.dumps(result))
+
+            replay_dir, request = prepare_replay(
+                source_trial_dir=source,
+                output_root=root / "replays",
+                replay_id="verifier-timeout",
+            )
+
+            self.assertEqual(
+                request["source"]["infra_reason"],
+                "invalid-verifier-result:missing",
+            )
+            self.assertEqual(
+                request["source"]["exception_type"], "VerifierTimeoutError"
+            )
+            self.assertTrue((replay_dir / "artifacts" / "model.patch").is_file())
+
     def test_prepare_rejects_incomplete_agent_and_empty_patch(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)

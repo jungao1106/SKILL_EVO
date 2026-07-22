@@ -36,6 +36,11 @@ from scripts.run_benchmark import (  # noqa: E402
 
 
 SCHEMA_VERSION = 1
+REPLAYABLE_VERIFIER_EXCEPTION_TYPES = {
+    "",
+    "DeepSweVerifierInfraError",
+    "VerifierTimeoutError",
+}
 
 
 def utc_now() -> str:
@@ -171,7 +176,7 @@ def prepare_replay(
         if isinstance(source_exception, dict)
         else ""
     )
-    if source_exception_type not in {"", "DeepSweVerifierInfraError"}:
+    if source_exception_type not in REPLAYABLE_VERIFIER_EXCEPTION_TYPES:
         raise ValueError(
             "Refusing verifier replay for a non-verifier source exception: "
             f"{source_exception_type}"

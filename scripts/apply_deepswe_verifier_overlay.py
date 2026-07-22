@@ -29,6 +29,10 @@ from scripts.run_benchmark import (  # noqa: E402
 SCHEMA_VERSION = 1
 OVERLAY_KIND = "deepswe_trial_verifier_overlay"
 APPLICATION_KIND = "deepswe_trial_verifier_overlay_application"
+REPLAYABLE_VERIFIER_EXCEPTION_TYPES = {
+    "DeepSweVerifierInfraError",
+    "VerifierTimeoutError",
+}
 
 
 def utc_now() -> str:
@@ -282,9 +286,9 @@ def _validate_source_result(
         if isinstance(exception, dict)
         else ""
     )
-    if exception_type != "DeepSweVerifierInfraError":
+    if exception_type not in REPLAYABLE_VERIFIER_EXCEPTION_TYPES:
         raise ValueError(
-            "Source result is not an exact DeepSweVerifierInfraError: "
+            "Source result is not an eligible verifier infrastructure error: "
             f"{exception_type or '<missing>'}"
         )
 
