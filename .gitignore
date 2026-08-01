@@ -32,6 +32,14 @@ configs/tb2_*.json
 configs/tbench_*.json
 papers/*.pdf
 
+# LaTeX build intermediates
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
 *.log
 *.out
 *.tmp
