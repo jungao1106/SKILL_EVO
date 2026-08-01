@@ -41,12 +41,15 @@ cross-repo failure-mode skills, and trains separate Skill Writer and Skill
 Evaluator policies under a fixed harness policy. During SWEGym training, the
 official verifier is used only for outcome supervision, evaluator calibration,
 and validation gates. During downstream evaluation, verifier labels are not
-available for updating memory. We describe a strict no-exact-transfer protocol
-and an online test-time evolution protocol over a $2{\times}2$ executor matrix:
-GLM-5.2 and GPT-5.5, each run in Pi and Claude-style agent harnesses. This
-matrix lets us test model transfer, harness transfer, and joint model+harness
-transfer. Final resolved rates and ablations are intentionally left blank in
-this draft pending the full experimental run.
+available to the writer or evaluator for skill promotion. We therefore evaluate
+online test-time evolution with a subset-composition protocol: after each
+verifier-scored gate, only the remaining unresolved tasks are retried with the
+newly promoted session skills, and the final score is the union of all tasks
+solved by any accepted gate. We describe a strict no-exact-transfer protocol and
+an online test-time evolution protocol over a $2{\times}2$ executor matrix:
+GLM-5.2 and GPT-5.5, each run in Pi and Claude-style agent harnesses. Current
+GLM-5.2/Pi pilot results improve from 368/500 without skills to 423/500 after
+three online gates; the full transfer matrix remains in progress.
 \end{abstract}
 
 \section{Introduction}
@@ -344,8 +347,10 @@ The SWEGym verifier is available only in this phase.
 \paragraph{SWE-Bench Verified final evaluation.}
 The primary downstream benchmark is SWE-Bench Verified. No exact SWE-Bench task
 trajectory, official verifier label, hidden test output, or gold patch is used
-to update skills during the evaluated run. The official verifier is invoked
-only after the run to report resolved count and resolved rate.
+to update skills during candidate generation or promotion. The official verifier
+is invoked only to score completed gate attempts and to report resolved count
+and resolved rate. Its labels are written to evaluation reports, not passed back
+to the writer or evaluator.
 
 \paragraph{Optional out-of-distribution evaluation.}
 We will also report transfer on SWE-Bench Pro and Terminal-Bench 2.0 when the
@@ -390,6 +395,33 @@ resources, agent timeout, retry policy, and concurrency within a model/harness
 pair. We log job directories, configs, active skill versions, selected skills,
 tool traces, runtime diagnostics, verifier reports, and score reports.
 
+\subsection{Downstream Test-Time Evolution Protocol}
+
+The downstream online setting is intentionally not a repeated full-benchmark
+rerun. Let $U_0$ be the SWE-Bench Verified task set and let $A_g$ be the set of
+tasks solved by gate $g$. Gate 0 or gate 1 may be evaluated on the full task
+set to establish the current accepted state. For each later gate, the executor
+runs only on the unresolved subset
+\[
+U_g = U_{g-1} \setminus A_g.
+\]
+The reported cumulative score after gate $g$ is
+\[
+\left|\bigcup_{i \le g} A_i\right| / |U_0|.
+\]
+Thus a later gate cannot lower the score by failing an already solved task,
+because those tasks are not rerun; it can only recover tasks that remain
+unsolved. This matches the intended use of test-time skill evolution as a
+verifier-free recovery process over the current error set.
+
+Within each gate, the writer summarizes only public traces from the previous
+unresolved subset. The evaluator promotes repo and failure-mode candidates using
+its frozen SWEGym-trained policy and public evidence features. Official
+SWE-Bench verifier outputs are used only after the gate run to report which
+subset tasks were recovered and to construct the next unresolved subset. They
+are not supplied as candidate inputs and do not update the persistent writer or
+evaluator policies.
+
 \subsection{Protocols}
 
 \begin{table}[t]
@@ -428,17 +460,19 @@ latency, or prompt cost.
 \subsection{Result Tables to Fill}
 
 \begin{table}[h]
-\caption{Primary SWE-Bench Verified within-cell results. Values are
-intentionally blank until the full GLM-5.2/GPT-5.5 by Pi/Claude-harness matrix
-finishes.}
+\caption{Primary SWE-Bench Verified within-cell results. GLM-5.2/Pi
+numbers are current pilot results; the remaining cells are pending full runs.}
 \label{tab:main-results}
 \begin{center}
 \begin{tabular}{L{0.27\linewidth} C{0.10\linewidth} C{0.10\linewidth} C{0.11\linewidth} C{0.11\linewidth} C{0.11\linewidth}}
 \toprule
 Model/Harness/Setting & Resolved & Rate & $0{\rightarrow}1$ & $1{\rightarrow}0$ & Diag. \\
 \midrule
-GLM-5.2 / Pi / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
-GLM-5.2 / Pi / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
+GLM-5.2 / Pi / No Skills & 368/500 & 73.6\% & -- & -- & 2 \\
+GLM-5.2 / Pi / Frozen SWEGym Library & 376/500 & 75.2\% & +8 & \tbd & 8 \\
+GLM-5.2 / Pi / \method{} Gate 1 Full Eval & 379/500 & 75.8\% & +11 & \tbd & 5 \\
+GLM-5.2 / Pi / \method{} Gate 2 Subset-Composed & 410/500 & 82.0\% & +42 & 0 by protocol & 6 \\
+GLM-5.2 / Pi / \method{} Gate 3 Subset-Composed & 423/500 & 84.6\% & +55 & 0 by protocol & 8 \\
 GLM-5.2 / Claude harness / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
 GLM-5.2 / Claude harness / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
 GPT-5.5 / Pi / No Skills & \tbd & \tbd & \tbd & \tbd & \tbd \\
@@ -449,6 +483,19 @@ GPT-5.5 / Claude harness / \method{} & \tbd & \tbd & \tbd & \tbd & \tbd \\
 \end{tabular}
 \end{center}
 \end{table}
+
+\paragraph{Current GLM-5.2/Pi pilot.}
+The no-skill baseline solves 368/500 SWE-Bench Verified tasks. A frozen
+SWEGym-derived library solves 376/500 under the same model, harness, task order,
+and sandbox settings. The first online gate, evaluated on the full benchmark for
+state initialization, solves 379/500. The second online gate is evaluated only
+on the 121 tasks unresolved by gate 1; it recovers 31 of them, yielding a
+subset-composed score of 410/500. The third gate is evaluated only on the
+remaining 90 unresolved tasks; it recovers 13 additional tasks, yielding a
+subset-composed score of 423/500. The eight-gate continuation is still running,
+starting gate 4 on the remaining 77 unresolved tasks. The earlier full-500
+rerun of gate 2 is not used for this metric because it violates the
+subset-composition protocol.
 
 \begin{table}[h]
 \caption{Transfer matrix to fill after the full run. Source denotes the
@@ -530,7 +577,10 @@ if failure signatures are noisy. Third, online test-time evolution is order
 sensitive, so we must report original-order and random-order robustness. Fourth,
 the current evaluator implementation is deterministic and rule-based; a learned
 evaluator must be tested against false accepts, false rejects, and prompt bloat.
-Finally, the full $2{\times}2$ transfer matrix is a planned setting. Within-cell
+Fifth, subset-composition evaluates recovery on the remaining error set and is
+therefore not comparable to rerunning every gate on the full benchmark; we
+report full-rerun numbers only as diagnostics. Finally, the full $2{\times}2$
+transfer matrix is a planned setting. Within-cell
 results, model-transfer results, harness-transfer results, and joint-transfer
 results must be reported separately because they answer different questions.
 
@@ -559,7 +609,10 @@ general SWE seeds under \texttt{\_general/swe/}. Training artifacts include
 \texttt{failure\_clusters.jsonl}, \texttt{evaluator\_decisions.jsonl},
 \texttt{evaluator\_calibration.jsonl}, \texttt{promotion\_decisions.jsonl},
 \texttt{harness\_policy.md}, \texttt{generator\_policy.md}, and
-\texttt{evaluator\_policy.md}.
+\texttt{evaluator\_policy.md}. Test-time evolution artifacts are stored under
+\texttt{run\_logs/swebench\_verified\_tts\_evo/.../subset\_eval/};
+\texttt{loop\_state.json} records the latest gate, cumulative resolved count,
+subset recoveries, and remaining unresolved count.
 
 \section{Command Skeletons}
 
@@ -580,6 +633,13 @@ python scripts/run_skill_evo_verified.py \
   --provider-model <target-model-id> \
   --all-verified \
   --concurrency <N>
+
+# Subset-composition test-time skill evolution, gates 2..8.
+python scripts/run_swebench_tts_subset_evo_loop.py \
+  --run-id swebench_verified_tts_evo_from_direct_failures_20260704 \
+  --start-gate 2 \
+  --max-gate 8 \
+  --concurrency 15
 \end{verbatim}
 
 \end{document}
