@@ -1,0 +1,48 @@
+{
+  "run_name": "swegym_novita_glm52_c15_resume_merged_20260630_071956",
+  "total_skills": 240,
+  "candidate_skills": 211,
+  "promoted_skills": 29,
+  "counts_by_status_bucket": {
+    "candidate/support_0": 14,
+    "candidate/support_1": 34,
+    "candidate/support_2": 37,
+    "candidate/support_3": 126,
+    "promoted/support_2": 1,
+    "promoted/support_3": 28
+  },
+  "counts_by_status_level": {
+    "candidate/failure_mode": 80,
+    "candidate/repo": 131,
+    "promoted/failure_mode": 1,
+    "promoted/repo": 28
+  },
+  "counts_by_status_decision": {
+    "candidate/promote/accept": 29,
+    "candidate/refresh/accept": 36,
+    "candidate/stage/accept": 25,
+    "candidate/stage/memory_only": 112,
+    "candidate/stage/reject": 4,
+    "candidate/stage/revise": 5,
+    "promoted/promote/accept": 29
+  },
+  "failure_mode_candidate_buckets": {
+    "localization-drift": {
+      "support_1": 3,
+      "support_2": 3,
+      "support_3": 26
+    },
+    "no-diff-recovery": {
+      "support_1": 6,
+      "support_2": 22
+    },
+    "weak-validation": {
+      "support_1": 20
+    }
+  },
+  "failure_mode_promoted_buckets": {
+    "localization-drift": {
+      "support_3": 1
+    }
+  }
+}

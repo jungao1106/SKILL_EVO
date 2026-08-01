@@ -1,0 +1,23 @@
+{
+  "base_skill_root": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/skills/downstream/swebench_verified_glm52_novita_v0100_frozen_direct_20260703_182027/v0100",
+  "copied_base": true,
+  "created_at": "2026-07-04T06:05:53+00:00",
+  "gate_index": 0,
+  "include_base": true,
+  "kind": "test_time_skill_evolution_gate_library",
+  "output_root": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/skills/test_time/swebench_verified_tts_evo_from_direct_failures_20260704/gate_000",
+  "promotion_source": "none",
+  "run_name": "swebench_verified_tts_evo_from_direct_failures_20260704",
+  "schema_version": 1,
+  "skill_counts": {
+    "base": 15,
+    "test_time_promoted": 0,
+    "total": 15
+  },
+  "skills": [],
+  "verifier_access_for_evolution": false,
+  "verifier_report": {
+    "note": "Base gate eval report is attached only after frozen eval.",
+    "status": "not_run"
+  }
+}
