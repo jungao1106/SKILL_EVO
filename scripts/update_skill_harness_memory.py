@@ -23,7 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from providers import ensure_macaron_attribution_header, requires_reasoning_effort_none
+from providers import (
+    ensure_macaron_attribution_header,
+    normalize_provider_name,
+    requires_reasoning_effort_none,
+    resolve_provider,
+)
 
 DEFAULT_OUT = ROOT / "analysis" / "skill_harness_memory.json"
 DEFAULT_TASK_SKILL_DIR = ROOT / "analysis" / "task_evidence"
@@ -67,6 +72,14 @@ PRIVATE_PATH_RE = re.compile(r"(/tmp/(?!pi-skills\b)|/root/|/home/|/opt/minicond
 
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(errors="replace"))
+
+
+def _agent_metadata(agent_dir: Path) -> dict[str, Any]:
+    for name in ("pi-metadata.json", "claude-agent-metadata.json"):
+        path = agent_dir / name
+        if path.exists():
+            return _load_json(path)
+    return {}
 
 
 TASK_LOOKUP_RE = re.compile(
@@ -378,6 +391,13 @@ def _relative_to_root(path: Path) -> str:
         return path.as_posix()
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
 def _script_language(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".py":
@@ -516,10 +536,9 @@ def _trial_entry(
     task_lookup_key = _task_lookup_key(str(task_name) if task_name is not None else None)
     agent_dir = trial_dir / "agent"
     problem_path = agent_dir / "problem_statement.md"
-    metadata_path = agent_dir / "pi-metadata.json"
     trajectory_path = agent_dir / "trajectory.json"
     problem_text = problem_path.read_text(errors="replace") if problem_path.exists() else ""
-    metadata = _load_json(metadata_path) if metadata_path.exists() else {}
+    metadata = _agent_metadata(agent_dir)
     trajectory = _load_json(trajectory_path) if trajectory_path.exists() else {}
     verifier_rewards = (
         result.get("verifier_result", {}).get("rewards")
@@ -546,13 +565,14 @@ def _trial_entry(
         "entry_id": f"{job_dir.name}:{trial_dir.name}",
         "task_skill_id": trial_dir.name,
         "source_job": job_dir.name,
-        "trial_dir": str(trial_dir.relative_to(ROOT)),
+        "trial_dir": _display_path(trial_dir),
         "task_name": task_name,
         "task_lookup_key": task_lookup_key,
         "repo": repo,
         "issue_title": title,
         "reward": reward,
         "exception": exception.get("exception_type") if exception else None,
+        "agent": metadata.get("agent"),
         "provider": metadata.get("provider"),
         "provider_model": metadata.get("provider_model"),
         "provider_base_url": metadata.get("provider_base_url"),
@@ -680,6 +700,30 @@ def _call_openai_compatible(
         return ""
     message = choices[0].get("message") or {}
     return str(message.get("content") or "")
+
+
+def _summary_model_config(entry: dict[str, Any]) -> tuple[str, str, str, str, str | None]:
+    provider_name = str(entry.get("provider") or "").strip()
+    agent_name = str(entry.get("agent") or "").strip().lower()
+    base_url = str(entry.get("provider_base_url") or "").strip()
+    model = str(entry.get("provider_model") or "").strip()
+    provider_api = str(entry.get("provider_api") or "openai-completions").strip() or "openai-completions"
+    api_key_env = str(entry.get("api_key_env") or "").strip()
+
+    if provider_name:
+        try:
+            provider = resolve_provider(normalize_provider_name(provider_name))
+        except ValueError:
+            provider = None
+        if provider is not None:
+            if "claude" in agent_name:
+                base_url = os.getenv(provider.base_url_env) or provider.default_base_url or base_url
+                provider_api = os.getenv(provider.provider_api_env) or provider.default_provider_api
+            model = os.getenv(provider.model_env) or provider.default_model or model
+            api_key_env = provider.api_key_env
+
+    api_key = os.getenv(api_key_env) if api_key_env else None
+    return base_url, model, provider_api, api_key_env, api_key
 
 
 def _summary_prompt(entry: dict[str, Any], skill_resources: dict[str, Any]) -> str:
@@ -1028,11 +1072,7 @@ def summarize_with_backbone(
     resource_counts: Counter[str] = Counter()
     selected_entries = entries if max_entries <= 0 else entries[:max_entries]
     for entry in selected_entries:
-        base_url = str(entry.get("provider_base_url") or "")
-        model = str(entry.get("provider_model") or "")
-        provider_api = str(entry.get("provider_api") or "openai-completions")
-        api_key_env = str(entry.get("api_key_env") or "")
-        api_key = os.getenv(api_key_env) if api_key_env else None
+        base_url, model, provider_api, api_key_env, api_key = _summary_model_config(entry)
         if not base_url or not model or not api_key:
             errors.append(
                 f"{entry.get('entry_id')}: missing base_url/model/api key env"
@@ -1266,8 +1306,8 @@ def build_version(
         "version_id": version_id,
         "parent_version": parent_version,
         "created_at": _utc_now(),
-        "source_jobs": [str(job_dir.relative_to(ROOT)) for job_dir in job_dirs],
-        "previous_jobs": [str(job_dir.relative_to(ROOT)) for job_dir in previous_job_dirs],
+        "source_jobs": [_display_path(job_dir) for job_dir in job_dirs],
+        "previous_jobs": [_display_path(job_dir) for job_dir in previous_job_dirs],
         "entries": entries,
         "aggregates": _aggregate(entries),
     }

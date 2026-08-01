@@ -102,16 +102,45 @@ def verify_python_runtime(python: str) -> None:
         )
 
 
-def source_env_block(env_file: Path) -> list[str]:
+def benchmark_agent_args(args: argparse.Namespace) -> list[str]:
+    command = [
+        "--provider",
+        args.provider,
+        "--harness",
+        args.harness,
+    ]
+    if args.provider_base_url:
+        command.extend(["--provider-base-url", args.provider_base_url])
+    if args.provider_anthropic_base_url:
+        command.extend(["--provider-anthropic-base-url", args.provider_anthropic_base_url])
+    if args.provider_model:
+        command.extend(["--provider-model", args.provider_model])
+    if args.provider_api:
+        command.extend(["--provider-api", args.provider_api])
+    if args.claude_max_turns is not None:
+        command.extend(["--claude-max-turns", str(args.claude_max_turns)])
+    if args.claude_max_budget_usd is not None:
+        command.extend(["--claude-max-budget-usd", str(args.claude_max_budget_usd)])
+    return command
+
+
+def source_env_block(args: argparse.Namespace) -> list[str]:
     lines = [
         "set -a",
-        f'if [ -f {shlex.quote(str(env_file))} ]; then . {shlex.quote(str(env_file))}; fi',
+        f'if [ -f {shlex.quote(str(args.env_file))} ]; then . {shlex.quote(str(args.env_file))}; fi',
         "set +a",
-        "export LLM_PROVIDER=openai",
+        f"export LLM_PROVIDER={shlex.quote(str(args.provider))}",
         "export OPENAI_COMPAT_API=${OPENAI_COMPAT_API:-openai-completions}",
         "export OPENAI_COMPAT_REASONING_EFFORT=none",
         "export OPENAI_COMPAT_ENABLE_THINKING=false",
+        "export NOVITA_REASONING_EFFORT=none",
+        "export NOVITA_ENABLE_THINKING=false",
+        "export MACARON_REASONING_EFFORT=none",
+        "export MACARON_ENABLE_THINKING=false",
+        "export SGLANG_REASONING_EFFORT=none",
+        "export SGLANG_ENABLE_THINKING=false",
         "export CLAUDE_CODE_ATTRIBUTION_HEADER=0",
+        "export FORCE_DISABLE_THINKING=1",
         "export PI_THINKING=off",
     ]
     return lines
@@ -128,8 +157,7 @@ def build_baseline_command(
         "scripts/run_benchmark.py",
         "--dataset",
         args.dataset,
-        "--provider",
-        "openai",
+        *benchmark_agent_args(args),
         "--job-name",
         baseline_job_name,
         "--task-names-file",
@@ -157,8 +185,7 @@ def build_direct_eval_command(
         "scripts/run_benchmark.py",
         "--dataset",
         args.dataset,
-        "--provider",
-        "openai",
+        *benchmark_agent_args(args),
         "--job-name",
         job_name,
         "--task-names-file",
@@ -253,7 +280,7 @@ def render_direct_shard_script(
         f"mkdir -p {shlex.quote(str(log_path.parent))}",
         f"exec >> {shlex.quote(str(log_path))} 2>&1",
         'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] direct skills shard start"',
-        *source_env_block(args.env_file),
+        *source_env_block(args),
         f"export E2B_CONCURRENCY={shlex.quote(str(args.concurrency_per_shard))}",
         f"export PI_SKILL_PACK_ROOT={shlex.quote(str(skill_pack_root))}",
         "export PI_USE_SKILL_HARNESS_MEMORY=false",
@@ -291,7 +318,7 @@ def render_baseline_only_shard_script(
         f"mkdir -p {shlex.quote(str(log_path.parent))}",
         f"exec >> {shlex.quote(str(log_path))} 2>&1",
         'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] no-skills baseline shard start"',
-        *source_env_block(args.env_file),
+        *source_env_block(args),
         f"export E2B_CONCURRENCY={shlex.quote(str(args.concurrency_per_shard))}",
         "unset PI_SKILL_PACK_ROOT PI_TASK_STAGE_SKILLS_ROOT PI_SKILL_HARNESS_MEMORY_PATH",
         "export PI_USE_SKILL_HARNESS_MEMORY=false",
@@ -345,7 +372,7 @@ def render_shard_script(
         f"mkdir -p {shlex.quote(str(log_path.parent))}",
         f"exec >> {shlex.quote(str(log_path))} 2>&1",
         'echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] shard start"',
-        *source_env_block(args.env_file),
+        *source_env_block(args),
         f"export E2B_CONCURRENCY={shlex.quote(str(args.concurrency_per_shard))}",
         f'echo "baseline_job={baseline_job_name}"',
         f'echo "eval_run={eval_run_name}"',
@@ -386,6 +413,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency-per-shard", type=int, default=10)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    parser.add_argument("--harness", choices=["pi", "claude-code"], default="pi")
+    parser.add_argument("--provider", default="openai")
+    parser.add_argument("--provider-base-url", default=None)
+    parser.add_argument("--provider-anthropic-base-url", default=None)
+    parser.add_argument("--provider-model", default=None)
+    parser.add_argument("--provider-api", default=None)
+    parser.add_argument("--claude-max-turns", type=int, default=None)
+    parser.add_argument("--claude-max-budget-usd", type=float, default=None)
     parser.add_argument("--skill-version-id", default="v0100")
     parser.add_argument("--skill-root", type=Path, default=ROOT / "skills" / "accepted")
     parser.add_argument("--promotion-decisions", type=Path, default=DEFAULT_PROMOTION_DECISIONS)
@@ -579,6 +614,11 @@ def main() -> None:
         "num_shards": len(manifest_rows),
         "concurrency_per_shard": args.concurrency_per_shard,
         "total_requested_concurrency": args.concurrency_per_shard * len(manifest_rows),
+        "harness": args.harness,
+        "provider": args.provider,
+        "provider_model": args.provider_model,
+        "provider_base_url": args.provider_base_url,
+        "provider_anthropic_base_url": args.provider_anthropic_base_url,
         "skill_version_id": args.skill_version_id,
         "source_skill_root": str(source_skill_root),
         "promotion_decisions": str(args.promotion_decisions),

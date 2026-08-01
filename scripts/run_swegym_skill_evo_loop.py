@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import glob
 import json
 import os
 import re
@@ -35,13 +36,24 @@ from scripts.run_skill_evo_verified import (
     next_skill_version_id,
     read_active_version,
 )
-from providers import ensure_macaron_attribution_header, ensure_reasoning_effort_none
+from providers import (
+    SUPPORTED_PROVIDER_CHOICES,
+    ProviderSpec,
+    ensure_macaron_attribution_header,
+    ensure_reasoning_effort_none,
+    normalize_provider_name,
+    resolve_provider,
+)
 
 
 DEFAULT_SWEGYM_DATASET = ROOT / "data" / "harbor_swegym_500_uniform"
 DEFAULT_EVO_ROOT = ROOT / "run_logs" / "swegym_skill_evo"
+DEFAULT_PI_JOBS_ROOT = ROOT / "jobs"
+DEFAULT_CLAUDE_CODE_JOBS_ROOT = ROOT / "jobs" / "claude_code"
 DEFAULT_SKILL_ARCHIVE_ROOT = ROOT / "skills" / "accepted"
+DEFAULT_CLAUDE_CODE_SKILL_ARCHIVE_ROOT = ROOT / "skills" / "accepted_claude_code"
 DEFAULT_CANDIDATE_EVAL_PACK_ROOT = ROOT / "skills" / "eval_candidate_augmented"
+DEFAULT_CLAUDE_CODE_CANDIDATE_EVAL_PACK_ROOT = ROOT / "skills" / "eval_candidate_augmented_claude_code"
 DEFAULT_WANDB_PROJECT = "skills-evo-swegym"
 DEFAULT_VERIFIER_BUFFER_SEC = 900
 DEFAULT_REPO_UPDATE_BATCH_SIZE = 5
@@ -81,10 +93,38 @@ def list_env(name: str) -> list[str] | None:
 
 
 def normalize_provider(value: str | None) -> str:
-    provider = str(value or "openai").strip().lower()
-    if provider in {"novita", "openai-compatible", "openai_compatible"}:
-        return "openai"
-    return provider
+    return normalize_provider_name(str(value or "openai"))
+
+
+def normalize_agent(value: str | None) -> str:
+    agent = str(value or "pi").strip().lower()
+    aliases = {
+        "pi-agent": "pi",
+        "pi_agent": "pi",
+        "claude": "claude-code",
+        "claude_code": "claude-code",
+        "claude-sdk": "claude-code",
+        "claude_sdk": "claude-code",
+    }
+    return aliases.get(agent, agent)
+
+
+def default_jobs_root(agent: str) -> Path:
+    if normalize_agent(agent) == "claude-code":
+        return DEFAULT_CLAUDE_CODE_JOBS_ROOT
+    return DEFAULT_PI_JOBS_ROOT
+
+
+def default_skill_archive_root(agent: str) -> Path:
+    if normalize_agent(agent) == "claude-code":
+        return DEFAULT_CLAUDE_CODE_SKILL_ARCHIVE_ROOT
+    return DEFAULT_SKILL_ARCHIVE_ROOT
+
+
+def default_validation_candidate_pack_root(agent: str) -> Path:
+    if normalize_agent(agent) == "claude-code":
+        return DEFAULT_CLAUDE_CODE_CANDIDATE_EVAL_PACK_ROOT
+    return DEFAULT_CANDIDATE_EVAL_PACK_ROOT
 
 
 def flatten_list_values(values: list[str] | None) -> list[str] | None:
@@ -138,6 +178,250 @@ def job_result_is_complete(job_dir: Path) -> bool:
 
 def job_has_trial_results(job_dir: Path) -> bool:
     return any(trial_result_paths(job_dir))
+
+
+def expand_job_globs(patterns: list[str] | None) -> list[Path]:
+    if not patterns:
+        return []
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        if not matches:
+            candidate = Path(pattern).expanduser()
+            matches = [str(candidate)] if candidate.exists() else []
+        for match in sorted(matches):
+            path = Path(match).expanduser().resolve()
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def task_lookup_key(value: str | None) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    leaf = text.split("/")[-1]
+    match = re.search(r"([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?:__[A-Za-z0-9]+)?", leaf)
+    if match:
+        return match.group(1)
+    return leaf
+
+
+def trial_task_lookup_key(result_path: Path) -> str:
+    try:
+        result = read_json(result_path)
+    except (OSError, json.JSONDecodeError):
+        return task_lookup_key(result_path.parent.name)
+    return task_lookup_key(str(result.get("task_name") or result.get("trial_name") or result_path.parent.name))
+
+
+def selected_trial_results(
+    job_dirs: list[Path],
+    *,
+    task_names_file: Path | None = None,
+) -> tuple[list[tuple[Path, Path]], list[str]]:
+    expected = set(task_lookup_key(name) for name in read_lines(task_names_file)) if task_names_file else None
+    expected = {name for name in expected if name} if expected is not None else None
+    selected: list[tuple[Path, Path]] = []
+    seen: set[str] = set()
+    duplicate_tasks: list[str] = []
+    for job_dir in job_dirs:
+        if not (job_dir / "result.json").exists():
+            raise SystemExit(f"Missing external baseline result: {job_dir / 'result.json'}")
+        for result_path in trial_result_paths(job_dir):
+            key = trial_task_lookup_key(result_path)
+            if expected is not None and key not in expected:
+                continue
+            if key in seen:
+                duplicate_tasks.append(key)
+                continue
+            seen.add(key)
+            selected.append((job_dir, result_path))
+    if expected is not None:
+        missing = sorted(expected - seen)
+        if missing:
+            sample = ", ".join(missing[:20])
+            raise SystemExit(
+                "External no-skill baseline shards do not cover the current SWEGym train split: "
+                f"missing={len(missing)} sample=[{sample}]"
+            )
+    return selected, duplicate_tasks
+
+
+def task_names_from_job_dirs(job_dirs: list[Path]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for job_dir in job_dirs:
+        if not (job_dir / "result.json").exists():
+            raise SystemExit(f"Missing external baseline result: {job_dir / 'result.json'}")
+        for result_path in trial_result_paths(job_dir):
+            key = trial_task_lookup_key(result_path)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            names.append(key)
+    return names
+
+
+def materialize_external_baseline_job(
+    *,
+    source_job_dirs: list[Path],
+    output_job_dir: Path,
+    task_names_file: Path,
+    copy_trials: bool,
+    force: bool,
+) -> dict[str, Any]:
+    selected, duplicate_tasks = selected_trial_results(source_job_dirs, task_names_file=task_names_file)
+    if not selected:
+        raise SystemExit("External no-skill baseline shards produced zero matching train trials.")
+    if output_job_dir.exists():
+        if job_result_is_complete(output_job_dir) and job_has_trial_results(output_job_dir) and not force:
+            selected_trial_results([output_job_dir], task_names_file=task_names_file)
+            return {
+                "job_dir": str(output_job_dir),
+                "reused_existing": True,
+                "n_trials": len(trial_result_paths(output_job_dir)),
+                "source_job_dirs": [str(path) for path in source_job_dirs],
+            }
+        if not force:
+            raise SystemExit(
+                f"External baseline output already exists but is incomplete: {output_job_dir}. "
+                "Remove it or pass --force-external-baseline-import."
+            )
+        if output_job_dir.is_symlink() or output_job_dir.is_file():
+            output_job_dir.unlink()
+        else:
+            shutil.rmtree(output_job_dir)
+    output_job_dir.mkdir(parents=True, exist_ok=True)
+    source_manifest: list[dict[str, Any]] = []
+    total_input_tokens = 0
+    total_cache_tokens = 0
+    total_output_tokens = 0
+    total_cost_usd = 0.0
+    rewards: list[float] = []
+    n_errors = 0
+    for source_job_dir, result_path in selected:
+        trial_dir = result_path.parent
+        target = output_job_dir / trial_dir.name
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"Duplicate trial directory while importing external baseline: {target}")
+        if copy_trials:
+            shutil.copytree(trial_dir, target, symlinks=True)
+        else:
+            target.symlink_to(trial_dir, target_is_directory=True)
+        result = read_json(result_path)
+        verifier_rewards = (
+            result.get("verifier_result", {}).get("rewards")
+            if result.get("verifier_result")
+            else None
+        )
+        reward = first_reward_value(verifier_rewards)
+        if reward is not None:
+            rewards.append(float(reward))
+        if result.get("exception_info"):
+            n_errors += 1
+        agent_result = result.get("agent_result") or {}
+        total_input_tokens += int(agent_result.get("n_input_tokens") or 0)
+        total_cache_tokens += int(agent_result.get("n_cache_tokens") or 0)
+        total_output_tokens += int(agent_result.get("n_output_tokens") or 0)
+        try:
+            total_cost_usd += float(agent_result.get("cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        source_manifest.append(
+            {
+                "source_job_dir": str(source_job_dir),
+                "source_trial_dir": str(trial_dir),
+                "trial_dir": trial_dir.name,
+                "task_name": result.get("task_name"),
+                "reward": reward,
+                "exception_type": (
+                    (result.get("exception_info") or {}).get("exception_type")
+                    if result.get("exception_info")
+                    else None
+                ),
+            }
+        )
+
+    base_config_path = source_job_dirs[0] / "config.json"
+    if base_config_path.exists():
+        shutil.copy2(base_config_path, output_job_dir / "config.json")
+    reward_stats = {
+        str(value): [
+            item["trial_dir"]
+            for item in source_manifest
+            if item.get("reward") is not None and float(item["reward"]) == value
+        ]
+        for value in sorted(set(rewards))
+    }
+    finished_at = utc_now()
+    write_json(
+        output_job_dir / "result.json",
+        {
+            "id": f"external-baseline-import-{output_job_dir.name}",
+            "started_at": finished_at,
+            "updated_at": finished_at,
+            "finished_at": finished_at,
+            "n_total_trials": len(source_manifest),
+            "stats": {
+                "n_completed_trials": len(source_manifest),
+                "n_errored_trials": n_errors,
+                "n_running_trials": 0,
+                "n_pending_trials": 0,
+                "n_cancelled_trials": 0,
+                "n_retries": 0,
+                "evals": {
+                    "external_no_skills_baseline": {
+                        "n_trials": len(source_manifest),
+                        "n_errors": n_errors,
+                        "metrics": [{"mean": sum(rewards) / len(rewards) if rewards else None}],
+                        "pass_at_k": {},
+                        "reward_stats": {"reward": reward_stats},
+                        "exception_stats": {},
+                    }
+                },
+                "n_input_tokens": total_input_tokens,
+                "n_cache_tokens": total_cache_tokens,
+                "n_output_tokens": total_output_tokens,
+                "cost_usd": total_cost_usd,
+            },
+            "external_import": {
+                "schema_version": 1,
+                "created_at": finished_at,
+                "mode": "copy" if copy_trials else "symlink",
+                "source_job_dirs": [str(path) for path in source_job_dirs],
+                "task_names_file": str(task_names_file),
+                "duplicate_tasks_skipped": duplicate_tasks,
+            },
+        },
+    )
+    write_json(
+        output_job_dir / "external_baseline_manifest.json",
+        {
+            "schema_version": 1,
+            "created_at": finished_at,
+            "mode": "copy" if copy_trials else "symlink",
+            "job_dir": str(output_job_dir),
+            "source_job_dirs": [str(path) for path in source_job_dirs],
+            "task_names_file": str(task_names_file),
+            "n_trials": len(source_manifest),
+            "n_errors": n_errors,
+            "mean_reward": sum(rewards) / len(rewards) if rewards else None,
+            "duplicate_tasks_skipped": duplicate_tasks,
+            "trials": source_manifest,
+        },
+    )
+    return {
+        "job_dir": str(output_job_dir),
+        "reused_existing": False,
+        "n_trials": len(source_manifest),
+        "n_errors": n_errors,
+        "mean_reward": sum(rewards) / len(rewards) if rewards else None,
+        "source_job_dirs": [str(path) for path in source_job_dirs],
+    }
 
 
 def version_id_with_offset(base_version_id: str, offset: int) -> str:
@@ -216,22 +500,25 @@ def missing_runtime_env(args: argparse.Namespace, env: dict[str, str], *, benchm
     missing: list[str] = []
     if benchmark_runs and not _env_present(env, "E2B_API_KEY"):
         missing.append("E2B_API_KEY")
-    if args.provider == "openai":
-        provider_names = (
-            "OPENAI_COMPAT_API_KEY",
-            "OPENAI_COMPAT_BASE_URL",
-            "OPENAI_COMPAT_MODEL",
-        )
-    else:
-        provider_names = ("TINKER_API_KEY", "TINKER_BASE_URL", "TINKER_MODEL")
+    provider = resolve_provider(args.provider)
+    try:
+        provider_names = tuple(provider.required_env(agent=args.agent))
+    except ValueError as exc:
+        missing.append(str(exc))
+        provider_names = ()
     if benchmark_runs:
         missing.extend(name for name in provider_names if not _env_present(env, name))
     if (
         not args.skip_training_update
         and args.summarize_with_backbone
-        and args.baseline_train_job_dir is not None
+        and (args.baseline_train_job_dir is not None or args.baseline_train_job_glob)
     ):
-        missing.extend(name for name in provider_names if not _env_present(env, name))
+        summary_names = [
+            provider.api_key_env,
+            provider.base_url_env,
+            provider.model_env,
+        ]
+        missing.extend(name for name in summary_names if not _env_present(env, name))
     return list(dict.fromkeys(missing))
 
 
@@ -391,6 +678,63 @@ def write_split(
         "validation_tasks_file": str(split_dir / "validation_tasks.txt"),
         "manifest": str(split_dir / "task_manifest.json"),
     }
+
+
+def choose_validation_repos_from_candidates(
+    tasks: list[SwegymTask],
+    *,
+    target_count: int,
+) -> set[str]:
+    if target_count <= 0 or not tasks:
+        return set()
+    counts = Counter(task.repo_slug for task in tasks)
+    selected: set[str] = set()
+    selected_count = 0
+    for repo, count in sorted(counts.items(), key=lambda item: (item[1], item[0])):
+        if not selected or abs((selected_count + count) - target_count) <= abs(selected_count - target_count):
+            selected.add(repo)
+            selected_count += count
+        if selected_count >= target_count:
+            break
+    return selected
+
+
+def rewrite_validation_split_excluding_train(
+    *,
+    tasks: list[SwegymTask],
+    train_names: list[str],
+    split_dir: Path,
+    validation_ratio: float,
+    smoke_validation_tasks: int | None,
+) -> tuple[list[str], set[str], dict[str, Any]]:
+    train_keys = {task_lookup_key(name) for name in train_names}
+    candidates = [
+        task
+        for task in tasks
+        if task_lookup_key(task.instance_id) not in train_keys
+    ]
+    target = round(len(tasks) * validation_ratio)
+    validation_repos = choose_validation_repos_from_candidates(
+        candidates,
+        target_count=target,
+    )
+    validation_tasks = sorted(
+        (task for task in candidates if task.repo_slug in validation_repos),
+        key=lambda task: (task.repo_slug, task.instance_id),
+    )
+    validation_tasks = select_smoke_tasks(validation_tasks, smoke_validation_tasks)
+    validation_names = [task.instance_id for task in validation_tasks]
+    write_lines(split_dir / "validation_tasks.txt", validation_names)
+    write_lines(split_dir / "validation_repos.txt", sorted(validation_repos))
+    return (
+        validation_names,
+        validation_repos,
+        {
+            "candidate_tasks_after_train_exclusion": len(candidates),
+            "target_validation_tasks": target,
+            "validation_repos_after_train_exclusion": sorted(validation_repos),
+        },
+    )
 
 
 def select_smoke_tasks(tasks: list[SwegymTask], limit: int | None) -> list[SwegymTask]:
@@ -1667,10 +2011,14 @@ def benchmark_command(
         str(dataset),
         "--benchmark-name",
         benchmark_name,
+        "--agent",
+        args.agent,
         "--provider",
         args.provider,
         "--job-name",
         job_name,
+        "--jobs-dir",
+        str(args.jobs_root),
         "--concurrency",
         str(args.concurrency),
         "--max-retries",
@@ -1700,6 +2048,8 @@ def benchmark_command(
         command.extend(["--agent-timeout-sec", str(args.agent_timeout_sec)])
     if args.provider_base_url:
         command.extend(["--provider-base-url", args.provider_base_url])
+    if args.provider_anthropic_base_url:
+        command.extend(["--provider-anthropic-base-url", args.provider_anthropic_base_url])
     if args.provider_model:
         command.extend(["--provider-model", args.provider_model])
     # Keep provider keys in the subprocess environment instead of argv so they
@@ -1710,6 +2060,10 @@ def benchmark_command(
         command.extend(["--model-context-window", str(args.model_context_window)])
     if args.model_max_tokens is not None:
         command.extend(["--model-max-tokens", str(args.model_max_tokens)])
+    if args.claude_max_turns is not None:
+        command.extend(["--claude-max-turns", str(args.claude_max_turns)])
+    if args.claude_max_budget_usd is not None:
+        command.extend(["--claude-max-budget-usd", str(args.claude_max_budget_usd)])
     if task_names_file is not None:
         command.extend(["--task-names-file", str(task_names_file)])
     if args.result_only:
@@ -1987,14 +2341,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--swegym-dataset", type=Path, default=DEFAULT_SWEGYM_DATASET)
     parser.add_argument("--verified-dataset", default=os.getenv("HARBOR_DATASET", "swe-bench/swe-bench-verified@2"))
+    parser.add_argument(
+        "--train-tasks-file",
+        type=Path,
+        default=None,
+        help="Explicit SWEGym training task names file. Overrides the default repo-isolated split train set.",
+    )
     parser.add_argument("--validation-ratio", type=float, default=0.05)
     parser.add_argument(
         "--provider",
-        choices=["openai", "tinker", "novita", "openai-compatible", "openai_compatible"],
+        choices=SUPPORTED_PROVIDER_CHOICES + ("openai-compatible", "openai_compatible"),
         default=os.getenv("LLM_PROVIDER", "openai"),
-        help="Provider profile. novita/openai-compatible aliases are normalized to openai-compatible mode.",
+        help="Provider profile for Pi or Claude Code harness runs.",
+    )
+    parser.add_argument(
+        "--agent",
+        "--harness",
+        choices=["pi", "claude-code"],
+        default=normalize_agent(os.getenv("BENCHMARK_AGENT", os.getenv("HARBOR_AGENT", "pi"))),
+        help="Agent harness for SWEGym benchmark jobs.",
     )
     parser.add_argument("--provider-base-url", default=os.getenv("PROVIDER_BASE_URL"))
+    parser.add_argument("--provider-anthropic-base-url", default=os.getenv("PROVIDER_ANTHROPIC_BASE_URL"))
     parser.add_argument("--provider-model", default=os.getenv("PROVIDER_MODEL"))
     parser.add_argument("--provider-api-key", default=os.getenv("PROVIDER_API_KEY"))
     parser.add_argument("--provider-api", default=os.getenv("PROVIDER_API"))
@@ -2028,6 +2396,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--override-storage-mb", type=int, default=int(os.getenv("E2B_OVERRIDE_STORAGE_MB", "10240")))
     parser.add_argument("--model-context-window", type=int, default=None)
     parser.add_argument("--model-max-tokens", type=int, default=None)
+    parser.add_argument("--claude-max-turns", type=int, default=int(os.getenv("CLAUDE_MAX_TURNS", "0")) or None)
+    parser.add_argument(
+        "--claude-max-budget-usd",
+        type=float,
+        default=float(os.getenv("CLAUDE_MAX_BUDGET_USD", "0")) or None,
+    )
     parser.add_argument("--result-only", action="store_true")
     parser.add_argument("--force-build", action="store_true")
     parser.add_argument("--keep-sandboxes", action="store_true")
@@ -2047,7 +2421,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-max-tokens", type=int, default=2600)
     parser.add_argument("--skill-resource-max-chars", type=int, default=1200)
     parser.add_argument("--skill-resource-max-total-chars", type=int, default=18000)
-    parser.add_argument("--skill-archive-root", type=Path, default=DEFAULT_SKILL_ARCHIVE_ROOT)
+    parser.add_argument(
+        "--jobs-root",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for benchmark job outputs. Defaults to jobs/ for Pi and "
+            "jobs/claude_code/ for Claude Code."
+        ),
+    )
+    parser.add_argument(
+        "--skill-archive-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root for accepted skill versions. Defaults to skills/accepted for Pi and "
+            "skills/accepted_claude_code for Claude Code."
+        ),
+    )
     parser.add_argument("--skill-version-id", default=None)
     parser.add_argument("--overwrite-skill-version", action="store_true")
     parser.add_argument(
@@ -2162,7 +2553,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--validation-candidate-pack-root",
         type=Path,
-        default=DEFAULT_CANDIDATE_EVAL_PACK_ROOT,
+        default=None,
         help="Root for temporary candidate-augmented validation skill packs.",
     )
     parser.add_argument(
@@ -2207,6 +2598,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-training-update", action="store_true")
     parser.add_argument("--baseline-train-job-dir", type=Path, default=None)
+    parser.add_argument(
+        "--baseline-train-job-glob",
+        action="append",
+        default=list_env("SWEGYM_BASELINE_TRAIN_JOB_GLOB"),
+        help=(
+            "External no-skill baseline job glob(s). Matching shards are imported into "
+            "the run-local baseline job before training, so the no-skill baseline is not rerun."
+        ),
+    )
+    parser.add_argument(
+        "--train-tasks-from-external-baseline",
+        action="store_true",
+        help=(
+            "Use the tasks covered by --baseline-train-job-glob as the train split. "
+            "This is useful when importing a completed baseline subset from another repo."
+        ),
+    )
+    parser.add_argument(
+        "--copy-external-baseline",
+        action="store_true",
+        help="Copy external baseline trial directories instead of symlinking them.",
+    )
+    parser.add_argument(
+        "--force-external-baseline-import",
+        action="store_true",
+        help="Replace an existing incomplete imported baseline job directory.",
+    )
     parser.add_argument("--validation-baseline-job-dir", type=Path, default=None)
     parser.add_argument("--validation-skill-job-dir", type=Path, default=None)
     parser.add_argument("--wandb-project", default=os.getenv("WANDB_PROJECT", DEFAULT_WANDB_PROJECT))
@@ -2221,16 +2639,25 @@ def main() -> None:
     args = parse_args()
     args.max_task_evidence_edits_per_task = args.max_task_skill_edits_per_task
     args.provider = normalize_provider(args.provider)
-    if args.provider == "openai":
-        args.provider_base_url = args.provider_base_url or os.getenv("OPENAI_COMPAT_BASE_URL")
-        args.provider_model = args.provider_model or os.getenv("OPENAI_COMPAT_MODEL")
-        args.provider_api_key = args.provider_api_key or os.getenv("OPENAI_COMPAT_API_KEY")
-        args.provider_api = args.provider_api or os.getenv("OPENAI_COMPAT_API")
-    elif args.provider == "tinker":
-        args.provider_base_url = args.provider_base_url or os.getenv("TINKER_BASE_URL")
-        args.provider_model = args.provider_model or os.getenv("TINKER_MODEL")
-        args.provider_api_key = args.provider_api_key or os.getenv("TINKER_API_KEY")
-        args.provider_api = args.provider_api or os.getenv("TINKER_API")
+    args.agent = normalize_agent(args.agent)
+    args.jobs_root = (args.jobs_root or default_jobs_root(args.agent)).expanduser().resolve()
+    args.skill_archive_root = (
+        args.skill_archive_root or default_skill_archive_root(args.agent)
+    ).expanduser().resolve()
+    args.validation_candidate_pack_root = (
+        args.validation_candidate_pack_root
+        or default_validation_candidate_pack_root(args.agent)
+    ).expanduser().resolve()
+    provider_spec: ProviderSpec = resolve_provider(args.provider)
+    args.provider_base_url = args.provider_base_url or os.getenv(provider_spec.base_url_env) or provider_spec.default_base_url
+    args.provider_anthropic_base_url = (
+        args.provider_anthropic_base_url
+        or (os.getenv(provider_spec.anthropic_base_url_env) if provider_spec.anthropic_base_url_env else None)
+        or provider_spec.default_anthropic_base_url
+    )
+    args.provider_model = args.provider_model or os.getenv(provider_spec.model_env) or provider_spec.default_model
+    args.provider_api_key = args.provider_api_key or os.getenv(provider_spec.api_key_env) or provider_spec.default_api_key
+    args.provider_api = args.provider_api or os.getenv(provider_spec.provider_api_env) or provider_spec.default_provider_api
 
     run_name = args.run_name or f"swegym_glm51_loop_{utc_stamp()}"
     run_dir = DEFAULT_EVO_ROOT / run_name
@@ -2249,6 +2676,55 @@ def main() -> None:
         smoke_train_tasks=args.smoke_train_tasks if args.smoke else None,
         smoke_validation_tasks=args.smoke_validation_tasks if args.smoke else None,
     )
+    split_override: dict[str, Any] | None = None
+    external_baseline_jobs_for_split: list[Path] = []
+    if args.train_tasks_from_external_baseline:
+        external_baseline_jobs_for_split = expand_job_globs(args.baseline_train_job_glob)
+        if not external_baseline_jobs_for_split:
+            raise SystemExit("--train-tasks-from-external-baseline requires matching --baseline-train-job-glob")
+        train_names = task_names_from_job_dirs(external_baseline_jobs_for_split)
+        validation_names, validation_repos, validation_override = rewrite_validation_split_excluding_train(
+            tasks=tasks,
+            train_names=train_names,
+            split_dir=split_dir,
+            validation_ratio=args.validation_ratio,
+            smoke_validation_tasks=args.smoke_validation_tasks if args.smoke else None,
+        )
+        write_lines(split_dir / "train_tasks.txt", train_names)
+        split_info["train_tasks_file"] = str(split_dir / "train_tasks.txt")
+        split_info["validation_tasks_file"] = str(split_dir / "validation_tasks.txt")
+        split_info["n_train"] = len(train_names)
+        split_info["n_validation"] = len(validation_names)
+        split_info["validation_repos"] = sorted(validation_repos)
+        split_override = {
+            "mode": "external_baseline_task_coverage",
+            "source_job_dirs": [str(path) for path in external_baseline_jobs_for_split],
+            "n_train": len(train_names),
+            "n_validation_after_overlap_removal": len(validation_names),
+            **validation_override,
+        }
+    elif args.train_tasks_file is not None:
+        train_names = read_lines(args.train_tasks_file.expanduser())
+        validation_names, validation_repos, validation_override = rewrite_validation_split_excluding_train(
+            tasks=tasks,
+            train_names=train_names,
+            split_dir=split_dir,
+            validation_ratio=args.validation_ratio,
+            smoke_validation_tasks=args.smoke_validation_tasks if args.smoke else None,
+        )
+        write_lines(split_dir / "train_tasks.txt", train_names)
+        split_info["train_tasks_file"] = str(split_dir / "train_tasks.txt")
+        split_info["validation_tasks_file"] = str(split_dir / "validation_tasks.txt")
+        split_info["n_train"] = len(train_names)
+        split_info["n_validation"] = len(validation_names)
+        split_info["validation_repos"] = sorted(validation_repos)
+        split_override = {
+            "mode": "explicit_train_tasks_file",
+            "source_train_tasks_file": str(args.train_tasks_file.expanduser().resolve()),
+            "n_train": len(train_names),
+            "n_validation_after_overlap_removal": len(validation_names),
+            **validation_override,
+        }
     if split_info["n_validation"] > 0:
         args.validation_min_effective_trials = min(
             args.validation_min_effective_trials,
@@ -2259,9 +2735,12 @@ def main() -> None:
         "target_validation_tasks": round(len(tasks) * args.validation_ratio),
         **split_info,
     }
+    if split_override:
+        repo_stats["train_split_override"] = split_override
     write_json(split_dir / "repo_split_summary.json", repo_stats)
 
-    skill_archive_root = args.skill_archive_root.expanduser().resolve()
+    jobs_root = args.jobs_root
+    skill_archive_root = args.skill_archive_root
     version_id = args.skill_version_id or next_skill_version_id(skill_archive_root)
     existing_versions = archived_skill_versions(skill_archive_root)
     if (
@@ -2277,26 +2756,26 @@ def main() -> None:
     env = os.environ.copy()
     env["SKILL_EVO_RUN_DIR"] = str(run_dir)
     if args.provider_api_key:
-        if args.provider == "openai":
-            env["OPENAI_COMPAT_API_KEY"] = args.provider_api_key
-        elif args.provider == "tinker":
-            env["TINKER_API_KEY"] = args.provider_api_key
+        env[provider_spec.api_key_env] = args.provider_api_key
     if args.provider_base_url:
-        env["OPENAI_COMPAT_BASE_URL" if args.provider == "openai" else "TINKER_BASE_URL"] = args.provider_base_url
+        env[provider_spec.base_url_env] = args.provider_base_url
+    if args.provider_anthropic_base_url and provider_spec.anthropic_base_url_env:
+        env[provider_spec.anthropic_base_url_env] = args.provider_anthropic_base_url
     if args.provider_model:
-        env["OPENAI_COMPAT_MODEL" if args.provider == "openai" else "TINKER_MODEL"] = args.provider_model
+        env[provider_spec.model_env] = args.provider_model
     if args.provider_api:
-        env["OPENAI_COMPAT_API" if args.provider == "openai" else "TINKER_API"] = args.provider_api
+        env[provider_spec.provider_api_env] = args.provider_api
+    env.setdefault("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
     ensure_macaron_attribution_header(args.provider_base_url, env)
-    if args.provider == "openai":
-        ensure_reasoning_effort_none(
-            args.provider_base_url,
-            env,
-            env_prefix="OPENAI_COMPAT",
-        )
+    ensure_macaron_attribution_header(args.provider_anthropic_base_url, env)
+    ensure_reasoning_effort_none(
+        args.provider_base_url,
+        env,
+        env_prefix=provider_spec.env_prefix,
+    )
 
     train_job_name = f"{run_name}_swegym_train_noskills"
-    default_train_job_dir = ROOT / "jobs" / train_job_name
+    default_train_job_dir = jobs_root / train_job_name
     provided_train_job_dir = (
         args.baseline_train_job_dir.expanduser().resolve()
         if args.baseline_train_job_dir
@@ -2304,6 +2783,7 @@ def main() -> None:
     )
     train_job_dir = default_train_job_dir
     train_job_complete = not args.dry_run and job_result_is_complete(train_job_dir)
+    external_train_baseline_import: dict[str, Any] | None = None
     if (
         not train_job_complete
         and provided_train_job_dir
@@ -2312,9 +2792,25 @@ def main() -> None:
     ):
         train_job_dir = provided_train_job_dir
         train_job_complete = True
+    elif not train_job_complete and args.baseline_train_job_glob and not args.dry_run:
+        external_baseline_jobs = expand_job_globs(args.baseline_train_job_glob)
+        if not external_baseline_jobs:
+            raise SystemExit(
+                "No external baseline jobs matched --baseline-train-job-glob: "
+                + ", ".join(args.baseline_train_job_glob)
+            )
+        external_train_baseline_import = materialize_external_baseline_job(
+            source_job_dirs=external_baseline_jobs,
+            output_job_dir=default_train_job_dir,
+            task_names_file=split_dir / "train_tasks.txt",
+            copy_trials=args.copy_external_baseline,
+            force=args.force_external_baseline_import,
+        )
+        train_job_dir = default_train_job_dir
+        train_job_complete = job_result_is_complete(train_job_dir) and job_has_trial_results(train_job_dir)
 
     val_base_name = f"{run_name}_swegym_validation_noskills"
-    default_val_base_dir = ROOT / "jobs" / val_base_name
+    default_val_base_dir = jobs_root / val_base_name
     provided_val_base_dir = (
         args.validation_baseline_job_dir.expanduser().resolve()
         if args.validation_baseline_job_dir
@@ -2329,7 +2825,7 @@ def main() -> None:
     if not job_result_is_complete(val_base_dir) and provided_val_base_dir and job_result_is_complete(provided_val_base_dir):
         val_base_dir = provided_val_base_dir
     final_val_skill_name = f"{run_name}_swegym_validation_accepted_skills"
-    final_val_skill_dir = ROOT / "jobs" / final_val_skill_name
+    final_val_skill_dir = jobs_root / final_val_skill_name
     if (
         not job_result_is_complete(final_val_skill_dir)
         and provided_val_skill_dir
@@ -2353,10 +2849,19 @@ def main() -> None:
         "dry_run": args.dry_run,
         "smoke": args.smoke,
         "provider": args.provider,
+        "agent": args.agent,
+        "provider_profile": {
+            "name": provider_spec.name,
+            "base_url_env": provider_spec.base_url_env,
+            "anthropic_base_url_env": provider_spec.anthropic_base_url_env,
+            "model_env": provider_spec.model_env,
+            "provider_api_env": provider_spec.provider_api_env,
+        },
         "swegym_dataset": str(args.swegym_dataset),
         "verified_dataset": args.verified_dataset,
         "split": repo_stats,
         "skill_version_id": version_id,
+        "jobs_root": str(jobs_root),
         "skill_archive_root": str(skill_archive_root),
         "hierarchical_skill_update": {
             "training_iterations": args.training_iterations,
@@ -2379,6 +2884,7 @@ def main() -> None:
             "validation_candidate_include_existing_signatures": args.validation_candidate_include_existing_signatures,
             "validation_candidate_pack_root": str(args.validation_candidate_pack_root),
         },
+        "external_train_baseline_import": external_train_baseline_import,
         "missing_runtime_env": missing_env,
     }
     write_json(run_dir / "manifest.json", manifest)
@@ -2573,7 +3079,7 @@ def main() -> None:
                     batch_index = int(batch["batch_index"])
                     batch_file = Path(str(batch["task_names_file"]))
                     skill_job_name = f"{run_name}_train_iter{iteration:02d}_batch{batch_index:04d}_skills"
-                    skill_job_dir = ROOT / "jobs" / skill_job_name
+                    skill_job_dir = jobs_root / skill_job_name
                     if not job_result_is_complete(skill_job_dir):
                         run_command(
                             benchmark_command(
@@ -2605,7 +3111,7 @@ def main() -> None:
                                 previous_job_dir=(
                                     train_job_dir
                                     if iteration == 1
-                                    else ROOT / "jobs" / f"{run_name}_train_iter{iteration - 1:02d}_batch{batch_index:04d}_skills"
+                                    else jobs_root / f"{run_name}_train_iter{iteration - 1:02d}_batch{batch_index:04d}_skills"
                                 ),
                                 task_names_file=batch_file,
                                 memory_path=train_memory_path,
@@ -2662,7 +3168,7 @@ def main() -> None:
                         gate_job_name = (
                             f"{run_name}_validation_iter{iteration:02d}_gate{gate_index:04d}_skills"
                         )
-                        gate_job_dir = ROOT / "jobs" / gate_job_name
+                        gate_job_dir = jobs_root / gate_job_name
                         validation_skill_pack_root = candidate_skill_pack_root
                         candidate_augmented_manifest: dict[str, Any] | None = None
                         if args.validation_include_failure_candidates and not args.dry_run:
@@ -2879,7 +3385,7 @@ def main() -> None:
         verified_job_dir = None
         if args.run_verified_test:
             verified_job_name = f"{run_name}_swebench_verified_skills"
-            verified_job_dir = ROOT / "jobs" / verified_job_name
+            verified_job_dir = jobs_root / verified_job_name
             env["PI_SKILL_PACK_ROOT"] = str(skill_pack_root)
             env["PI_USE_SKILL_HARNESS_MEMORY"] = "false"
             env["PI_SKILL_RETRIEVAL_SCOPE"] = "general,failure"

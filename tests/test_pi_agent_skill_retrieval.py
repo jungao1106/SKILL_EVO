@@ -10,9 +10,12 @@ from unittest import mock
 from agents.pi_agent import (
     _filter_task_specific_skills,
     _repo_slug_from_instruction,
+    _task_context_marker,
     _task_filter_text,
+    _task_slug_from_instruction,
 )
 from agents.claude_sdk_agent import _task_filter_text as _claude_task_filter_text
+from agents.skill_harness_memory import task_slug_from_text
 
 
 class TestTimeSkillRetrievalTest(unittest.TestCase):
@@ -42,7 +45,12 @@ class TestTimeSkillRetrievalTest(unittest.TestCase):
             environment_dir.mkdir(parents=True)
             (task_dir / "task.toml").write_text(
                 """\
+[task]
+name = "datacurve/bandit-structured-nosec-directives"
 [metadata]
+task_id = "bandit-structured-nosec-directives"
+language = "python"
+category = "feature_request"
 repository_url = "https://github.com/PyCQA/bandit.git"
 """
             )
@@ -52,6 +60,18 @@ repository_url = "https://github.com/PyCQA/bandit.git"
                 session_id="trial",
             )
             filter_text = _task_filter_text("DeepSWE issue", environment)
+            self.assertEqual(
+                _task_slug_from_instruction(filter_text),
+                "bandit-structured-nosec-directives",
+            )
+            self.assertEqual(
+                task_slug_from_text(filter_text),
+                "bandit-structured-nosec-directives",
+            )
+            self.assertEqual(_task_context_marker(filter_text, "language"), "python")
+            self.assertEqual(
+                _task_context_marker(filter_text, "category"), "feature_request"
+            )
             self.assertEqual(
                 _repo_slug_from_instruction(
                     _claude_task_filter_text("DeepSWE issue", environment)
@@ -90,6 +110,34 @@ repository_url = "https://github.com/PyCQA/bandit.git"
             self.assertEqual(selected_names[0], "matching-repo")
             self.assertIn("generic-recovery", selected_names)
             self.assertNotIn("other-repo", selected_names)
+
+    def test_deepswe_task_slug_routes_task_specific_skill(self) -> None:
+        skills = [
+            {
+                "name": "matching-task",
+                "relative_path": (
+                    "_tasks/bandit-structured-nosec-directives/matching/SKILL.md"
+                ),
+            },
+            {
+                "name": "other-task",
+                "relative_path": "_tasks/other-task/other/SKILL.md",
+            },
+        ]
+        with mock.patch.dict(
+            os.environ, {"PI_SKILL_RETRIEVAL_SCOPE": "task"}, clear=False
+        ):
+            selected = _filter_task_specific_skills(
+                skills,
+                "datacurve/bandit-structured-nosec-directives",
+            )
+
+        self.assertEqual([skill["name"] for skill in selected], ["matching-task"])
+
+    def test_explicit_deepswe_task_marker_is_preferred(self) -> None:
+        text = "datacurve/stale-name\nskill-task:datacurve/current-name"
+        self.assertEqual(_task_slug_from_instruction(text), "current-name")
+        self.assertEqual(task_slug_from_text(text), "current-name")
 
 
 if __name__ == "__main__":

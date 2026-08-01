@@ -20,7 +20,11 @@ from harbor.models.trial.paths import EnvironmentPaths
 from harbor.utils.trajectory_utils import format_trajectory_json
 
 from agents.pi_agent import (
+    PI_SANDBOX_SKILLS_DIR,
+    PI_SKILLS_INDEX_PATH,
     _pi_skill_pack,
+    _pi_no_skills_cleanup_command,
+    _pi_skills_setup_commands,
     _pi_skills_metadata,
     _task_filter_text as _pi_task_filter_text,
 )
@@ -60,6 +64,7 @@ BENCHMARK ISSUE:
 REMOTE_VENV = PurePosixPath("/tmp/harbor-claude-agent-venv")
 REMOTE_PYTHON = REMOTE_VENV / "bin/python"
 DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.116"
+DEFAULT_CLAUDE_SKILL_INDEX_MAX_ENTRIES = 32
 
 
 class DeepSweProviderAuthenticationError(RuntimeError):
@@ -861,45 +866,45 @@ def _task_filter_text(instruction: str, environment: BaseEnvironment) -> str:
     return _pi_task_filter_text(instruction, environment)
 
 
+def _claude_skill_index_max_entries() -> int:
+    raw = os.getenv(
+        "CLAUDE_SKILL_INDEX_MAX_ENTRIES",
+        str(DEFAULT_CLAUDE_SKILL_INDEX_MAX_ENTRIES),
+    )
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_CLAUDE_SKILL_INDEX_MAX_ENTRIES
+    return min(64, max(1, value))
+
+
 def _claude_transferable_skills_prompt(skills: list[dict[str, Any]]) -> str:
     if not skills:
         return ""
 
-    max_skill_chars = int(os.getenv("CLAUDE_SKILL_PROMPT_MAX_CHARS_PER_SKILL", "3600"))
     lines = [
         "",
-        "Transferable skill library:",
-        "- Treat these skills as evidence-gated weak hints, not mandatory patches.",
-        "- First inspect the current repository evidence. Use a skill only if its checks, owner path, error signal, or validation command match.",
-        "- If no skill matches concrete repository evidence, continue with the normal no-skill workflow.",
-        "- Prefer at most two matching skills before the first edit.",
+        "Transferable skill index:",
+        f"- Skill files are available under {PI_SANDBOX_SKILLS_DIR}.",
+        f"- The machine-readable index is saved at {PI_SKILLS_INDEX_PATH}.",
+        "- First inspect the current repository. Match skill descriptions against concrete task evidence before reading a skill file.",
+        "- You may read zero skills. If no description matches, continue with the normal no-skill workflow.",
+        "- Read at most two matching SKILL.md files before the first edit. Stop using a skill as soon as its first check does not match.",
         "",
+        "Available skills:",
     ]
     for skill in skills:
-        root = skill.get("_root")
-        relative_path = skill.get("relative_path")
-        if not root or not relative_path:
-            continue
-        skill_path = Path(str(root)) / str(relative_path)
-        try:
-            body = skill_path.read_text(errors="replace").strip()
-        except OSError:
-            continue
-        if len(body) > max_skill_chars:
-            body = body[: max_skill_chars - 32].rstrip() + "\n... [skill truncated]"
         quality = skill.get("quality_score")
-        quality_text = f", quality={quality:.2f}" if isinstance(quality, (int, float)) else ""
-        lines.extend(
-            [
-                f"### {skill.get('name') or skill_path.parent.name}",
-                f"- Source: `{relative_path}`",
-                f"- Use policy: `{skill.get('use_policy', 'evidence-gated')}`{quality_text}",
-                "",
-                body,
-                "",
-            ]
+        quality_text = (
+            f", quality={quality:.2f}" if isinstance(quality, (int, float)) else ""
         )
-    return "\n".join(lines).rstrip() + "\n"
+        description = " ".join(str(skill.get("description") or "").split())[:240]
+        description_text = f" {description}" if description else ""
+        lines.append(
+            f"- {skill['name']}:{description_text} Path: {skill['path']} "
+            f"({skill.get('use_policy', 'evidence-gated')}{quality_text})"
+        )
+    return "\n".join(lines)
 
 
 def _claude_system_prompt(memory_prompt: str = "", skill_prompt: str = "") -> str:
@@ -1118,18 +1123,31 @@ class ClaudeSdkAgent(BaseInstalledAgent):
         provider_model = env[self.model_env]
         model = self.model_name or f"{self.provider_name}/{provider_model}"
         task_filter_text = _task_filter_text(instruction, environment)
+        skill_index_max_entries = _claude_skill_index_max_entries()
         if self.use_skills:
-            claude_skills, _, _, all_claude_skills_count, skill_retrieval_filter = _pi_skill_pack(
-                task_filter_text
+            (
+                claude_skills,
+                claude_skill_pack_b64,
+                claude_skill_source_root,
+                all_claude_skills_count,
+                skill_retrieval_filter,
+            ) = _pi_skill_pack(
+                task_filter_text,
+                max_skills=skill_index_max_entries,
             )
         else:
             claude_skills = []
+            claude_skill_pack_b64 = ""
+            claude_skill_source_root = ""
             all_claude_skills_count = 0
             skill_retrieval_filter = {
                 "task_slug": "",
                 "repo_slug": "",
+                "language": "",
+                "category": "",
                 "max_prompt_skills": "0",
             }
+        has_skill_pack = self.use_skills and bool(claude_skills)
         transferable_skill_prompt = _claude_transferable_skills_prompt(claude_skills)
         skill_harness_memory = {
             "enabled": False,
@@ -1156,6 +1174,19 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             use_skills=effective_use_skills,
         )
         thinking_disabled = _disable_thinking_for_provider_model(provider_model)
+        if has_skill_pack:
+            skills_policy = (
+                "transferable skill index injected; indexed candidate files materialized "
+                "in the sandbox for evidence-gated on-demand reads; "
+                "ClaudeAgentOptions(skills=[], setting_sources=[])"
+            )
+        elif effective_use_skills:
+            skills_policy = (
+                "skill_harness_memory injected without a transferable skill pack; "
+                "ClaudeAgentOptions(skills=[], setting_sources=[])"
+            )
+        else:
+            skills_policy = "disabled via ClaudeAgentOptions(skills=[], setting_sources=[])"
 
         instruction_path = PurePosixPath(EnvironmentPaths.agent_dir / self._INSTRUCTION_FILENAME)
         system_prompt_path = PurePosixPath(EnvironmentPaths.agent_dir / self._SYSTEM_PROMPT_FILENAME)
@@ -1178,17 +1209,22 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             "model_env": self.model_env,
             "system_prompt": claude_system_prompt,
             "tool_policy": "default Claude Code toolset; permission_mode=bypassPermissions",
-            "skills_policy": (
-                "transferable skill prompt and/or skill_harness_memory injected; "
-                "ClaudeAgentOptions(skills=[], setting_sources=[])"
-                if effective_use_skills
-                else "disabled via ClaudeAgentOptions(skills=[], setting_sources=[])"
-            ),
+            "skills_policy": skills_policy,
             "use_skills": effective_use_skills,
             "transferable_skills": {
                 "source_root_filter": skill_retrieval_filter,
+                "source_root": claude_skill_source_root,
                 "all_discovered_count": all_claude_skills_count,
                 "selected": _pi_skills_metadata(claude_skills),
+                "indexed_count": len(claude_skills),
+                "index_max_entries": skill_index_max_entries,
+                "delivery_mode": "sandbox_index_on_demand",
+                "retrieval_mode": "model_evidence_gated_from_index",
+                "materialized": has_skill_pack,
+                "skills_dir": PI_SANDBOX_SKILLS_DIR.as_posix(),
+                "index_path": PI_SKILLS_INDEX_PATH.as_posix(),
+                "body_prompt_chars": 0,
+                "index_prompt_chars": len(transferable_skill_prompt),
                 "prompt_chars": len(transferable_skill_prompt),
             },
             "skill_harness_memory": {
@@ -1218,6 +1254,21 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             f": > {shlex.quote(str(stderr_path))}\n"
         )
         await self.exec_as_agent(environment, command=setup_command, env=env)
+        skill_setup_commands = (
+            _pi_skills_setup_commands(
+                claude_skills,
+                claude_skill_pack_b64,
+                python_command=str(REMOTE_PYTHON),
+            )
+            if has_skill_pack
+            else [_pi_no_skills_cleanup_command()]
+        )
+        for skill_setup_command in skill_setup_commands:
+            await self.exec_as_agent(
+                environment,
+                command="set -euo pipefail\n" + skill_setup_command,
+                env=env,
+            )
         await self._write_remote_file(environment, instruction_path, effective_instruction, env)
         await self._write_remote_file(environment, system_prompt_path, claude_system_prompt, env)
         await self._write_remote_file(

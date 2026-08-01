@@ -160,6 +160,58 @@ class TemplateLookupCacheTests(unittest.TestCase):
         previous_sandbox.kill.assert_awaited_once()
         self.assertIsNone(environment._sandbox)
 
+    def test_cancelled_command_is_killed_before_cancellation_propagates(self) -> None:
+        environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+        handle = SimpleNamespace(
+            wait=AsyncMock(side_effect=asyncio.CancelledError()),
+            kill=AsyncMock(return_value=True),
+        )
+        commands = SimpleNamespace(run=AsyncMock(return_value=handle))
+        environment._sandbox = SimpleNamespace(commands=commands)
+        environment._workdir = "/app"
+        environment._persistent_env = {}
+        environment.default_user = None
+        environment.logger = SimpleNamespace(warning=lambda *_args: None)
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(environment.exec("long-running-agent", user="root"))
+
+        handle.kill.assert_awaited_once_with()
+        commands.run.assert_awaited_once_with(
+            cmd="long-running-agent",
+            background=True,
+            cwd="/app",
+            envs={},
+            timeout=0,
+            user="root",
+        )
+
+    def test_completed_command_preserves_exec_result(self) -> None:
+        environment = object.__new__(e2b_swebench.E2BSwebenchEnvironment)
+        handle = SimpleNamespace(
+            wait=AsyncMock(
+                return_value=SimpleNamespace(
+                    stdout="out",
+                    stderr="err",
+                    exit_code=7,
+                )
+            ),
+            kill=AsyncMock(),
+        )
+        environment._sandbox = SimpleNamespace(
+            commands=SimpleNamespace(run=AsyncMock(return_value=handle))
+        )
+        environment._workdir = "/app"
+        environment._persistent_env = {}
+        environment.default_user = None
+
+        result = asyncio.run(environment.exec("command"))
+
+        self.assertEqual(result.stdout, "out")
+        self.assertEqual(result.stderr, "err")
+        self.assertEqual(result.return_code, 7)
+        handle.kill.assert_not_awaited()
+
     def test_dockerfile_runtime_env_resolves_against_base_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dockerfile = Path(temp_dir) / "Dockerfile"

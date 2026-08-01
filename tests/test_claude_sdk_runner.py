@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from agents.claude_sdk_agent import (
     RUNNER_SCRIPT,
+    _claude_skill_index_max_entries,
+    _claude_transferable_skills_prompt,
     _events_completed,
     _termination_status,
 )
@@ -110,6 +116,43 @@ class ClaudeRunnerFailureClassificationTest(unittest.TestCase):
             "budget_exhausted",
         )
         self.assertEqual(_termination_status([event]), "budget_exhausted")
+
+
+class ClaudeSkillDeliveryTest(unittest.TestCase):
+    def test_prompt_contains_index_but_not_skill_body(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            skill_path = Path(raw_dir) / "example" / "SKILL.md"
+            skill_path.parent.mkdir()
+            skill_path.write_text("SECRET_SKILL_BODY_SENTINEL\n")
+            prompt = _claude_transferable_skills_prompt(
+                [
+                    {
+                        "name": "example-skill",
+                        "description": "Use only after matching repository evidence.",
+                        "path": "/tmp/pi-skills/example/SKILL.md",
+                        "relative_path": "example/SKILL.md",
+                        "_root": raw_dir,
+                        "quality_score": 0.9,
+                        "use_policy": "evidence-gated",
+                    }
+                ]
+            )
+
+        self.assertIn("example-skill", prompt)
+        self.assertIn("Use only after matching repository evidence.", prompt)
+        self.assertIn("/tmp/pi-skills/example/SKILL.md", prompt)
+        self.assertIn("Read at most two matching SKILL.md files", prompt)
+        self.assertNotIn("SECRET_SKILL_BODY_SENTINEL", prompt)
+
+    def test_skill_index_limit_is_bounded(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_SKILL_INDEX_MAX_ENTRIES": "999"}, clear=False
+        ):
+            self.assertEqual(_claude_skill_index_max_entries(), 64)
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_SKILL_INDEX_MAX_ENTRIES": "invalid"}, clear=False
+        ):
+            self.assertEqual(_claude_skill_index_max_entries(), 32)
 
 
 if __name__ == "__main__":

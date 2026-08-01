@@ -288,7 +288,7 @@ def subset_execution_payload(
         "PI_SKILL_HARNESS_MEMORY_MAX_ENTRIES",
         "PI_SKILL_HARNESS_MEMORY_MAX_CHARS",
         "PI_MIN_MEMORY_SKILL_QUALITY",
-        "CLAUDE_SKILL_PROMPT_MAX_CHARS_PER_SKILL",
+        "CLAUDE_SKILL_INDEX_MAX_ENTRIES",
         f"{provider.env_prefix}_REASONING_EFFORT",
         f"{provider.env_prefix}_ENABLE_THINKING",
     )

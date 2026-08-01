@@ -411,6 +411,9 @@ def _discover_pi_skills_from_roots(skills_roots: list[Path]) -> list[dict[str, s
 
 def _task_slug_from_instruction(instruction: str) -> str:
     patterns = (
+        r"(?<![A-Za-z0-9_.-])skill-task:datacurve/([A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_.-])",
+        r"(?<![A-Za-z0-9_.-])datacurve/([A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_.-])",
+        r"(?<![A-Za-z0-9_.-])skill-task:([A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_.-])",
         r"swe-bench/([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
         r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
     )
@@ -419,6 +422,15 @@ def _task_slug_from_instruction(instruction: str) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+def _task_context_marker(instruction: str, name: str) -> str:
+    marker = re.search(
+        rf"(?<![A-Za-z0-9_.-])skill-{re.escape(name)}:([A-Za-z0-9_.+-]+)"
+        r"(?=$|[^A-Za-z0-9_.+-])",
+        instruction,
+    )
+    return marker.group(1) if marker else ""
 
 
 def _repo_slug_from_instruction(instruction: str) -> str:
@@ -508,9 +520,12 @@ def _skill_scope_rank(skill: dict[str, str], task_slug: str, repo_slug: str) -> 
 def _filter_task_specific_skills(
     skills: list[dict[str, str]],
     instruction: str,
+    *,
+    max_skills: int = PI_MAX_PROMPT_SKILLS,
 ) -> list[dict[str, str]]:
     if not skills:
         return []
+    max_skills = max(0, int(max_skills))
     task_slug = _task_slug_from_instruction(instruction)
     repo_slug = _repo_slug_from_instruction(instruction)
 
@@ -521,7 +536,7 @@ def _filter_task_specific_skills(
             continue
         ranked.append((rank, str(skill.get("relative_path") or ""), skill))
     ranked.sort(key=lambda item: (item[0], item[1]))
-    return [skill for _, _, skill in ranked[:PI_MAX_PROMPT_SKILLS]]
+    return [skill for _, _, skill in ranked[:max_skills]]
 
 
 def _iter_pi_skill_pack_files(skills_root: Path) -> list[Path]:
@@ -575,10 +590,19 @@ def _iter_pi_skill_pack_files_for_skills(
     return files
 
 
-def _pi_skill_pack(instruction: str) -> tuple[list[dict[str, str]], str, str, int, dict[str, str]]:
+def _pi_skill_pack(
+    instruction: str,
+    *,
+    max_skills: int = PI_MAX_PROMPT_SKILLS,
+) -> tuple[list[dict[str, str]], str, str, int, dict[str, str]]:
+    max_skills = max(0, int(max_skills))
     skills_roots = _active_task_skill_roots()
     all_skills = _discover_pi_skills_from_roots(skills_roots)
-    skills = _filter_task_specific_skills(all_skills, instruction)
+    skills = _filter_task_specific_skills(
+        all_skills,
+        instruction,
+        max_skills=max_skills,
+    )
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for path, relative_path in _iter_pi_skill_pack_files_for_skills(skills):
@@ -595,7 +619,9 @@ def _pi_skill_pack(instruction: str) -> tuple[list[dict[str, str]], str, str, in
     task_filter = {
         "task_slug": _task_slug_from_instruction(instruction),
         "repo_slug": _repo_slug_from_instruction(instruction),
-        "max_prompt_skills": str(PI_MAX_PROMPT_SKILLS),
+        "language": _task_context_marker(instruction, "language"),
+        "category": _task_context_marker(instruction, "category"),
+        "max_prompt_skills": str(max_skills),
     }
     return (
         skills,
@@ -617,8 +643,20 @@ def _task_filter_text(instruction: str, environment: BaseEnvironment) -> str:
         task_toml = Path(environment_dir).parent / "task.toml"
         try:
             task_config = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+            task = task_config.get("task") or {}
+            metadata = task_config.get("metadata") or {}
+            task_name = str(task.get("name") or "").strip()
+            task_id = str(metadata.get("task_id") or "").strip()
+            if re.fullmatch(r"datacurve/[A-Za-z0-9_.-]+", task_name):
+                parts.append(f"skill-task:{task_name}")
+            elif re.fullmatch(r"[A-Za-z0-9_.-]+", task_id):
+                parts.append(f"skill-task:{task_id}")
+            for marker, key in (("language", "language"), ("category", "category")):
+                value = str(metadata.get(key) or "").strip()
+                if re.fullmatch(r"[A-Za-z0-9_.+-]+", value):
+                    parts.append(f"skill-{marker}:{value}")
             repository_url = str(
-                (task_config.get("metadata") or {}).get("repository_url") or ""
+                metadata.get("repository_url") or ""
             )
             match = re.search(
                 r"(?:github\.com[/:])([^/]+)/([^/#]+?)(?:\.git)?$",
@@ -690,14 +728,19 @@ def _pi_skills_index_text(skills: list[dict[str, str]]) -> str:
         {
             "skills_dir": PI_SANDBOX_SKILLS_DIR.as_posix(),
             "excluded": sorted(PI_SKILL_PACK_EXCLUDE_DIRS),
-            "skills": skills,
+            "skills": _pi_skills_metadata(skills),
         },
         ensure_ascii=False,
         indent=2,
     )
 
 
-def _pi_skills_setup_commands(skills: list[dict[str, str]], skill_pack_b64: str) -> list[str]:
+def _pi_skills_setup_commands(
+    skills: list[dict[str, str]],
+    skill_pack_b64: str,
+    *,
+    python_command: str = "python",
+) -> list[str]:
     skills_index = _pi_skills_index_text(skills)
     if not skill_pack_b64:
         return [
@@ -723,7 +766,7 @@ def _pi_skills_setup_commands(skills: list[dict[str, str]], skill_pack_b64: str)
             f"HARBOR_PI_SKILLS_PACK_{index}_EOF\n"
         )
     commands.append(
-        "python - <<'HARBOR_PI_SKILLS_UNPACK'\n"
+        f"{shlex.quote(python_command)} - <<'HARBOR_PI_SKILLS_UNPACK'\n"
         "import base64\n"
         "import os\n"
         "import shutil\n"

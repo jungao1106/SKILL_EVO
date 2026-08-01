@@ -46,7 +46,7 @@ DEEPSWE_MIN_STORAGE_MB = 20480
 DEEPSWE_MIN_MAX_RETRIES = 3
 DEEPSWE_MIN_SANDBOX_TIMEOUT_SEC = 14400
 DEEPSWE_MIN_VERIFIER_BUFFER_SEC = 4800
-DEEPSWE_RESUME_CONTRACT_VERSION = 1
+DEEPSWE_RESUME_CONTRACT_VERSION = 2
 DEEPSWE_ARTIFACT_HOOK_VERSION = (
     "exact-official-test-paths-v7-fresh-verifier-retry-test-errata"
 )
@@ -1062,6 +1062,9 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
                 "claude_harness_memory": os.getenv(
                     "CLAUDE_USE_SKILL_HARNESS_MEMORY", ""
                 ),
+                "claude_skill_index_max_entries": os.getenv(
+                    "CLAUDE_SKILL_INDEX_MAX_ENTRIES", "32"
+                ),
             }
         )
         def env_bool(name: str, default: bool) -> bool:
@@ -1107,11 +1110,11 @@ def _deepswe_resume_contract(args: argparse.Namespace, config: Any) -> dict[str,
         "PI_MIN_ACTIVE_SKILL_QUALITY",
         "PI_USE_SKILL_HARNESS_MEMORY",
         "CLAUDE_USE_SKILL_HARNESS_MEMORY",
+        "CLAUDE_SKILL_INDEX_MAX_ENTRIES",
         "PI_SKILL_HARNESS_MEMORY_PATH",
         "PI_SKILL_HARNESS_MEMORY_MAX_ENTRIES",
         "PI_SKILL_HARNESS_MEMORY_MAX_CHARS",
         "PI_MIN_MEMORY_SKILL_QUALITY",
-        "CLAUDE_SKILL_PROMPT_MAX_CHARS_PER_SKILL",
         f"{provider.env_prefix}_REASONING_EFFORT",
         f"{provider.env_prefix}_ENABLE_THINKING",
     )
@@ -2466,13 +2469,17 @@ def _archive_deepswe_infra_trials(
             if isinstance(exception_info, dict)
             else ""
         )
-        if exception_type:
-            if exception_type in DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS:
-                candidates.append((trial_dir, f"exception:{exception_type}"))
-            continue
         reason = _deepswe_result_infra_reason(result)
-        if reason is not None and not reason.startswith("negative-reward:"):
-            candidates.append((trial_dir, reason))
+        if reason is not None:
+            # Negative verifier rewards are preserved as audit evidence and are
+            # never converted into an extra model sample. Every other invalid
+            # verifier outcome must be removed so resume can actually rerun it,
+            # even when its exception type is normally a valid agent outcome.
+            if not reason.startswith("negative-reward:"):
+                candidates.append((trial_dir, reason))
+            continue
+        if exception_type in DEEPSWE_TRANSIENT_RETRY_EXCEPTIONS:
+            candidates.append((trial_dir, f"exception:{exception_type}"))
 
     _prepare_deepswe_root_result(
         job_dir,

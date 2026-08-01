@@ -99,6 +99,10 @@ def render_eval_launcher(
         args.num_shards,
         "--concurrency-per-shard",
         args.concurrency_per_shard,
+        "--harness",
+        args.harness,
+        "--provider",
+        args.provider,
         "--python",
         args.python,
         "--env-file",
@@ -110,6 +114,18 @@ def render_eval_launcher(
         "--e2b-sandbox-timeout-sec",
         args.e2b_sandbox_timeout_sec,
     ]
+    if args.provider_base_url:
+        command.extend(["--provider-base-url", args.provider_base_url])
+    if args.provider_anthropic_base_url:
+        command.extend(["--provider-anthropic-base-url", args.provider_anthropic_base_url])
+    if args.provider_model:
+        command.extend(["--provider-model", args.provider_model])
+    if args.provider_api:
+        command.extend(["--provider-api", args.provider_api])
+    if args.claude_max_turns is not None:
+        command.extend(["--claude-max-turns", args.claude_max_turns])
+    if args.claude_max_budget_usd is not None:
+        command.extend(["--claude-max-budget-usd", args.claude_max_budget_usd])
     if args.materialize_eval_scripts_only:
         command.append("--materialize-only")
     lines = [
@@ -202,6 +218,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-file-glob", default=DEFAULT_TASK_FILE_GLOB)
     parser.add_argument("--num-shards", type=int, default=5)
     parser.add_argument("--concurrency-per-shard", type=int, default=10)
+    parser.add_argument("--harness", choices=["pi", "claude-code"], default="pi")
+    parser.add_argument("--provider", default="openai")
+    parser.add_argument("--provider-base-url", default=None)
+    parser.add_argument("--provider-anthropic-base-url", default=None)
+    parser.add_argument("--provider-model", default=None)
+    parser.add_argument("--provider-api", default=None)
+    parser.add_argument("--claude-max-turns", type=int, default=None)
+    parser.add_argument("--claude-max-budget-usd", type=float, default=None)
     parser.add_argument("--python", default=DEFAULT_PYTHON)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--agent-timeout-sec", type=float, default=3600)
@@ -335,6 +359,11 @@ def main() -> None:
             "failure_mode_min_repo_support": args.failure_mode_min_repo_support,
             "max_repo_skills_per_gate": args.max_repo_skills_per_gate,
             "max_failure_skills_per_gate": args.max_failure_skills_per_gate,
+            "harness": args.harness,
+            "provider": args.provider,
+            "provider_model": args.provider_model,
+            "provider_base_url": args.provider_base_url,
+            "provider_anthropic_base_url": args.provider_anthropic_base_url,
         },
         "summary": {
             "task_evidence": len(evidence_rows),

@@ -131,6 +131,9 @@ def _version_chain_entries(
 
 def task_slug_from_text(text: str) -> str:
     patterns = (
+        r"(?<![A-Za-z0-9_.-])skill-task:datacurve/([A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_.-])",
+        r"(?<![A-Za-z0-9_.-])datacurve/([A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_.-])",
+        r"(?<![A-Za-z0-9_.-])skill-task:([A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_.-])",
         r"swe-bench/([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
         r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-\d+)(?=__|$|[^A-Za-z0-9_.-])",
     )
