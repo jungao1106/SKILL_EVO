@@ -1,0 +1,27 @@
+\section{Limitations}
+
+\method{} has real limits. First, verifier-grounded training is only as
+trustworthy as the verifier and validation split; incomplete public tests can
+still miscalibrate the evaluator. Second, failure-mode skills can be over-broad
+when failure signatures are noisy, so we report trigger-match and
+retrieval-false-positive rates rather than pass rate alone. Third, online
+test-time evolution is order-sensitive; we report both original-order and
+random-order robustness. Fourth, the shipped evaluator is deterministic and
+rule-based---a learned evaluator must be stress-tested against false accepts,
+false rejects, and prompt bloat before it replaces the shell. Finally,
+within-cell, model-transfer, harness-transfer, and joint-transfer results answer
+different questions and must be read separately; collapsing them is exactly the
+conflation this protocol is designed to prevent.
+
+\section{Conclusion}
+
+We presented \method{}, a verifier-grounded approach for evolving external
+software-engineering skills for frozen coding agents. By promoting public task
+evidence through repo-level and cross-repo failure-mode gates, separating writer
+and evaluator policies, and freezing all transferable state behind a hard
+verifier boundary before downstream evaluation, \method{} makes leakage
+structurally hard instead of merely discouraged. The protocol is built to answer
+one question cleanly: whether SWEGym can train reusable skill-writing and
+skill-selection behavior that transfers in-domain to SWE-bench Verified and
+DeepSWE and out-of-domain to Terminal-Bench 2.0/2.1, without test-time verifier
+feedback.

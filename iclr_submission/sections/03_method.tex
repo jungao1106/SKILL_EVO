@@ -1,0 +1,192 @@
+\section{Hierarchical Skill Evolution}
+
+\subsection{A hierarchy with different update clocks}
+
+\method{} updates different abstraction levels at different rates. Low levels
+change quickly because a mistake there touches only local evidence; high levels
+change slowly because a mistake there propagates into every future task.
+Table~\ref{tab:levels} lists the objects, their clocks, and the evidence each
+promotion requires.
+
+\begin{table}[t]
+\caption{Skill-evolution objects and update clocks. The main experiments freeze
+all training-derived transferable state before any downstream evaluation.}
+\label{tab:levels}
+\begin{center}
+\small
+\begin{tabular}{@{}c L{0.24\linewidth} L{0.24\linewidth} L{0.30\linewidth}@{}}
+\toprule
+Level & Object & Update clock & Evidence requirement \\
+\midrule
+L0 & Rollout trace & Every task attempt & Public trajectory and runtime outputs \\
+L1 & Task evidence & Every task attempt & One task trace; verifier label (train only) \\
+L2 & Repo skill candidate & Same-repo batch & Multiple evidence records, one repo \\
+L3 & Failure-mode candidate & Cross-repo trigger & Repeated repo summaries across repos \\
+L4 & Skill Writer policy & Slow policy window & Aggregated accept/reject histories \\
+L5 & Skill Evaluator policy & Slow policy window & Verifier-calibrated false accepts/rejects \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+Task evidence stores public fields only---task id, repo, problem summary,
+reward, previous reward, case label, exception type, selected skills, touched and
+edited paths, public test commands, failure signature, and diagnostic signals.
+It feeds higher-level aggregation but is never exported as a reusable
+\texttt{SKILL.md}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=7mm and 12mm]
+  \node[stage] (trace) {Agent\\trace};
+  \node[stage, right=of trace] (evid) {Task\\evidence};
+  \node[stage, right=of evid] (repo) {Repo\\candidate};
+  \node[stage, right=of repo] (fail) {Failure-mode\\skill};
+  % gates on the arrows
+  \node[gate, above=4mm of $(evid)!0.5!(repo)$] (g1) {evaluator gate\\\scriptsize support\,/\,risk};
+  \node[gate, above=4mm of $(repo)!0.5!(fail)$] (g2) {evaluator gate\\\scriptsize $\geq$\,3 repos\,/\,risk};
+  \draw[flow] (trace) -- (evid);
+  \draw[flow] (evid) -- node[below, font=\scriptsize, align=center]{same-repo\\batch} (repo);
+  \draw[flow] (repo) -- node[below, font=\scriptsize, align=center]{cross-repo\\recurrence} (fail);
+  \draw[flow, gray] (g1) -- ($(evid)!0.5!(repo)$);
+  \draw[flow, gray] (g2) -- ($(repo)!0.5!(fail)$);
+  \node[below=5mm of evid, font=\scriptsize, text width=2.4cm, align=center, gray]
+    {public record,\\not deployed};
+  \node[below=5mm of fail, font=\scriptsize, text width=2.6cm, align=center, gray]
+    {primary\\transferable artifact};
+\end{tikzpicture}
+\caption{The promotion pipeline. A trace becomes task evidence, then a repo-level
+candidate, then a cross-repo failure-mode skill. Task evidence is never deployed
+directly; each upward step passes an evaluator gate that checks support, risk,
+and validation. Repo promotion needs repeated same-repo evidence; failure-mode
+promotion needs at least three distinct repositories.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Writer and evaluator: generation versus gatekeeping}
+
+The writer turns clusters of evidence into structured candidates. From a cluster
+of same-repo evidence it emits a repo candidate with fields name, trigger,
+evidence gate, actions, validation hint, abort condition, and support summary.
+From a cross-repo cluster it emits a process-level failure-mode candidate with a
+failure signature, trigger, actions, stop condition, and support summary:
+\[
+c_{\mathrm{repo}} = f_w(E_{\mathrm{repo}}), \qquad
+c_{\mathrm{fail}} = f_w(E_{\mathrm{cross\text{-}repo}}).
+\]
+The structure is not decoration: it forces every candidate to expose its trigger,
+support, actions, and risks so the evaluator can inspect them before anything is
+deployed.
+
+The evaluator is the gatekeeper that separates generation from deployment:
+\[
+\pi_e(c, E) \rightarrow (d, \hat r, \rho, z),
+\]
+with decision $d \in \{\textsc{accept}, \textsc{reject}, \textsc{revise},
+\textsc{memory-only}\}$, proxy reward $\hat r$, confidence $\rho$, and risk flags
+$z$. Hard safety risks---hidden verifier details, oracle or exact patches,
+task-id memorization, private sandbox paths---force rejection regardless of
+apparent utility. Repo candidates require repeated same-repo support; failure-mode
+candidates require support from multiple distinct repositories. A single repo can
+never originate a failure-mode skill.
+
+We deliberately ship a \emph{deterministic} evaluator shell with explicit
+thresholds and risk checks. This is an interface choice, not a limitation: it
+makes the accept/reject contract auditable today, while exposing exactly the same
+call signature that a learned evaluator---trained on SWEGym calibration
+events---can later occupy without disturbing the rest of the loop.
+
+\subsection{A fixed harness policy the learned policies cannot rewrite}
+
+The learned writer and evaluator are explicitly forbidden from inventing their
+own reward labels, update clocks, or promotion budgets. A fixed harness policy
+maps verifier transitions and runtime diagnostics to case labels:
+\begin{itemize}
+    \item \textbf{Strong positive}: previous attempt failed, current attempt
+    passed.
+    \item \textbf{Weak positive}: current attempt passed without a paired
+    improvement, or a previously passing attempt stays passing.
+    \item \textbf{Strong negative}: previous attempt passed, current attempt
+    failed.
+    \item \textbf{Weak negative}: current attempt failed without a paired
+    regression.
+    \item \textbf{Diagnostic}: missing reward, timeout, setup error, verifier
+    error, sandbox failure, or provider/runtime failure.
+\end{itemize}
+Cold-start solved traces are weak positives; unsolved traces are weak negatives
+unless a diagnostic is present. Strong positives may add support to a candidate
+but cannot by themselves create a global skill. Strong negatives prioritize
+rollback, trigger narrowing, and evaluator false-accept penalties. Diagnostics
+are kept out of semantic edit skills entirely and used only to shape runtime or
+recover/validate safeguards.
+
+\subsection{Training loop and the verifier boundary}
+
+Training alternates rollout, evidence extraction, candidate generation, evaluator
+gating, and validation (Figure~\ref{fig:verifier-boundary}, top lane). The
+verifier supervises case labels, calibrates the evaluator, and gates candidate
+states---and nothing more. At downstream evaluation (bottom lane) the writer,
+evaluator, and transferable skills are frozen and only public trace signals enter
+the update path.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=6mm and 10mm]
+  % training lane
+  \node[stage, fill=blue!4] (r1) {rollout};
+  \node[stage, right=of r1] (e1) {task\\evidence};
+  \node[stage, right=of e1] (c1) {repo/failure\\candidates};
+  \node[gate, right=of c1] (g1) {$\pi_e$ gate};
+  \node[gate, right=of g1] (v1) {validation\\gate};
+  \draw[flow] (r1)--(e1); \draw[flow] (e1)--(c1); \draw[flow] (c1)--(g1); \draw[flow] (g1)--(v1);
+  \node[draw, fill=red!8, rounded corners, font=\scriptsize, above=5mm of c1] (ver)
+    {SWEGym verifier $V$:\ labels, calibration, gates};
+  \draw[flow, red!60!black, dashed] (ver) -- (c1);
+  \draw[flow, red!60!black, dashed] (ver.east) to[out=0,in=90] (v1.north);
+  \node[left=2mm of r1, font=\footnotesize\bfseries, rotate=90, anchor=south] {Train};
+
+  % downstream lane
+  \node[stage, fill=green!5, below=14mm of r1] (r2) {frozen\\$\pi_w,\pi_e$, skills};
+  \node[stage, right=of r2] (a2) {agent\\rollout};
+  \node[stage, right=of a2] (p2) {public\\evidence};
+  \node[gate, right=of p2] (s2) {session\\skills only};
+  \draw[flow] (r2)--(a2); \draw[flow] (a2)--(p2); \draw[flow] (p2)--(s2);
+  \node[left=2mm of r2, font=\footnotesize\bfseries, rotate=90, anchor=south] {Test};
+  % the boundary
+  \draw[red!60!black, very thick, dashed] ($(r1.south west)!0.5!(r2.north west)+(-0.3,0)$)
+     -- ($(v1.south east)!0.5!(s2.north east)+(0.3,0)$);
+  \node[red!60!black, font=\scriptsize] at ($(s2.north east)+(0.1,0.9)$) {no $V$ below this line};
+\end{tikzpicture}
+\caption{The verifier boundary. \textbf{Top (train):} verifier $V$ supplies
+outcome labels, evaluator calibration, and validation gates. \textbf{Bottom
+(test):} the writer, evaluator, and transferable skills are frozen and only
+public trace signals update memory. $V$ appears in the training lane and in final
+reporting only---never on the downstream update path.}
+\label{fig:verifier-boundary}
+\end{figure}
+
+\paragraph{Default update hyperparameters.}
+Unless stated otherwise, repo updates use same-repo batches of 5 evidence events,
+failure-mode updates trigger every 4 repo updates, a failure-mode promotion
+requires at least 3 supporting repositories, and policy updates are capped at 3
+bullet edits per policy window. Each repo batch emits at most one repo candidate;
+each failure-mode trigger promotes at most two accepted failure-mode skills.
+These values are the harness defaults and are treated as fixed protocol
+hyperparameters, not tuned per benchmark.
+
+\subsection{Validation gate}
+
+Candidate skill states are scored on a repo-isolated SWEGym validation set via
+\[
+\mathrm{effective\_resolved\_rate}
+= \frac{\#\,\text{resolved valid trials}}{\#\,\text{effective valid trials}},
+\qquad
+\mathrm{diagnostic\_rate}
+= \frac{\#\,\text{diagnostic trials}}{\#\,\text{total trials}}.
+\]
+A candidate state is accepted only if it has enough effective validation trials,
+stays under the diagnostic-rate threshold, and does not regress beyond a fixed
+tolerance relative to the current accepted state. Otherwise the candidate version
+is rejected or rolled back and the decision is logged. The gate exists precisely
+to stop a plausible-looking candidate from silently trading pass rate for
+regressions.

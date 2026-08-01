@@ -1,0 +1,61 @@
+\documentclass{article}
+
+\usepackage{iclr2026_conference,times}
+
+\input{math_commands.tex}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{pifont}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+
+% ---- project macros ----
+\newcommand{\method}{HSE}
+\newcommand{\skillrepo}{SkillRepo}
+\newcommand{\tbd}{\textcolor{gray}{--}}            % unfilled numeric cell
+\newcommand{\dpos}[1]{\textcolor{teal!70!black}{$+#1$}}
+\newcommand{\dneg}[1]{\textcolor{red!70!black}{$-#1$}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+% ---- shared tikz styles for the pipeline / boundary figures ----
+\tikzset{
+  stage/.style={draw, rounded corners=2pt, align=center, font=\small,
+                minimum height=9mm, inner sep=4pt, fill=blue!4},
+  gate/.style={draw, rounded corners=2pt, align=center, font=\footnotesize,
+               fill=orange!12, inner sep=3pt},
+  flow/.style={-{Stealth[length=2.2mm]}, thick},
+}
+
+\title{Hierarchical Skill Evolution for Software-Engineering Agents}
+
+% Anonymous submission. Uncomment \iclrfinalcopy only for camera-ready.
+\author{Anonymous authors}
+
+% \iclrfinalcopy
+\begin{document}
+
+\maketitle
+
+\input{sections/00_abstract}
+\input{sections/01_introduction}
+\input{sections/02_problem_setting}
+\input{sections/03_method}
+\input{sections/04_experiments}
+\input{sections/05_related_work}
+\input{sections/06_limitations_conclusion}
+
+\bibliographystyle{iclr2026_conference}
+\bibliography{references}
+
+\appendix
+\input{sections/07_appendix}
+
+\end{document}

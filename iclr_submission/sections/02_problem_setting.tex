@@ -1,0 +1,35 @@
+\section{Problem Setting}
+
+\paragraph{Tasks and agents.}
+A software-engineering task $x$ consists of a natural-language issue, a
+repository snapshot, and a public execution environment. A frozen coding agent
+$M$ interacts with a harness $H$ by issuing file reads, searches, edits, shell
+commands, and a final answer. A trajectory $\tau$ records the observable history:
+prompts, tool calls, outputs, diffs, public tests, and runtime diagnostics. $M$
+and $H$ are fixed throughout; the only thing that evolves is the external skill
+state.
+
+\paragraph{Training-time verifier.}
+During SWEGym training we hold a verifier $V$ mapping a completed trial to a
+reward $r \in \{0,1\}$ or a diagnostic outcome. $V$ supervises training-time
+labels and validation gates. It is deliberately \emph{not} a writer of skills
+and \emph{not} a source of hidden solutions. At downstream test time $V$ is
+unavailable for any memory update; it is invoked only after the protocol
+completes, to report final benchmark scores.
+
+\paragraph{Skill state.}
+The external state $S$ holds structured evidence and accepted skills in four
+deployed categories:
+\begin{itemize}
+    \item \textbf{Task evidence} records what happened on one task. It is not a
+    reusable skill and is never deployed as one.
+    \item \textbf{Repo skills} summarize repeated, evidence-gated procedures
+    within a single repository.
+    \item \textbf{Failure-mode skills} summarize cross-repo recovery strategies
+    for recurring agent failures. These are the primary transferable artifact.
+    \item \textbf{General seed skills} provide weak process priors for common
+    stages (reproduce, localize, edit, validate, recover).
+\end{itemize}
+The writer policy $\pi_w$ drafts evidence summaries and candidate skills; the
+evaluator policy $\pi_e$ assigns decisions, proxy rewards, confidence, and risk
+flags.

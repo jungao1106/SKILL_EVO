@@ -1,0 +1,31 @@
+\section{Implementation Notes}
+
+Accepted skills are stored under versioned directories
+\texttt{skills/accepted/vXXXX/}: repo skills under \texttt{\_repos/}, failure-mode
+skills under \texttt{\_failure\_modes/}, and general SWE seeds under
+\texttt{\_general/swe/}. Training artifacts include \texttt{task\_events.jsonl},
+\texttt{repo\_clusters.jsonl}, \texttt{failure\_clusters.jsonl},
+\texttt{evaluator\_decisions.jsonl}, \texttt{evaluator\_calibration.jsonl},
+\texttt{promotion\_decisions.jsonl}, \texttt{harness\_policy.md},
+\texttt{generator\_policy.md}, and \texttt{evaluator\_policy.md}.
+
+\section{Command Skeletons}
+
+\begin{verbatim}
+# SWEGym evolution loop, one source cell.
+python scripts/run_swegym_skill_evo_loop.py \
+  --run-name swegym_<model>_<harness>_hse_main \
+  --provider openai \
+  --provider-model <model-id> \
+  --provider-api openai-completions \
+  --concurrency <N>
+
+# SWE-bench Verified target-cell evaluation with accepted skills.
+python scripts/run_skill_evo_verified.py \
+  --run-name verified_<source>_to_<target>_hse_final \
+  --dataset swe-bench/swe-bench-verified@2 \
+  --provider openai \
+  --provider-model <target-model-id> \
+  --all-verified \
+  --concurrency <N>
+\end{verbatim}

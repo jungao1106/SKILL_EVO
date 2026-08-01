@@ -1,0 +1,27 @@
+\section{Related Work}
+
+\paragraph{Software-engineering benchmarks.}
+SWE-bench introduced real GitHub issue resolution as a benchmark for language
+models and coding agents \citep{swebench2024}; SWE-bench Verified refines it with
+human-verified tasks and criteria \citep{swebenchverified2024}. SWEGym provides
+executable training environments and verifiers for software-engineering agents
+and is the source of verifier-supervised evolution in our work
+\citep{swegym2025}. Terminal-Bench extends evaluation to broader terminal
+workflows beyond repository patching \citep{terminalbench2025}, which we use as
+our out-of-domain extrapolation target.
+
+\paragraph{Language-agent memory and reflection.}
+Prior agents reuse verbal feedback, self-reflection, or episodic memory to
+improve future behavior \citep{react2023,reflexion2023,voyager2023}. \method{}
+departs from this line in two ways that matter for evaluation integrity: it
+enforces a benchmark-verifier boundary, and it refuses to treat task-local
+evidence as a transferable skill.
+
+\paragraph{Skill extraction and text-space optimization.}
+A recent wave of systems distills trajectories into textual skills, optimizes
+external instructions, or curates skill repositories
+\citep{trace2skill2024,skillopt2024,skillos2025,autoskill2023}. These methods
+largely assume the harvested skill is safe to deploy. Our setting is harder and
+more honest: executable verifiers exist at training time but are forbidden at
+test-time memory update, and exact-task leakage is treated as the central
+evaluation risk rather than an afterthought.

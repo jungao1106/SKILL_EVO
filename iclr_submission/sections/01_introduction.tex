@@ -1,0 +1,71 @@
+\section{Introduction}
+
+Large language model agents can repair real software bugs: they read a
+repository, edit code, run tests, and recover from failures. Every one of those
+attempts---successful or not---produces information about how to localize, edit,
+validate, and recover on the next task. Almost all of it is thrown away the
+moment the benchmark scores the trial. Recycling it into external
+\emph{skills}---compact textual procedures injected into future prompts---is an
+attractive way to make a frozen agent better without retraining its weights.
+
+The attraction hides a trap. A raw trajectory is full of things that must not
+leak forward: concrete file paths, the exact shape of a gold patch, transient
+environment errors, and incidental identifiers of the benchmark instance. Inject
+those into a future prompt and the system improves by \emph{memorization}, not
+transfer---and on a held-out benchmark this is indistinguishable from progress
+until someone audits the prompt. The opposite failure is just as common: a
+one-shot ``summarize the trajectory into advice'' step yields instructions like
+``run focused tests'' that are too generic to change behavior, or over-specific
+rules that fire on the wrong task and cause regressions. We argue that most
+trace-to-skill pipelines sit on one of these two failure modes and report the
+resulting numbers as if they measured transfer.
+
+The question we take seriously is therefore: \emph{can a coding-agent system
+learn reusable software-engineering skills from training-time verifier feedback
+without using test-time verifier feedback and without leaking task-specific
+solutions?} Answering it requires more than a better summarizer. It requires (i)
+a disciplined notion of what is allowed to become a transferable skill, and (ii)
+a hard, auditable boundary on when the verifier may influence memory.
+
+We propose \method{}, \textbf{hierarchical skill evolution}. The central design
+commitment is restraint: \emph{not every trace artifact is a skill}. A task
+attempt first becomes \emph{task evidence}---a structured record of public
+signals (touched and edited paths, test commands, diagnostics, selected skills,
+failure signatures, verifier outcome). Task evidence is never rendered as a
+deployed skill. A Skill Writer drafts a repo-level skill only from \emph{multiple}
+evidence records in the \emph{same} repository, and a failure-mode skill only
+from patterns that \emph{recur across} repositories---localization drift, weak
+validation, no-diff exits, timeout recovery. A Skill Evaluator then scores each
+candidate for utility, support, and risk and decides whether to accept, reject,
+revise, or retain it as memory-only evidence. Every upward step is gated; a
+single lucky trace cannot mint a global skill.
+
+The boundary is the second commitment, and it is hard rather than aspirational.
+SWEGym verifiers are available at training time, so we use them to label
+outcomes, calibrate the evaluator, and gate candidate states on a repo-isolated
+validation split. On SWE-bench Verified and other downstream benchmarks, no
+official verifier label, hidden test result, gold patch, or future task outcome
+may influence a skill update---full stop. This is what makes a transfer claim on
+those benchmarks meaningful rather than a restatement of leaked supervision.
+
+\paragraph{Contributions.}
+\begin{itemize}
+    \item We recast software-agent skill evolution as a hierarchical,
+    evidence-gated process that cleanly separates task evidence, repo-level
+    skills, cross-repo failure-mode skills, and the writer/evaluator policies
+    that produce and police them.
+    \item We define a verifier-boundary protocol that licenses training-time use
+    of SWEGym verifier outcomes while forbidding any verifier signal on the
+    test-time update path, turning leakage from a reviewer's worry into a
+    structural property of the system.
+    \item We instantiate the framework end to end for the Pi coding-agent
+    harness with an OpenAI-compatible model interface, Harbor/E2B execution,
+    versioned skill archives, promotion logs, validation gates, and a
+    deterministic evaluator shell that can be swapped for a learned policy
+    without changing the loop contract.
+    \item We specify an evaluation protocol over a GLM-5.2/GPT-5.5
+    $\times$ Pi/Claude-style matrix that separates within-cell evolution, model
+    transfer, and harness transfer across SWE-bench Verified, DeepSWE, and an
+    out-of-domain Terminal-Bench 2.0/2.1 extrapolation, treating exact-task
+    memory only as an explicitly labeled adaptation upper bound.
+\end{itemize}
