@@ -16,7 +16,13 @@ It keeps:
 
 Directory naming:
 
-- `skills/accepted/<version>/...` stores accepted repo scaffold and failure-mode skills.
+- Pi skill evolution writes accepted repo scaffold and failure-mode skills to
+  `skills/accepted/<version>/...`.
+- Claude Code SWEGym evolution writes to
+  `skills/accepted_claude_code/<version>/...` by default, so its `vXXXX`
+  sequence is independent from Pi.
+- Claude Code benchmark jobs launched by the SWEGym loop write under
+  `jobs/claude_code/` by default. Pi keeps using `jobs/`.
 - `swe_agent_skills/` is the retained legacy SWE-agent skill source. Evolution summaries may distill resources from a legacy skill only when a trace actually read that skill.
 - Pi packages `skills/accepted/<active-memory-version>` into the sandbox when `--use-skills` is enabled and that directory exists.
 
@@ -172,12 +178,12 @@ python scripts/check_tinker_models.py
 ## Skill/Harness Evolution Memory
 
 `scripts/update_skill_harness_memory.py` builds an append-only, versioned memory
-from completed Pi traces. Each memory entry is one SWE task evidence record,
+from completed benchmark traces. Each memory entry is one SWE task evidence record,
 organized by public signals such as touched paths, edited paths, focused tests,
 case label, and failure signature. Task evidence is not a downstream skill.
-Higher-level training artifacts are written under
-`skills/accepted/<version>/_repos/...` and
-`skills/accepted/<version>/_failure_modes/...`.
+Higher-level training artifacts are written under the active agent's skill archive,
+for example `skills/accepted/<version>/_repos/...` for Pi or
+`skills/accepted_claude_code/<version>/_failure_modes/...` for Claude Code.
 
 ```bash
 set -a; . .env; set +a
@@ -298,6 +304,29 @@ python scripts/run_swegym_skill_evo_loop.py \
   --provider-api openai-completions \
   --concurrency 1
 ```
+
+Claude Code + Novita GLM 5.2 can reuse external no-skill SWEGym baseline
+shards instead of rerunning the baseline. The importer materializes a run-local
+baseline job under `jobs/claude_code/<run-name>_swegym_train_noskills` and
+symlinks the trial directories by default. Its accepted skill versions are
+archived under `skills/accepted_claude_code/`, not `skills/accepted/`:
+
+```bash
+NOVITA_API_KEY=... \
+E2B_API_KEY=... \
+python scripts/run_swegym_skill_evo_loop.py \
+  --run-name swegym_cc_glm52_train \
+  --swegym-dataset /vePFS-Mindverse/user/intern/jungao/SWE_GYM/data/harbor_swegym_full \
+  --agent claude-code \
+  --provider novita \
+  --provider-model zai-org/glm-5.2 \
+  --baseline-train-job-glob '/vePFS-Mindverse/user/intern/jungao/Marcronv1-Coding/jobs/swegym_present_novita_glm52_*_nov1' \
+  --train-tasks-from-external-baseline \
+  --concurrency 15
+```
+
+Use `--jobs-root` or `--skill-archive-root` only when intentionally overriding
+the agent-scoped defaults.
 
 Artifacts are written under `run_logs/swegym_skill_evo/<run-name>/`. W&B logging
 is enabled unless `--no-wandb` or `--dry-run` is passed.
