@@ -1,0 +1,107 @@
+{
+  "job_name": "cc_novita_glm52_smoke_20260709_074152",
+  "jobs_dir": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/jobs/claude_code",
+  "n_attempts": 1,
+  "timeout_multiplier": 1.0,
+  "agent_timeout_multiplier": null,
+  "verifier_timeout_multiplier": null,
+  "agent_setup_timeout_multiplier": 2.0,
+  "environment_build_timeout_multiplier": 2.0,
+  "debug": false,
+  "n_concurrent_trials": 1,
+  "quiet": false,
+  "retry": {
+    "max_retries": 0,
+    "include_exceptions": null,
+    "exclude_exceptions": [
+      "VerifierTimeoutError",
+      "AgentTimeoutError",
+      "RewardFileNotFoundError",
+      "RewardFileEmptyError",
+      "VerifierOutputParseError"
+    ],
+    "wait_multiplier": 1.0,
+    "min_wait_sec": 5.0,
+    "max_wait_sec": 60.0
+  },
+  "environment": {
+    "type": null,
+    "import_path": "environments.e2b_swebench:E2BSwebenchEnvironment",
+    "force_build": false,
+    "delete": true,
+    "override_cpus": 1,
+    "override_memory_mb": 8192,
+    "override_storage_mb": 10240,
+    "override_gpus": null,
+    "suppress_override_warnings": false,
+    "mounts_json": null,
+    "env": {
+      "LLM_PROVIDER": "${LLM_PROVIDER}",
+      "NOVITA_ANTHROPIC_BASE_URL": "${NOVITA_ANTHROPIC_BASE_URL}",
+      "NOVITA_MODEL": "${NOVITA_MODEL}",
+      "CLAUDE_CODE_ATTRIBUTION_HEADER": "${CLAUDE_CODE_ATTRIBUTION_HEADER}",
+      "NOVITA_API_KEY": "${NOVITA_API_KEY}"
+    },
+    "kwargs": {
+      "template_namespace": "anchen1011",
+      "pi_template_suffix": "",
+      "strip_dockerfile_comments": true,
+      "sandbox_timeout_sec": 2400,
+      "force_allow_internet": true
+    }
+  },
+  "verifier": {
+    "override_timeout_sec": null,
+    "max_timeout_sec": null,
+    "disable": true
+  },
+  "metrics": [
+    {
+      "type": "mean",
+      "kwargs": {}
+    }
+  ],
+  "agents": [
+    {
+      "name": null,
+      "import_path": "agents.claude_sdk_agent:ClaudeSdkAgent",
+      "model_name": "novita/zai-org/glm-5.2",
+      "override_timeout_sec": 900.0,
+      "override_setup_timeout_sec": 900.0,
+      "max_timeout_sec": null,
+      "kwargs": {
+        "provider_name": "novita",
+        "api_key_env": "NOVITA_API_KEY",
+        "anthropic_base_url_env": "NOVITA_ANTHROPIC_BASE_URL",
+        "model_env": "NOVITA_MODEL",
+        "default_anthropic_base_url": "https://api.novita.ai/anthropic",
+        "default_model": "zai-org/glm-5.2",
+        "max_turns": 6,
+        "max_budget_usd": null,
+        "result_only": false,
+        "use_skills": false,
+        "benchmark_name": "swe-gym"
+      },
+      "env": {}
+    }
+  ],
+  "datasets": [
+    {
+      "path": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/data/harbor_swegym_500_uniform",
+      "name": null,
+      "version": null,
+      "ref": null,
+      "registry_url": null,
+      "registry_path": null,
+      "overwrite": true,
+      "download_dir": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/.cache/harbor_tasks",
+      "task_names": [
+        "modin-project__modin-6656"
+      ],
+      "exclude_task_names": null,
+      "n_tasks": null
+    }
+  ],
+  "tasks": [],
+  "artifacts": []
+}

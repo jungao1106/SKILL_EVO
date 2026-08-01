@@ -1,0 +1,108 @@
+{
+  "job_name": "cc_deepswe_sglang_smoke_verifier2_20260708_083853",
+  "jobs_dir": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/jobs",
+  "n_attempts": 1,
+  "timeout_multiplier": 1.0,
+  "agent_timeout_multiplier": null,
+  "verifier_timeout_multiplier": null,
+  "agent_setup_timeout_multiplier": 2.0,
+  "environment_build_timeout_multiplier": 2.0,
+  "debug": false,
+  "n_concurrent_trials": 1,
+  "quiet": true,
+  "retry": {
+    "max_retries": 1,
+    "include_exceptions": [
+      "RemoteProtocolError",
+      "ProtocolError",
+      "ConnectException",
+      "SandboxException",
+      "ReadError"
+    ],
+    "exclude_exceptions": [
+      "VerifierTimeoutError",
+      "AgentTimeoutError",
+      "RewardFileEmptyError",
+      "VerifierOutputParseError",
+      "RewardFileNotFoundError"
+    ],
+    "wait_multiplier": 1.0,
+    "min_wait_sec": 5.0,
+    "max_wait_sec": 60.0
+  },
+  "environment": {
+    "type": null,
+    "import_path": "environments.e2b_swebench:E2BSwebenchEnvironment",
+    "force_build": false,
+    "delete": true,
+    "override_cpus": 2,
+    "override_memory_mb": 8192,
+    "override_storage_mb": 20480,
+    "override_gpus": null,
+    "suppress_override_warnings": false,
+    "mounts_json": null,
+    "env": {
+      "LLM_PROVIDER": "${LLM_PROVIDER}",
+      "SGLANG_ANTHROPIC_BASE_URL": "${SGLANG_ANTHROPIC_BASE_URL}",
+      "SGLANG_MODEL": "${SGLANG_MODEL}",
+      "CLAUDE_CODE_ATTRIBUTION_HEADER": "${CLAUDE_CODE_ATTRIBUTION_HEADER}",
+      "SGLANG_API_KEY": "${SGLANG_API_KEY}"
+    },
+    "kwargs": {
+      "template_namespace": "anchen1011",
+      "pi_template_suffix": "",
+      "strip_dockerfile_comments": true,
+      "sandbox_timeout_sec": 1800,
+      "force_allow_internet": true
+    }
+  },
+  "verifier": {
+    "override_timeout_sec": null,
+    "max_timeout_sec": null,
+    "disable": false
+  },
+  "metrics": [],
+  "agents": [
+    {
+      "name": null,
+      "import_path": "agents.claude_sdk_agent:ClaudeSdkAgent",
+      "model_name": "sglang/zai-org/GLM-5.2-FP8",
+      "override_timeout_sec": 900.0,
+      "override_setup_timeout_sec": 1200.0,
+      "max_timeout_sec": null,
+      "kwargs": {
+        "provider_name": "sglang",
+        "api_key_env": "SGLANG_API_KEY",
+        "anthropic_base_url_env": "SGLANG_ANTHROPIC_BASE_URL",
+        "model_env": "SGLANG_MODEL",
+        "default_anthropic_base_url": "http://34.201.124.250:39606",
+        "default_model": "zai-org/GLM-5.2-FP8",
+        "max_turns": 1,
+        "max_budget_usd": null,
+        "result_only": false,
+        "use_skills": false,
+        "benchmark_name": "deepswe"
+      },
+      "env": {}
+    }
+  ],
+  "datasets": [
+    {
+      "path": "/vePFS-Mindverse/user/intern/jungao/Marcronv1-Coding/deep-swe/tasks",
+      "name": null,
+      "version": null,
+      "ref": null,
+      "registry_url": null,
+      "registry_path": null,
+      "overwrite": false,
+      "download_dir": "/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO/.cache/harbor_tasks",
+      "task_names": [
+        "abs-module-cache-flags"
+      ],
+      "exclude_task_names": null,
+      "n_tasks": null
+    }
+  ],
+  "tasks": [],
+  "artifacts": []
+}
