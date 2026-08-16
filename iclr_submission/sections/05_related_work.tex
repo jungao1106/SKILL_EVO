@@ -1,27 +1,46 @@
 \section{Related Work}
 
-\paragraph{Software-engineering benchmarks.}
-SWE-bench introduced real GitHub issue resolution as a benchmark for language
-models and coding agents \citep{swebench2024}; SWE-bench Verified refines it with
-human-verified tasks and criteria \citep{swebenchverified2024}. SWEGym provides
-executable training environments and verifiers for software-engineering agents
-and is the source of verifier-supervised evolution in our work
-\citep{swegym2025}. Terminal-Bench extends evaluation to broader terminal
-workflows beyond repository patching \citep{terminalbench2025}, which we use as
-our out-of-domain extrapolation target.
-
-\paragraph{Language-agent memory and reflection.}
-Prior agents reuse verbal feedback, self-reflection, or episodic memory to
-improve future behavior \citep{react2023,reflexion2023,voyager2023}. \method{}
-departs from this line in two ways that matter for evaluation integrity: it
-enforces a benchmark-verifier boundary, and it refuses to treat task-local
-evidence as a transferable skill.
+\paragraph{Software-engineering benchmarks and training environments.}
+SWE-bench \citep{swebench2024} introduced real GitHub issue resolution as a
+benchmark; SWE-bench Verified \citep{swebenchverified2024} refines it with
+human-verified tasks. SWEGym \citep{swegym2025} provides executable training
+environments and verifiers for software-engineering agents and is the source of
+verifier-supervised evolution in our work. SWE-Exp \citep{sweexp2025} builds
+an experience bank from SWE-bench Verified trajectories, using the benchmark's
+own ground-truth labels to annotate success and failure; unlike our setting, it
+has no verifier boundary: the experience bank is a product of the evaluation
+distribution.
 
 \paragraph{Skill extraction and text-space optimization.}
-A recent wave of systems distills trajectories into textual skills, optimizes
-external instructions, or curates skill repositories
-\citep{trace2skill2024,skillopt2024,skillos2025,autoskill2023}. These methods
-largely assume the harvested skill is safe to deploy. Our setting is harder and
-more honest: executable verifiers exist at training time but are forbidden at
-test-time memory update, and exact-task leakage is treated as the central
-evaluation risk rather than an afterthought.
+Trace2Skill \citep{trace2skill2024} distills trajectory-local lessons into
+transferable skills but maps trace$\to$skill directly, without multi-evidence
+aggregation. SkillOpt \citep{skillopt2024} optimizes a single skill document
+with held-out gating, but runs the generate$\to$validate$\to$accept loop on
+the evaluation benchmark itself (``splits derived from the same dataset
+seed''). SkillOS \citep{skillos2025} trains a skill curator with RL on the
+same benchmark's training split. MUSE-Autoskill \citep{museautoskill2026}
+manages skill lifecycles on SkillsBench but treats skills as independent
+artifacts. GEPA \citep{gepa2026} evolves prompts with a standard
+train/validation/test split on the same benchmark. All of these lack an
+independent evaluator and close the optimization loop on the evaluation
+distribution. \method{} closes the loop on SWEGym's training set and forbids
+verifier signals on the test-time update path.
+
+\paragraph{Skill evolution in non-coding environments.}
+Voyager \citep{voyager2023} builds an ever-growing skill library in Minecraft;
+SkillRL \citep{skillrl2026} co-evolves a skill bank with the agent policy via
+RL; AutoSkill \citep{autoskill2023} abstracts user preferences from dialogue
+traces. These operate in environments with closed, shared action spaces where
+skills are procedure shortcuts over a fixed vocabulary. Software engineering
+has open, per-task action spaces, so the transferable invariant is not an
+environment procedure but a failure-mode abstraction about the agent's own
+behavior. These methods also require at least one trainable component
+(policy weights or curator), whereas \method{} keeps the agent frozen and
+evolves only external skill state.
+
+\paragraph{Language-agent memory and reflection.}
+ReAct \citep{react2023} and Reflexion \citep{reflexion2023} reuse verbal
+feedback or episodic memory to improve future behavior. \method{} departs from
+this line in two ways: it enforces a benchmark-verifier boundary, and it
+refuses to treat task-local evidence as a transferable skill: evidence must
+aggregate across multiple tasks and repositories before promotion.

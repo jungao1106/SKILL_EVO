@@ -2,70 +2,158 @@
 
 Large language model agents can repair real software bugs: they read a
 repository, edit code, run tests, and recover from failures. Every one of those
-attempts---successful or not---produces information about how to localize, edit,
+attempts, successful or not, produces information about how to localize, edit,
 validate, and recover on the next task. Almost all of it is thrown away the
 moment the benchmark scores the trial. Recycling it into external
-\emph{skills}---compact textual procedures injected into future prompts---is an
-attractive way to make a frozen agent better without retraining its weights.
+\emph{skills}, compact textual procedures injected into future prompts, is an
+attractive way to let a frozen agent accumulate experience without retraining
+its weights.
 
-The attraction hides a trap. A raw trajectory is full of things that must not
-leak forward: concrete file paths, the exact shape of a gold patch, transient
-environment errors, and incidental identifiers of the benchmark instance. Inject
-those into a future prompt and the system improves by \emph{memorization}, not
-transfer---and on a held-out benchmark this is indistinguishable from progress
-until someone audits the prompt. The opposite failure is just as common: a
-one-shot ``summarize the trajectory into advice'' step yields instructions like
-``run focused tests'' that are too generic to change behavior, or over-specific
-rules that fire on the wrong task and cause regressions. We argue that most
-trace-to-skill pipelines sit on one of these two failure modes and report the
-resulting numbers as if they measured transfer.
+Existing skills fail at two extremes, both of which break in the
+software-engineering setting. At one end, public skills, hand-authored or
+distilled from parametric knowledge, are safe to reuse but too generic to
+change behavior: ``run focused tests'' or ``read the error trace'' are things
+the agent already does. Trace2Skill \citep{trace2skill2024} notes that
+hand-authored skills ``do not scale'' and that skills ``generated purely from
+parametric knowledge often miss critical operational pitfalls'';
+MUSE-Autoskill \citep{museautoskill2026} criticizes existing practice for
+treating skills as ``isolated and static artifacts.'' At the other end, raw
+trajectory memory is specific enough to change behavior but leaks
+task-identifying details such as file paths, patch shapes, and failing test
+names, so that held-out gains are indistinguishable from memorization.
+SkillRL \citep{skillrl2026} observes that raw trajectories are ``redundant and
+noise-heavy'' and ``prevent agents from extracting high-level, reusable
+behavioral patterns.'' Between these extremes lies a missing middle: skills
+that are abstract enough to transfer yet concrete enough to act, grounded in
+multiple execution traces rather than a single one.
 
-The question we take seriously is therefore: \emph{can a coding-agent system
-learn reusable software-engineering skills from training-time verifier feedback
-without using test-time verifier feedback and without leaking task-specific
-solutions?} Answering it requires more than a better summarizer. It requires (i)
-a disciplined notion of what is allowed to become a transferable skill, and (ii)
-a hard, auditable boundary on when the verifier may influence memory.
+\paragraph{Why non-coding skill mechanisms do not transfer.}
+Existing skill-evolution systems, Voyager \citep{voyager2023}, ExpeL, AutoSkill
+\citep{autoskill2023}, and SkillRL \citep{skillrl2026}, operate in environments
+with a closed, shared action space (Minecraft, ALFWorld, WebShop). There, a
+``skill'' is a procedure shortcut over a fixed action vocabulary (``go to the
+sink before washing''), and it transfers because the next task lives in the
+same environment. Software engineering is different: every task instance is a
+new environment with a new repository, build system, and test framework. No
+fixed action vocabulary spans two repos, and an operation sequence that works
+in repo~A may not even compile in repo~B. The only invariant that survives
+across environments is a \emph{failure-mode abstraction}: not ``go to the
+sink'' but ``I tend to start editing before checking all call sites''
+(localization drift), or ``I declare success after running only the touched
+file's tests'' (weak validation). This is knowledge about the agent's own
+behavioral tendencies, not about the environment's structure, and existing
+pipelines that extract ``how to navigate the environment'' do not capture it.
 
-We propose \method{}, \textbf{hierarchical skill evolution}. The central design
-commitment is restraint: \emph{not every trace artifact is a skill}. A task
-attempt first becomes \emph{task evidence}---a structured record of public
-signals (touched and edited paths, test commands, diagnostics, selected skills,
-failure signatures, verifier outcome). Task evidence is never rendered as a
-deployed skill. A Skill Writer drafts a repo-level skill only from \emph{multiple}
-evidence records in the \emph{same} repository, and a failure-mode skill only
-from patterns that \emph{recur across} repositories---localization drift, weak
-validation, no-diff exits, timeout recovery. A Skill Evaluator then scores each
-candidate for utility, support, and risk and decides whether to accept, reject,
-revise, or retain it as memory-only evidence. Every upward step is gated; a
-single lucky trace cannot mint a global skill.
+\paragraph{What existing coding skill evolution misses.}
+Three structural gaps appear in current coding-skill methods. First, skills are
+flat: SkillOpt \citep{skillopt2024} optimizes a single skill document, SkillOS
+\citep{skillos2025} maintains a flat repository, and MUSE-Autoskill manages
+independent skill packages. But a single SWE trajectory mixes two kinds of
+knowledge with different reuse ranges: repo-local entry points and test
+commands that are meaningless outside that repo, versus cross-repo behavioral
+patterns like localization drift that are the truly transferable content. A
+flat library either leaks repo details into transferable skills or obscures
+behavioral patterns under repo-specific noise. Second, skills are generated
+from single trajectories: Trace2Skill \citep{trace2skill2024} and AutoSkill
+\citep{autoskill2023} map trace$\to$skill directly, so task-specific details
+such as file paths and patch shapes are written into the skill alongside
+reusable patterns, with no multi-evidence aggregation to separate them.
+Third, skill quality is judged solely by downstream test scores: SkillOpt
+accepts an edit only when it ``strictly improves a held-out validation score''
+with ``train/selection/test splits derived from the same dataset seed,'' GEPA
+\citep{gepa2026} ``adopts a standard train/validation/test split'' on the same
+benchmark, and SkillOS ``trains on its training split'' and ``evaluates on the
+corresponding test set'' of the same benchmark. There is no independent
+evaluator, so skill quality is entirely determined by the downstream
+validator's score, and that validator is simultaneously the benchmark's scoring
+function. The skill library is a product of the evaluation distribution, not of
+transferable competence.
 
-The boundary is the second commitment, and it is hard rather than aspirational.
-SWEGym verifiers are available at training time, so we use them to label
-outcomes, calibrate the evaluator, and gate candidate states on a repo-isolated
-validation split. On SWE-bench Verified and other downstream benchmarks, no
-official verifier label, hidden test result, gold patch, or future task outcome
-may influence a skill update---full stop. This is what makes a transfer claim on
-those benchmarks meaningful rather than a restatement of leaked supervision.
+\paragraph{Generation and acceptance must be separated, and the loop must close
+on the training set.}
+If skill quality is judged only by the same test scores that measure benchmark
+performance, ``the skill is effective'' and ``the skill was selected by the
+evaluation distribution'' become indistinguishable. SkillOpt, GEPA, and SkillOS
+all run the generate$\to$validate$\to$accept loop on the evaluation benchmark:
+they split it into train/selection/test, use the selection split to gate skill
+updates, and report on the test split. The splits are disjoint, but they are
+drawn from the same distribution (same benchmark, same repositories), so a
+skill that scores well on the selection split may simply be fitting that
+distribution rather than learning a transferable procedure. SWE-Exp
+\citep{sweexp2025} goes further: it builds its experience bank directly on
+SWE-bench Verified, annotating trajectories as success or failure using the
+benchmark's own ground-truth labels, with no verifier boundary at all.
+
+Our setting is different. The generate$\to$validate$\to$accept loop closes on
+the SWEGym training set \citep{swegym2025}, whose repositories do not overlap
+with SWE-bench Verified or DeepSWE. SWEGym's verifier labels outcomes,
+calibrates the evaluator, and gates candidate states on a repo-isolated
+validation split, exactly as SkillOpt and SkillOS use their validation splits,
+but the loop never touches the downstream benchmark. At test time, the
+verifier is absent from the skill-update path: skill promotion is decided by
+the evaluator's proxy reward alone, and the verifier is invoked only
+afterward to report resolved count. The evaluation set is read-only.
+
+\paragraph{Our method: \method{}.}
+We propose \textbf{hierarchical skill evolution} (\method{}), built on four
+design choices that address the gaps above.
+
+\emph{(1) Hierarchical sedimentation, not flat optimization.} A trace first
+becomes \emph{task evidence}, a structured record of public signals (touched
+and edited paths, test commands, diagnostics, failure signatures, verifier
+outcome) that is never deployed as a skill. Evidence records from the same
+repository aggregate into a repo-level skill candidate only when they reach a
+support threshold ($\geq 2$). A behavior skill candidate forms only when the
+same failure signature recurs across $\geq 2$ repositories. The promotion
+condition is a support count, so the sedimentation process itself uses reuse
+range as a gate: repo-local knowledge stays repo-local, and only cross-repo
+behavioral patterns become transferable.
+
+\emph{(2) Writer--evaluator co-evolution.} A Skill Writer drafts candidates
+from evidence; a Skill Evaluator scores each candidate for utility, support,
+and risk, deciding whether to accept, reject, revise, or retain it as
+memory-only. The two policies co-evolve: the Writer produces new skill forms,
+and the Evaluator's criteria must update to judge them, otherwise it rejects
+novel skills with stale standards or accepts obsolete ones. The Evaluator is
+calibrated by SWEGym verifier outcomes during training (penalize false accepts
+first; if a previously solved case regresses, disable before raising
+confidence anywhere upstream) and then frozen for downstream use. This is not
+RL training of weights; the policies are calibration rules learned from
+accept/reject histories (``update only after 2 failure-mode triggers'',
+``penalize false accepts first'').
+
+\emph{(3) Two things transfer, not one.} Existing methods transfer a static
+skill library. We transfer two things: (a)~a \emph{frozen library} of
+repo-level and cross-repo behavior skills distilled during SWEGym training, and
+(b)~the Writer and Evaluator policies themselves, which let the agent continue
+evolving skills at test time on the downstream benchmark, but using the
+frozen, verifier-calibrated Evaluator rather than the downstream verifier.
+
+\emph{(4) Verifier boundary.} During SWEGym training, the verifier labels
+outcomes, calibrates the Evaluator, and gates candidate states on a
+repo-isolated validation split. On SWE-bench Verified and DeepSWE, no official
+verifier label, hidden test result, gold patch, or future task outcome may
+influence a skill update. The verifier is invoked only after the protocol
+completes, to report resolved count. This makes a transfer claim on those
+benchmarks meaningful rather than an artifact of leaked supervision.
 
 \paragraph{Contributions.}
 \begin{itemize}
     \item We recast software-agent skill evolution as a hierarchical,
-    evidence-gated process that cleanly separates task evidence, repo-level
-    skills, cross-repo failure-mode skills, and the writer/evaluator policies
-    that produce and police them.
-    \item We define a verifier-boundary protocol that licenses training-time use
-    of SWEGym verifier outcomes while forbidding any verifier signal on the
-    test-time update path, turning leakage from a reviewer's worry into a
-    structural property of the system.
-    \item We instantiate the framework end to end for the Pi coding-agent
-    harness with an OpenAI-compatible model interface, Harbor/E2B execution,
-    versioned skill archives, promotion logs, validation gates, and a
-    deterministic evaluator shell that can be swapped for a learned policy
-    without changing the loop contract.
-    \item We specify an evaluation protocol over a GLM-5.2/GPT-5.5
-    $\times$ Pi/Claude-style matrix that separates within-cell evolution, model
-    transfer, and harness transfer across SWE-bench Verified, DeepSWE, and an
-    out-of-domain Terminal-Bench 2.0/2.1 extrapolation, treating exact-task
-    memory only as an explicitly labeled adaptation upper bound.
+    evidence-gated sedimentation process that separates task evidence,
+    repo-level skills, cross-repo behavior skills, and the writer/evaluator
+    policies that produce and police them, addressing the flat-skill and
+    single-trajectory gaps.
+    \item We define a verifier-boundary protocol that licenses training-time
+    use of SWEGym verifier outcomes while forbidding any verifier signal on
+    the test-time update path, turning leakage from a reviewer concern into a
+    structural property of the system, addressing the evaluation-distribution
+    gap.
+    \item We instantiate the framework end to end for the Pi and Claude-style
+    coding-agent harnesses with sandboxed execution, versioned skill archives,
+    promotion logs, validation gates, and a deterministic evaluator shell.
+    \item We evaluate on SWE-bench Verified and DeepSWE under GLM-5.2,
+    reporting within-cell frozen-skill transfer and multi-round online
+    test-time skill evolution, with all models served from our own
+    self-hosted deployment.
 \end{itemize}

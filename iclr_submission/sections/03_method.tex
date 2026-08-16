@@ -21,7 +21,7 @@ Level & Object & Update clock & Evidence requirement \\
 L0 & Rollout trace & Every task attempt & Public trajectory and runtime outputs \\
 L1 & Task evidence & Every task attempt & One task trace; verifier label (train only) \\
 L2 & Repo skill candidate & Same-repo batch & Multiple evidence records, one repo \\
-L3 & Failure-mode candidate & Cross-repo trigger & Repeated repo summaries across repos \\
+L3 & Behavior candidate & Cross-repo trigger & Repeated repo summaries across repos \\
 L4 & Skill Writer policy & Slow policy window & Aggregated accept/reject histories \\
 L5 & Skill Evaluator policy & Slow policy window & Verifier-calibrated false accepts/rejects \\
 \bottomrule
@@ -29,7 +29,7 @@ L5 & Skill Evaluator policy & Slow policy window & Verifier-calibrated false acc
 \end{center}
 \end{table}
 
-Task evidence stores public fields only---task id, repo, problem summary,
+Task evidence stores public fields only: task id, repo, problem summary,
 reward, previous reward, case label, exception type, selected skills, touched and
 edited paths, public test commands, failure signature, and diagnostic signals.
 It feeds higher-level aggregation but is never exported as a reusable
@@ -41,7 +41,7 @@ It feeds higher-level aggregation but is never exported as a reusable
   \node[stage] (trace) {Agent\\trace};
   \node[stage, right=of trace] (evid) {Task\\evidence};
   \node[stage, right=of evid] (repo) {Repo\\candidate};
-  \node[stage, right=of repo] (fail) {Failure-mode\\skill};
+  \node[stage, right=of repo] (fail) {Behavior\\skill};
   % gates on the arrows
   \node[gate, above=4mm of $(evid)!0.5!(repo)$] (g1) {evaluator gate\\\scriptsize support\,/\,risk};
   \node[gate, above=4mm of $(repo)!0.5!(fail)$] (g2) {evaluator gate\\\scriptsize $\geq$\,3 repos\,/\,risk};
@@ -56,9 +56,9 @@ It feeds higher-level aggregation but is never exported as a reusable
     {primary\\transferable artifact};
 \end{tikzpicture}
 \caption{The promotion pipeline. A trace becomes task evidence, then a repo-level
-candidate, then a cross-repo failure-mode skill. Task evidence is never deployed
+candidate, then a cross-repo behavior skill. Task evidence is never deployed
 directly; each upward step passes an evaluator gate that checks support, risk,
-and validation. Repo promotion needs repeated same-repo evidence; failure-mode
+and validation. Repo promotion needs repeated same-repo evidence; behavior
 promotion needs at least three distinct repositories.}
 \label{fig:pipeline}
 \end{figure}
@@ -68,7 +68,7 @@ promotion needs at least three distinct repositories.}
 The writer turns clusters of evidence into structured candidates. From a cluster
 of same-repo evidence it emits a repo candidate with fields name, trigger,
 evidence gate, actions, validation hint, abort condition, and support summary.
-From a cross-repo cluster it emits a process-level failure-mode candidate with a
+From a cross-repo cluster it emits a process-level behavior candidate with a
 failure signature, trigger, actions, stop condition, and support summary:
 \[
 c_{\mathrm{repo}} = f_w(E_{\mathrm{repo}}), \qquad
@@ -84,48 +84,43 @@ The evaluator is the gatekeeper that separates generation from deployment:
 \]
 with decision $d \in \{\textsc{accept}, \textsc{reject}, \textsc{revise},
 \textsc{memory-only}\}$, proxy reward $\hat r$, confidence $\rho$, and risk flags
-$z$. Hard safety risks---hidden verifier details, oracle or exact patches,
-task-id memorization, private sandbox paths---force rejection regardless of
-apparent utility. Repo candidates require repeated same-repo support; failure-mode
+$z$. Hard safety risks (hidden verifier details, oracle or exact patches,
+task-id memorization, private sandbox paths) force rejection regardless of
+apparent utility. Repo candidates require repeated same-repo support; behavior
 candidates require support from multiple distinct repositories. A single repo can
-never originate a failure-mode skill.
+never originate a behavior skill.
 
 We deliberately ship a \emph{deterministic} evaluator shell with explicit
 thresholds and risk checks. This is an interface choice, not a limitation: it
 makes the accept/reject contract auditable today, while exposing exactly the same
-call signature that a learned evaluator---trained on SWEGym calibration
-events---can later occupy without disturbing the rest of the loop.
+call signature that a learned evaluator, trained on SWEGym calibration
+events, can later occupy without disturbing the rest of the loop.
 
 \subsection{A fixed harness policy the learned policies cannot rewrite}
 
 The learned writer and evaluator are explicitly forbidden from inventing their
 own reward labels, update clocks, or promotion budgets. A fixed harness policy
-maps verifier transitions and runtime diagnostics to case labels:
-\begin{itemize}
-    \item \textbf{Strong positive}: previous attempt failed, current attempt
-    passed.
-    \item \textbf{Weak positive}: current attempt passed without a paired
-    improvement, or a previously passing attempt stays passing.
-    \item \textbf{Strong negative}: previous attempt passed, current attempt
-    failed.
-    \item \textbf{Weak negative}: current attempt failed without a paired
-    regression.
-    \item \textbf{Diagnostic}: missing reward, timeout, setup error, verifier
-    error, sandbox failure, or provider/runtime failure.
-\end{itemize}
-Cold-start solved traces are weak positives; unsolved traces are weak negatives
-unless a diagnostic is present. Strong positives may add support to a candidate
-but cannot by themselves create a global skill. Strong negatives prioritize
-rollback, trigger narrowing, and evaluator false-accept penalties. Diagnostics
-are kept out of semantic edit skills entirely and used only to shape runtime or
-recover/validate safeguards.
+maps verifier transitions and runtime diagnostics to case labels. A
+\textbf{strong positive} is a previous attempt that failed and a current
+attempt that passed; a \textbf{weak positive} is a current attempt that passed
+without a paired improvement, or a previously passing attempt that stays
+passing. A \textbf{strong negative} is a previous attempt that passed and a
+current attempt that failed; a \textbf{weak negative} is a current attempt that
+failed without a paired regression. A \textbf{diagnostic} covers missing reward,
+timeout, setup error, verifier error, sandbox failure, or provider/runtime
+failure. Cold-start solved traces are weak positives; unsolved traces are weak
+negatives unless a diagnostic is present. Strong positives may add support to a
+candidate but cannot by themselves create a global skill. Strong negatives
+prioritize rollback, trigger narrowing, and evaluator false-accept penalties.
+Diagnostics are kept out of semantic edit skills entirely and used only to
+shape runtime or recover/validate safeguards.
 
 \subsection{Training loop and the verifier boundary}
 
 Training alternates rollout, evidence extraction, candidate generation, evaluator
 gating, and validation (Figure~\ref{fig:verifier-boundary}, top lane). The
 verifier supervises case labels, calibrates the evaluator, and gates candidate
-states---and nothing more. At downstream evaluation (bottom lane) the writer,
+states, and nothing more. At downstream evaluation (bottom lane) the writer,
 evaluator, and transferable skills are frozen and only public trace signals enter
 the update path.
 
@@ -135,7 +130,7 @@ the update path.
   % training lane
   \node[stage, fill=blue!4] (r1) {rollout};
   \node[stage, right=of r1] (e1) {task\\evidence};
-  \node[stage, right=of e1] (c1) {repo/failure\\candidates};
+  \node[stage, right=of e1] (c1) {repo/behavior\\candidates};
   \node[gate, right=of c1] (g1) {$\pi_e$ gate};
   \node[gate, right=of g1] (v1) {validation\\gate};
   \draw[flow] (r1)--(e1); \draw[flow] (e1)--(c1); \draw[flow] (c1)--(g1); \draw[flow] (g1)--(v1);
@@ -167,10 +162,10 @@ reporting only---never on the downstream update path.}
 
 \paragraph{Default update hyperparameters.}
 Unless stated otherwise, repo updates use same-repo batches of 5 evidence events,
-failure-mode updates trigger every 4 repo updates, a failure-mode promotion
+behavior updates trigger every 4 repo updates, a behavior promotion
 requires at least 3 supporting repositories, and policy updates are capped at 3
 bullet edits per policy window. Each repo batch emits at most one repo candidate;
-each failure-mode trigger promotes at most two accepted failure-mode skills.
+each behavior trigger promotes at most two accepted behavior skills.
 These values are the harness defaults and are treated as fixed protocol
 hyperparameters, not tuned per benchmark.
 

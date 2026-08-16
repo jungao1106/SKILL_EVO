@@ -54,7 +54,7 @@ PI_SKILL_PACK_B64_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz.b64")
 PI_SKILL_PACK_TAR_PATH = PurePosixPath("/tmp/harbor-pi-skills.tar.gz")
 PI_SKILL_PACK_EXCLUDE_DIRS = {"benchmark-sharded-concurrency"}
 PI_SKILL_PACK_CHUNK_SIZE = 24_000
-PI_MAX_PROMPT_SKILLS = 8
+PI_MAX_PROMPT_SKILLS = int(os.getenv("PI_MAX_PROMPT_SKILLS", "8"))
 DEFAULT_PI_AGENT_VERSION = "0.80.6"
 PI_MACARON_PROXY_PORT = 18080
 PI_REASONING_PROXY_PORT = PI_MACARON_PROXY_PORT
@@ -1575,7 +1575,7 @@ def _no_diff_metadata_update_function_command(metadata_path: PurePosixPath) -> s
   HARBOR_NO_DIFF_RESCUED_VALUE="${{1:-false}}" \\
   HARBOR_NO_DIFF_ATTEMPTS_VALUE="${{2:-0}}" \\
   HARBOR_NO_DIFF_FAILED_VALUE="${{3:-false}}" \\
-  HARBOR_NO_DIFF_MAX_ATTEMPTS_VALUE="${{HARBOR_NO_DIFF_RESCUE_MAX:-2}}" \\
+  HARBOR_NO_DIFF_MAX_ATTEMPTS_VALUE="${{HARBOR_NO_DIFF_RESCUE_MAX:-0}}" \\
   ${{HARBOR_PYTHON_BIN:-python3}} - <<'HARBOR_NO_DIFF_METADATA'
 import json
 import os
@@ -1707,7 +1707,7 @@ def _no_diff_rescue_loop_command(
     jsonl_path_q = shlex.quote(str(jsonl_path))
     stderr_path_q = shlex.quote(str(stderr_path))
     return f"""HARBOR_PI_ORIGINAL_PROMPT="$PROMPT"
-HARBOR_NO_DIFF_RESCUE_MAX="${{HARBOR_NO_DIFF_RESCUE_MAX:-2}}"
+HARBOR_NO_DIFF_RESCUE_MAX="${{HARBOR_NO_DIFF_RESCUE_MAX:-0}}"
 HARBOR_NO_DIFF_RESCUE_ATTEMPT=0
 while true; do
   harbor_run_pi_with_provider_retry || exit "$?"

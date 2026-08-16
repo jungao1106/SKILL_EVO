@@ -788,7 +788,7 @@ class E2BSwebenchEnvironment(E2BEnvironment):
             )
 
         disk = await self.exec(
-            "df -Pm /app | tail -n 1 | awk '{print $2}'",
+            "if [ -d /app ]; then df -Pm /app; else df -Pm /; fi | tail -n 1 | awk '{print $2}'",
             user="root",
         )
         try:

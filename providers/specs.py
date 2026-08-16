@@ -327,10 +327,10 @@ def resolve_provider(name: str) -> ProviderSpec:
             env_prefix="MACARON",
             default_provider_api="openai-completions",
             compat=_glm_openai_compat("MACARON"),
-            default_base_url="https://pi-api-cn.macaron.xin/v1",
+            default_base_url="https://mintcn.macaron.xin/v1",
             default_model="glm-5.2",
             anthropic_base_url_env="MACARON_ANTHROPIC_BASE_URL",
-            default_anthropic_base_url="https://pi-api.macaron.xin/anthropic",
+            default_anthropic_base_url="https://mintcn.macaron.xin",
         )
 
     if provider == "sglang":

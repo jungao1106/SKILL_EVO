@@ -15,21 +15,22 @@ reward $r \in \{0,1\}$ or a diagnostic outcome. $V$ supervises training-time
 labels and validation gates. It is deliberately \emph{not} a writer of skills
 and \emph{not} a source of hidden solutions. At downstream test time $V$ is
 unavailable for any memory update; it is invoked only after the protocol
-completes, to report final benchmark scores.
+completes, to report final benchmark scores. This boundary is what
+distinguishes \method{} from methods like SWE-Exp \citep{sweexp2025}, which
+builds its experience bank on SWE-bench Verified using the benchmark's own
+ground-truth labels.
 
 \paragraph{Skill state.}
 The external state $S$ holds structured evidence and accepted skills in four
-deployed categories:
-\begin{itemize}
-    \item \textbf{Task evidence} records what happened on one task. It is not a
-    reusable skill and is never deployed as one.
-    \item \textbf{Repo skills} summarize repeated, evidence-gated procedures
-    within a single repository.
-    \item \textbf{Failure-mode skills} summarize cross-repo recovery strategies
-    for recurring agent failures. These are the primary transferable artifact.
-    \item \textbf{General seed skills} provide weak process priors for common
-    stages (reproduce, localize, edit, validate, recover).
-\end{itemize}
-The writer policy $\pi_w$ drafts evidence summaries and candidate skills; the
-evaluator policy $\pi_e$ assigns decisions, proxy rewards, confidence, and risk
-flags.
+deployed categories. \emph{Task evidence} records what happened on one task;
+it is not a reusable skill and is never deployed as one. \emph{Repo skills}
+summarize repeated, evidence-gated procedures within a single repository.
+\emph{Behavior skills} summarize cross-repo recovery strategies for recurring
+agent failures and are the primary transferable artifact. \emph{General seed
+skills} provide weak process priors for common stages (reproduce, localize,
+edit, validate, recover). The writer policy $\pi_w$ drafts evidence summaries
+and candidate skills; the evaluator policy $\pi_e$ assigns decisions, proxy
+rewards, confidence, and risk flags. Both policies co-evolve: the Writer
+produces new skill forms, and the Evaluator's criteria update to judge them,
+calibrated by SWEGym verifier outcomes during training and frozen for
+downstream use.

@@ -1,27 +1,27 @@
 \begin{abstract}
-Software-engineering agents generate rich traces---issue interpretations, file
-searches, edits, test runs, failures, and recoveries---that are discarded after
-each benchmark trial. The obvious move is to recycle these traces into reusable
-text skills, but the obvious move is also where most systems quietly cheat: raw
-trace retrieval smuggles task-specific solutions into future prompts, and
-one-shot ``summarize the trajectory'' pipelines emit over-specific or actively
-harmful instructions that no one audits. Either way, apparent gains come from
+Software-engineering agents generate rich traces, including issue
+interpretations, file searches, edits, test runs, failures, and recoveries,
+that are discarded after each benchmark trial. Recycling these traces into
+reusable text skills is an attractive way to let a frozen agent accumulate
+experience, but it is also where most systems introduce leakage: raw trace
+retrieval carries task-specific solutions into future prompts, and one-shot
+``summarize the trajectory'' pipelines emit over-specific or actively harmful
+instructions that no one audits. Either way, apparent gains come from
 memorization or noise rather than transfer. We present \method{}, a
 verifier-grounded framework that evolves external skills for \emph{frozen}
 coding agents while making leakage structurally hard. \method{} refuses to call
 every trace artifact a skill: it separates single-task evidence from reusable
 skills, promotes evidence through a hierarchy of repo-level and cross-repo
-failure-mode skills, and trains separate Skill Writer and Skill Evaluator
+behavior skills, and trains separate Skill Writer and Skill Evaluator
 policies behind a fixed harness policy. The design is built around one hard
 information boundary. During SWEGym training the official verifier supplies
 outcome labels, evaluator calibration, and validation gates; at downstream
-evaluation the verifier never touches the update path---no hidden test, gold
+evaluation the verifier never touches the update path, so no hidden test, gold
 patch, or future outcome may alter a skill. We instantiate the framework in a
-runnable system (Pi harness, OpenAI-compatible models, Harbor/E2B execution,
-versioned skill archives with promotion logs and validation gates) and specify
-an evaluation protocol over a $2{\times}2$ executor matrix---GLM-5.2 and GPT-5.5
-$\times$ Pi and Claude-style harnesses---that isolates model transfer, harness
-transfer, and joint transfer, with SWE-bench Verified and DeepSWE as in-domain
-targets and Terminal-Bench 2.0/2.1 as an out-of-domain extrapolation test, all
-under a shared sandbox and acceptance rule.
+runnable system (Pi harness, OpenAI-compatible models served from our own
+self-hosted deployment, versioned skill archives with promotion logs and
+validation gates) and specify an evaluation protocol over GLM-5.2 under two
+agent harnesses, Pi and Claude-style, that isolates harness transfer, with
+SWE-bench Verified and DeepSWE as in-domain targets, all under a shared
+sandbox and acceptance rule.
 \end{abstract}

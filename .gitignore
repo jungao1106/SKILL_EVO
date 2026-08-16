@@ -14,12 +14,21 @@ analysis/
 archive_failed_runs/
 archive_failed_runs_cleaned/
 jobs/
+jobs-83/
 legacy/
 data/
 figures/
 run_logs/
 wandb/
 skills/tasks/
+skills/test_time/
+
+# experiment outputs (large)
+results/
+
+# vendored third-party skill collections
+anthropic_skills_public/
+swe_skills_bench_public/
 logs/*.log
 run_logs/*.out
 run_logs/*.pid

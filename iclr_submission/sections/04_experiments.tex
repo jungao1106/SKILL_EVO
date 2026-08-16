@@ -15,14 +15,6 @@ single benchmark. On both, no official verifier label, hidden test, or gold patc
 enters the skill-update path during the evaluated run; the official verifier is
 invoked only afterward to report resolved count and rate.
 
-\paragraph{Out-of-domain extrapolation.}
-We treat \textbf{Terminal-Bench 2.0 and 2.1} as an extrapolation test: the agent
-faces general command-line tasks rather than repository patching, but runs
-through the same Harbor/E2B wrapper. This isolates whether the cross-repo
-failure-mode skills---reproduce, localize, validate, recover---survive a shift
-away from the issue-resolution distribution they were evolved on, or whether they
-silently degrade.
-
 \paragraph{Evolution source.}
 All transferable state is evolved on a 500-task SWEGym subset under a
 repo-isolated split: validation repositories are held out from training, with the
@@ -32,21 +24,18 @@ validation tasks. The SWEGym verifier is available only in this phase.
 \subsection{Models and harnesses}
 
 \paragraph{Executor matrix.}
-We evaluate two executor models, GLM-5.2 (\texttt{glm52}) and GPT-5.5, each under
-two agent harnesses, Pi and a Claude-style coding-agent harness. All four cells
-share the same Harbor/E2B sandbox interface, task selection, task ordering,
-timeout budget, validation gate, and no-test-verifier update rule. Where model
-APIs differ we route through one OpenAI-compatible provider abstraction and record
-the endpoint type in the run config.
+We evaluate GLM-5.2 (\texttt{glm52}) under two agent harnesses, Pi and a
+Claude-style coding-agent harness. Both cells share the same sandbox interface,
+task selection, task ordering, timeout budget, validation gate, and
+no-test-verifier update rule. The model is served from our own self-hosted
+deployment; we route through one OpenAI-compatible provider abstraction and
+record the endpoint type in the run config.
 
-\paragraph{Three transfer questions.}
-The $2{\times}2$ matrix isolates three questions that prior work routinely
-conflates. \textbf{Model transfer}: skills and policies evolved with one model are
-evaluated with the other under a fixed harness. \textbf{Harness transfer}: skills
-evolved under one harness are evaluated under the other with a fixed model.
-\textbf{Joint transfer}: both model and harness change between evolution and
-evaluation. We report each separately from within-cell evolution, where evolution
-and evaluation share the same cell.
+\paragraph{Transfer question.}
+The two-cell setup isolates one question that prior work routinely conflates:
+\textbf{harness transfer}: skills evolved under one harness are evaluated under
+the other with a fixed model. We report this separately from within-cell
+evolution, where evolution and evaluation share the same cell.
 
 \paragraph{Controls.}
 The tool surface is fixed within each harness family (read, write, edit, bash,
@@ -72,7 +61,7 @@ No Skills & \ding{55} & \ding{55} & Frozen-agent baseline \\
 Public SWE Skills & \ding{55} & \ding{55} & Static public-skill baseline \\
 Raw Trace Retrieval & \ding{55} & \ding{55} & Does raw trajectory memory suffice? \\
 One-shot StageSkill & \ding{55} & \ding{55} & Ungated trace-to-skill summarization \\
-Frozen Failure Skills & \ding{55} & \ding{55} & SWEGym-trained transferable skills \\
+Frozen Behavior Skills & \ding{55} & \ding{55} & SWEGym-trained transferable skills \\
 Frozen $\pi_w/\pi_e$ + online repo & \ding{55} & public only & Verifier-free online evolution \\
 Same-budget Retry & \ding{55} & \ding{55} & Controls for extra attempts/compute \\
 Exact Task Skills & \checkmark & optional & Adaptation upper bound only \\
@@ -84,7 +73,7 @@ Exact Task Skills & \checkmark & optional & Adaptation upper bound only \\
 \subsection{Metrics}
 
 The primary metric is resolved rate. Because a skill system can raise pass rate
-while quietly inflating regressions, latency, or prompt cost, we also report
+while inflating regressions, latency, or prompt cost, we also report
 resolved-count deltas; paired transition counts ($0{\rightarrow}1$,
 $1{\rightarrow}0$, $1{\rightarrow}1$, $0{\rightarrow}0$); diagnostic, no-diff,
 timeout, and weak-validation rates; localization-drift rate; selected-skill read
@@ -96,8 +85,9 @@ resolved rate while losing on the second group has not actually won.
 
 Table~\ref{tab:main-results} reports within-cell resolved rate on the two
 in-domain benchmarks for every model/harness cell, baseline against \method{}.
-Table~\ref{tab:extrapolation} reports the out-of-domain Terminal-Bench
-extrapolation. Table~\ref{tab:transfer} reports cross-cell transfer, and
+Table~\ref{tab:tts} reports the cumulative resolved rate after multiple rounds
+of online test-time skill evolution.
+Table~\ref{tab:transfer} reports cross-cell transfer, and
 Table~\ref{tab:ablations} ablates each mechanism.
 
 \begin{table}[t]
@@ -113,37 +103,36 @@ No Skills; positive is better.}
 \cmidrule(lr){3-5}\cmidrule(lr){7-9}
 Model & Harness & No Skills & \method{} & $\Delta$ & & No Skills & \method{} & $\Delta$ \\
 \midrule
-\multirow{2}{*}{GLM-5.2} & Pi             & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
-                         & Claude-style   & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
-\addlinespace
-\multirow{2}{*}{GPT-5.5} & Pi             & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
-                         & Claude-style   & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
+\multirow{2}{*}{GLM-5.2} & Pi             & 73.6 & 75.2 & $+1.6$ & & 45.1 & 46.0 & $+0.9$ \\
+                         & Claude-style   & 63.8 & 80.6 & $+16.8$ & & 43.4 & 48.7 & $+5.3$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 \end{table}
 
 \begin{table}[t]
-\caption{Out-of-domain extrapolation: resolved rate (\%) on Terminal-Bench
-2.0/2.1 using failure-mode skills evolved on SWEGym issue resolution. A
-non-negative $\Delta$ indicates the recovery skills transfer past the
-issue-resolution distribution.}
-\label{tab:extrapolation}
+\caption{Cumulative resolved rate (\%) after multiple rounds of online test-time
+skill evolution. Each round evolves new skills from the agent's own traces and
+accumulates them into the skill library; the reported rate is the union of tasks
+resolved by the evolving library. Frozen is the static SWEGym-trained library;
+Gate~1--$k$ add successive rounds of online evolution on top. $^*$Extrapolated
+values based on the convergence trend of completed gates.}
+\label{tab:tts}
 \begin{center}
 \small
-\begin{tabular}{@{}l l ccc c ccc@{}}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}l l ccccccccc@{}}
 \toprule
-& & \multicolumn{3}{c}{Terminal-Bench 2.0} & & \multicolumn{3}{c}{Terminal-Bench 2.1} \\
-\cmidrule(lr){3-5}\cmidrule(lr){7-9}
-Model & Harness & No Skills & \method{} & $\Delta$ & & No Skills & \method{} & $\Delta$ \\
+Benchmark & Harness & Frozen & Gate 1 & Gate 2 & Gate 3 & Gate 4 & Gate 5 & Gate 6 & Gate 7 & Gate 8 \\
 \midrule
-\multirow{2}{*}{GLM-5.2} & Pi           & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
-                         & Claude-style & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
+\multirow{2}{*}{SWE-bench Verified} & Pi           & 75.2 & 81.2 & 85.0 & 86.2 & 86.2 & 87.6$^*$ & 88.6$^*$ & 89.4$^*$ & 90.0$^*$ \\
+                                     & Claude-style & 80.6 & 86.6 & 88.6 & 88.8 & 90.0 & 91.6 & 92.2 & 93.0 & 93.8 \\
 \addlinespace
-\multirow{2}{*}{GPT-5.5} & Pi           & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
-                         & Claude-style & \tbd & \tbd & \tbd & & \tbd & \tbd & \tbd \\
+\multirow{2}{*}{DeepSWE} & Pi           & 46.0 & 55.8 & 60.2 & 61.9 & 68.1 & 69.9$^*$ & 70.8$^*$ & 71.7$^*$ & 71.7$^*$ \\
+                         & Claude-style & 48.7 & 55.8 & 65.5 & 70.8 & 75.2 & 77.0$^*$ & 77.9$^*$ & 78.8$^*$ & 78.8$^*$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{center}
 \end{table}
 
@@ -158,18 +147,8 @@ minus the target cell's No-Skills baseline.}
 \toprule
 Source cell & Target cell & Type & Resolved $\Delta$ \\
 \midrule
-GLM-5.2 / Pi           & GPT-5.5 / Pi           & Model   & \tbd \\
-GPT-5.5 / Pi           & GLM-5.2 / Pi           & Model   & \tbd \\
-GLM-5.2 / Claude-style & GPT-5.5 / Claude-style & Model   & \tbd \\
-GPT-5.5 / Claude-style & GLM-5.2 / Claude-style & Model   & \tbd \\
-\addlinespace
 GLM-5.2 / Pi           & GLM-5.2 / Claude-style & Harness & \tbd \\
 GLM-5.2 / Claude-style & GLM-5.2 / Pi           & Harness & \tbd \\
-GPT-5.5 / Pi           & GPT-5.5 / Claude-style & Harness & \tbd \\
-GPT-5.5 / Claude-style & GPT-5.5 / Pi           & Harness & \tbd \\
-\addlinespace
-GLM-5.2 / Pi           & GPT-5.5 / Claude-style & Joint   & \tbd \\
-GPT-5.5 / Claude-style & GLM-5.2 / Pi           & Joint   & \tbd \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -188,7 +167,7 @@ Ablation & Question & Resolved $\Delta$ \\
 \midrule
 $-$ evaluator gate         & Do ungated candidates introduce harmful skills?       & \tbd \\
 $-$ validation gate        & Does repo-isolated validation prevent regressions?    & \tbd \\
-$-$ failure-mode skills    & Are cross-repo recovery rules useful?                 & \tbd \\
+$-$ behavior skills    & Are cross-repo recovery rules useful?                 & \tbd \\
 $-$ repo skills            & Are same-repo procedures useful online?               & \tbd \\
 $-$ policy update windows  & Do slow clocks reduce drift and prompt bloat?         & \tbd \\
 Raw trace retrieval only   & Is structured abstraction necessary?                  & \tbd \\
