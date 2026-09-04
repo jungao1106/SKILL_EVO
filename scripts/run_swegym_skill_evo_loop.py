@@ -27,6 +27,7 @@ from agents.skill_evaluator import calibration_event, evaluate_candidate
 from agents.skill_writer import (
     build_failure_cluster,
     build_repo_cluster,
+    normalize_writer_policy,
     write_candidate_skill,
     write_failure_mode_candidate,
     write_repo_candidate,
@@ -1000,15 +1001,14 @@ def failure_mode_policy_rules(
     )
 
     writer_rules = [
-        "Extract task evidence only from trace-visible owner paths, public commands, public outputs, and explicit stop conditions; never promote raw task evidence directly to downstream skills.",
-        "Treat cold-start solved traces as weak-positive local evidence: keep them task-scoped and evidence-gated until same-repo batching supplies repeated support.",
-        f"Update generator/evaluator policy only after {args.policy_update_every_failure_mode_triggers} failure-mode triggers, using the current window of accepted and rejected histories rather than a single trace.",
+        "Extract candidate content only from trace-visible owner paths, public commands, public outputs, and explicit stop conditions; omit unsupported trigger details and actions.",
+        "Treat cold-start solved traces as weak-positive local evidence: require same-repo repeated support before drafting an active repo candidate.",
     ]
     if case_counts.get("weak_negative", 0) or case_counts.get("diagnostic", 0):
         writer_rules.append(
-            "For unresolved or diagnostic traces, prefer narrow recover/validate guards over semantic edit instructions, and keep the skill inactive unless the evaluator finds concrete reusable evidence."
+            "For unresolved or diagnostic traces, draft at most 3 recover/validate actions, omit semantic edit instructions, and keep the skill inactive unless the evaluator finds concrete reusable evidence."
         )
-    if repo_promotions or failure_promotions:
+    elif repo_promotions or failure_promotions:
         writer_rules.append(
             "When drafting higher-level skills, summarize only repeated paths, validation commands, or failure signatures that survived the lower-level gate."
         )
@@ -1046,10 +1046,12 @@ def append_failure_mode_policy_updates(
         promotion_decisions=promotion_decisions,
         args=args,
     )
+    compiled_writer_policy = normalize_writer_policy({"rules": rules["writer"]})
     update_state = {
         "writer_policy_updates": 0,
         "evaluator_policy_updates": 0,
         "writer_rules": rules["writer"],
+        "writer_directives": compiled_writer_policy["directives"],
         "evaluator_rules": rules["evaluator"],
         "update_index": update_index,
         "failure_mode_trigger_count": failure_mode_trigger_count,
@@ -1259,6 +1261,7 @@ def repo_skill_decision(
     batch: list[dict[str, Any]],
     update_index: int,
     args: argparse.Namespace,
+    writer_policy: dict[str, Any] | None = None,
     evaluator_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     case_counts = Counter(case_label_for_entry(entry) for entry in batch)
@@ -1283,7 +1286,7 @@ def repo_skill_decision(
         diagnostic_signature_counts=dict(diagnostic_counts),
         positive_entries=accepted_entries,
     )
-    candidate = write_repo_candidate(cluster)
+    candidate = write_repo_candidate(cluster, writer_policy=writer_policy)
     evaluator_decision = evaluate_candidate(
         candidate=candidate,
         evidence=cluster,
@@ -1451,6 +1454,7 @@ def update_memory_hierarchical_state(
         "schema_version": 1,
         "writer_policy": {
             "rules": (policy_state.get("policy_calibration") or {}).get("writer_rules") or [],
+            "directives": (policy_state.get("policy_calibration") or {}).get("writer_directives") or {},
             "update_count": (policy_state.get("clocks") or {}).get("writer_policy_updates", 0),
             "path": (policy_state.get("policy_paths") or {}).get("generator_policy"),
         },
@@ -1533,7 +1537,7 @@ def write_hierarchical_training_artifacts(
     policy_task_events_buffer: list[dict[str, Any]] = []
     policy_promotion_buffer: list[dict[str, Any]] = []
     policy_update_history: list[dict[str, Any]] = []
-    current_writer_policy: dict[str, Any] = {"rules": [], "update_count": 0}
+    current_writer_policy = normalize_writer_policy(None)
     current_evaluator_policy: dict[str, Any] = {"rules": [], "update_count": 0}
     repo_update_count = 0
     repo_skill_promotions = 0
@@ -1559,6 +1563,7 @@ def write_hierarchical_training_artifacts(
                 batch=batch,
                 update_index=repo_update_count,
                 args=args,
+                writer_policy=current_writer_policy,
                 evaluator_policy=current_evaluator_policy,
             )
             promotion_decisions.append(decision)
@@ -1633,7 +1638,10 @@ def write_hierarchical_training_artifacts(
                         trigger_index=failure_mode_trigger_count,
                     )
                     failure_clusters.append(failure_cluster)
-                    failure_candidate = write_failure_mode_candidate(failure_cluster)
+                    failure_candidate = write_failure_mode_candidate(
+                        failure_cluster,
+                        writer_policy=current_writer_policy,
+                    )
                     failure_candidates.append(failure_candidate)
                     failure_evaluator_decision = evaluate_candidate(
                         candidate=failure_candidate,
@@ -1735,10 +1743,11 @@ def write_hierarchical_training_artifacts(
                     )
                     policy_update_history.append(policy_update_state)
                     if policy_update_state.get("writer_policy_updates"):
-                        current_writer_policy = {
+                        current_writer_policy = normalize_writer_policy({
                             "rules": policy_update_state.get("writer_rules") or [],
+                            "directives": policy_update_state.get("writer_directives") or {},
                             "update_count": current_writer_policy["update_count"] + 1,
-                        }
+                        })
                     if policy_update_state.get("evaluator_policy_updates"):
                         current_evaluator_policy = {
                             "rules": policy_update_state.get("evaluator_rules") or [],
@@ -1760,10 +1769,11 @@ def write_hierarchical_training_artifacts(
         )
         policy_update_history.append(policy_update_state)
         if policy_update_state.get("writer_policy_updates"):
-            current_writer_policy = {
+            current_writer_policy = normalize_writer_policy({
                 "rules": policy_update_state.get("writer_rules") or [],
+                "directives": policy_update_state.get("writer_directives") or {},
                 "update_count": current_writer_policy["update_count"] + 1,
-            }
+            })
         if policy_update_state.get("evaluator_policy_updates"):
             current_evaluator_policy = {
                 "rules": policy_update_state.get("evaluator_rules") or [],
@@ -1775,6 +1785,7 @@ def write_hierarchical_training_artifacts(
             "writer_policy_updates": sum(update["writer_policy_updates"] for update in policy_update_history),
             "evaluator_policy_updates": sum(update["evaluator_policy_updates"] for update in policy_update_history),
             "writer_rules": policy_update_history[-1]["writer_rules"],
+            "writer_directives": policy_update_history[-1]["writer_directives"],
             "evaluator_rules": policy_update_history[-1]["evaluator_rules"],
             "update_history": policy_update_history,
         }
@@ -1783,6 +1794,7 @@ def write_hierarchical_training_artifacts(
             "writer_policy_updates": 0,
             "evaluator_policy_updates": 0,
             "writer_rules": [],
+            "writer_directives": {},
             "evaluator_rules": [],
             "update_history": [],
         }

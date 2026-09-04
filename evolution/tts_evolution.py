@@ -385,6 +385,7 @@ def generate_test_time_decisions(
     evidence_rows: list[dict[str, Any]],
     run_name: str,
     benchmark_name: str = "swebench_verified",
+    writer_policy: dict[str, Any] | None = None,
     evaluator_policy: dict[str, Any] | None = None,
     repo_update_batch_size: int = 5,
     repo_min_support: int = 2,
@@ -436,7 +437,7 @@ def generate_test_time_decisions(
             cluster["source"] = "test_time_benchmark_failed_traces"
             cluster["verifier_access"] = False
             repo_clusters.append(cluster)
-            candidate = write_repo_candidate(cluster)
+            candidate = write_repo_candidate(cluster, writer_policy=writer_policy)
             candidate["source"] = "test_time_writer"
             candidate["benchmark"] = benchmark_name
             candidate["skill_polarity"] = "mixed"
@@ -515,7 +516,10 @@ def generate_test_time_decisions(
         failure_cluster["source"] = "test_time_benchmark_failed_traces"
         failure_cluster["verifier_access"] = False
         failure_clusters.append(failure_cluster)
-        candidate = write_failure_mode_candidate(failure_cluster)
+        candidate = write_failure_mode_candidate(
+            failure_cluster,
+            writer_policy=writer_policy,
+        )
         candidate["source"] = "test_time_writer"
         candidate["benchmark"] = benchmark_name
         candidate["skill_polarity"] = "negative"

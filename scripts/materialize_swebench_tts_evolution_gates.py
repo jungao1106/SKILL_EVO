@@ -23,6 +23,7 @@ from evolution.tts_evolution import (  # noqa: E402
     write_json,
     write_jsonl,
 )
+from agents.skill_writer import normalize_writer_policy  # noqa: E402
 
 
 DEFAULT_SOURCE_RUN_ID = "swebench_verified_glm52_novita_v0100_frozen_direct_20260703_182027"
@@ -74,6 +75,24 @@ def load_evaluator_policy(path: Path | None) -> dict[str, Any]:
         "update_count": evaluator_policy.get("update_count") or (data.get("clocks") or {}).get("evaluator_policy_updates", 0),
         "path": str(path),
     }
+
+
+def load_writer_policy(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return normalize_writer_policy({"path": str(path) if path else None})
+    data = read_json(path)
+    calibration = data.get("policy_calibration") if isinstance(data.get("policy_calibration"), dict) else {}
+    writer_policy = calibration.get("writer_policy") if isinstance(calibration.get("writer_policy"), dict) else {}
+    policy = normalize_writer_policy(
+        {
+            "rules": writer_policy.get("rules") or calibration.get("writer_rules") or [],
+            "directives": writer_policy.get("directives") or calibration.get("writer_directives") or {},
+            "update_count": writer_policy.get("update_count")
+            or (data.get("clocks") or {}).get("writer_policy_updates", 0),
+            "path": str(path),
+        }
+    )
+    return policy
 
 
 def render_eval_launcher(
@@ -264,6 +283,7 @@ def main() -> None:
     run_dir = args.out_root / run_id
     skill_run_root = args.skill_output_root / run_id
     evaluator_policy = load_evaluator_policy(args.policy_state)
+    writer_policy = load_writer_policy(args.policy_state)
 
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=args.source_aggregate,
@@ -273,6 +293,7 @@ def main() -> None:
     generated = generate_test_time_decisions(
         evidence_rows=evidence_rows,
         run_name=run_id,
+        writer_policy=writer_policy,
         evaluator_policy=evaluator_policy,
         repo_update_batch_size=args.repo_update_batch_size,
         repo_min_support=args.repo_min_support,
@@ -344,9 +365,10 @@ def main() -> None:
         "run_dir": str(run_dir),
         "skill_run_root": str(skill_run_root),
         "evaluator_policy": evaluator_policy,
+        "writer_policy": writer_policy,
         "evolution_contract": {
             "target_trace_filter": "source direct run reward != 1",
-            "candidate_generation": "writer_from_public_trace_evidence",
+            "candidate_generation": "trained_writer_policy_from_public_trace_evidence",
             "promotion": "evaluator_only",
             "verifier_access_for_evolution": False,
             "verifier_metrics": "report_only_after_each_gate_eval",

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+_BOOLEAN_WRITER_DIRECTIVES = (
+    "public_evidence_only",
+    "require_same_repo_repetition",
+    "recover_validate_only",
+    "gate_surviving_signals_only",
+)
 
 
 def utc_now() -> str:
@@ -42,6 +51,68 @@ def repeated_values(
     return [value for value, count in counter.most_common(limit) if count >= min_count]
 
 
+def normalize_writer_policy(writer_policy: dict[str, Any] | None) -> dict[str, Any]:
+    """Compile the learned writer policy into directives consumed by the writer.
+
+    New policy states persist explicit directives.  The text fallback keeps archived
+    policy states operational instead of silently ignoring their learned rules.
+    """
+
+    raw = writer_policy if isinstance(writer_policy, dict) else {}
+    rules = [str(rule).strip() for rule in (raw.get("rules") or []) if str(rule).strip()]
+    explicit = raw.get("directives") if isinstance(raw.get("directives"), dict) else {}
+    rule_text = " ".join(rules).lower()
+    directives: dict[str, Any] = {
+        "public_evidence_only": "trace-visible" in rule_text and "public" in rule_text,
+        "require_same_repo_repetition": "same-repo" in rule_text and "repeated support" in rule_text,
+        "recover_validate_only": "recover/validate" in rule_text and "semantic edit" in rule_text,
+        "gate_surviving_signals_only": "survived the lower-level gate" in rule_text,
+    }
+    for key in _BOOLEAN_WRITER_DIRECTIVES:
+        if key in explicit:
+            directives[key] = bool(explicit[key])
+
+    max_actions = explicit.get("max_actions")
+    if max_actions is None:
+        match = re.search(r"at most\s+(\d+)\s+(?:recover/validate\s+)?actions", rule_text)
+        max_actions = match.group(1) if match else None
+    try:
+        directives["max_actions"] = max(1, min(8, int(max_actions))) if max_actions is not None else None
+    except (TypeError, ValueError):
+        directives["max_actions"] = None
+
+    return {
+        "rules": rules,
+        "directives": directives,
+        "update_count": int(raw.get("update_count") or 0),
+        **({"path": raw.get("path")} if raw.get("path") else {}),
+    }
+
+
+def _append_gate(current: str, addition: str) -> str:
+    current = str(current or "").strip()
+    addition = str(addition or "").strip()
+    if not current:
+        return addition
+    if not addition or addition in current:
+        return current
+    return f"{current} {addition}"
+
+
+def _policy_application(
+    policy: dict[str, Any],
+    effects: list[str],
+) -> dict[str, Any]:
+    directives = policy.get("directives") if isinstance(policy.get("directives"), dict) else {}
+    return {
+        "supplied": bool(policy.get("rules") or any(value for value in directives.values())),
+        "applied": bool(effects),
+        "update_count": int(policy.get("update_count") or 0),
+        "rule_count": len(policy.get("rules") or []),
+        "effects": effects,
+    }
+
+
 def build_repo_cluster(
     *,
     repo: str,
@@ -70,7 +141,11 @@ def build_repo_cluster(
     }
 
 
-def write_repo_candidate(cluster: dict[str, Any]) -> dict[str, Any]:
+def write_repo_candidate(
+    cluster: dict[str, Any],
+    *,
+    writer_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     repo = str(cluster.get("repo") or "unknown")
     repeated_paths = _short_list(cluster.get("repeated_paths"), limit=6)
     repeated_tests = _short_list(cluster.get("repeated_tests"), limit=3)
@@ -102,7 +177,7 @@ def write_repo_candidate(cluster: dict[str, Any]) -> dict[str, Any]:
         actions.append("If the repeated failure signature appears, recover before broadening the edit.")
     if not actions:
         actions.append("Use the repo evidence only as weak background and collect a fresh current-task signal first.")
-    return {
+    candidate = {
         "created_at": utc_now(),
         "level": "repo",
         "repo": repo,
@@ -121,6 +196,53 @@ def write_repo_candidate(cluster: dict[str, Any]) -> dict[str, Any]:
         ),
         "source_cluster": cluster,
     }
+    policy = normalize_writer_policy(writer_policy)
+    directives = policy["directives"]
+    effects: list[str] = []
+    if directives["public_evidence_only"]:
+        candidate["evidence_gate"] = _append_gate(
+            candidate["evidence_gate"],
+            "Match using trace-visible public paths, commands, outputs, or diagnostics only.",
+        )
+        effects.append("public_evidence_only")
+    if directives["require_same_repo_repetition"]:
+        candidate["trigger"] = (
+            f"All required: current task is in repo {repo}; current public evidence independently "
+            "matches at least one repeated same-repo path, validation command, or failure signature."
+        )
+        candidate["evidence_gate"] = _append_gate(
+            candidate["evidence_gate"],
+            "A repo name alone is insufficient; require a repeated same-repo signal.",
+        )
+        effects.append("require_same_repo_repetition")
+        if not (repeated_paths or repeated_tests or repeated_failures):
+            candidate["writer_abstained"] = True
+            candidate["actions"] = [
+                "Collect a repeated same-repo public signal before activating this candidate."
+            ]
+            effects.append("abstain_without_repeated_signal")
+    if directives["recover_validate_only"] and int(cluster.get("positive_support") or 0) == 0:
+        allowed_terms = ("validation", "test", "failure", "recover", "traceback", "symptom")
+        candidate["actions"] = [
+            action
+            for action in candidate["actions"]
+            if any(term in action.lower() for term in allowed_terms)
+        ] or [
+            "Reconstruct the current symptom and derive the narrowest public validation before editing."
+        ]
+        effects.append("recover_validate_only")
+    if directives["gate_surviving_signals_only"]:
+        candidate["evidence_gate"] = _append_gate(
+            candidate["evidence_gate"],
+            "Do not introduce trigger details or actions that are absent from the repeated cluster fields.",
+        )
+        effects.append("gate_surviving_signals_only")
+    max_actions = directives.get("max_actions")
+    if max_actions is not None and len(candidate["actions"]) > max_actions:
+        candidate["actions"] = candidate["actions"][:max_actions]
+        effects.append(f"max_actions={max_actions}")
+    candidate["writer_policy_application"] = _policy_application(policy, effects)
+    return candidate
 
 
 def build_failure_cluster(
@@ -142,10 +264,14 @@ def build_failure_cluster(
     }
 
 
-def write_failure_mode_candidate(cluster: dict[str, Any]) -> dict[str, Any]:
+def write_failure_mode_candidate(
+    cluster: dict[str, Any],
+    *,
+    writer_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     signature = str(cluster.get("failure_signature") or "unknown-failure-mode")
     support_repos = _short_list(cluster.get("support_repos"), limit=12)
-    return {
+    candidate = {
         "created_at": utc_now(),
         "level": "failure_mode",
         "failure_signature": signature,
@@ -165,6 +291,43 @@ def write_failure_mode_candidate(cluster: dict[str, Any]) -> dict[str, Any]:
         ),
         "source_cluster": cluster,
     }
+    policy = normalize_writer_policy(writer_policy)
+    directives = policy["directives"]
+    effects: list[str] = []
+    if directives["public_evidence_only"]:
+        candidate["evidence_gate"] = (
+            "Require the current trace-visible public diagnostic to match this failure signature; "
+            "task identity or hidden verifier information is never evidence."
+        )
+        effects.append("public_evidence_only")
+    if directives["recover_validate_only"]:
+        allowed_terms = (
+            "symptom",
+            "diff",
+            "failing symbol",
+            "traceback",
+            "test",
+            "localization drifted",
+            "validation",
+        )
+        candidate["actions"] = [
+            action
+            for action in candidate["actions"]
+            if any(term in action.lower() for term in allowed_terms)
+        ]
+        effects.append("recover_validate_only")
+    if directives["gate_surviving_signals_only"]:
+        candidate["evidence_gate"] = _append_gate(
+            candidate.get("evidence_gate") or "",
+            "Use only the supported failure signature and cross-repo support retained by the lower-level gate.",
+        )
+        effects.append("gate_surviving_signals_only")
+    max_actions = directives.get("max_actions")
+    if max_actions is not None and len(candidate["actions"]) > max_actions:
+        candidate["actions"] = candidate["actions"][:max_actions]
+        effects.append(f"max_actions={max_actions}")
+    candidate["writer_policy_application"] = _policy_application(policy, effects)
+    return candidate
 
 
 def candidate_to_skill_markdown(
