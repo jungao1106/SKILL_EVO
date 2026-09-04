@@ -16,12 +16,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.tts_evolution import (  # noqa: E402
-    REWARD_CONDITION_OPERATORS,
+    TTS_EVALUATION_SCOPES,
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
-    normalize_reward_condition,
+    normalize_tts_evaluation_scope,
     safe_slug,
+    select_tts_evaluation_task_names,
     write_json,
     write_jsonl,
 )
@@ -61,50 +62,53 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(errors="replace"))
 
 
-def add_reward_condition_args(parser: argparse.ArgumentParser) -> None:
+def add_evaluation_scope_arg(
+    parser: argparse.ArgumentParser,
+    *,
+    default: str | None = "reward-zero",
+) -> None:
     parser.add_argument(
-        "--reward-operator",
-        choices=REWARD_CONDITION_OPERATORS,
-        default="eq",
-        help="Comparison used to select TTS evidence and rerun tasks (default: eq).",
-    )
-    parser.add_argument(
-        "--reward-value",
-        type=float,
-        default=0.0,
-        help="Reward value used by --reward-operator (default: 0).",
-    )
-    parser.add_argument(
-        "--include-missing-reward",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Include missing or invalid rewards in the selected TTS condition.",
-    )
-    parser.add_argument(
-        "--reward-threshold",
-        type=float,
-        default=None,
-        help="Deprecated compatibility alias for reward < threshold including missing rewards.",
+        "--evaluation-scope",
+        choices=TTS_EVALUATION_SCOPES,
+        default=default,
+        help=(
+            "Tasks evaluated at each TTS gate: the previous report's exact "
+            "reward=0 subset, or the full downstream task set "
+            f"(default: {default or 'inherit from manifest'})."
+        ),
     )
 
 
-def reward_condition_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    legacy_threshold = getattr(args, "reward_threshold", None)
-    if legacy_threshold is not None:
-        return normalize_reward_condition(
-            {
-                "operator": "lt",
-                "value": legacy_threshold,
-                "include_missing": True,
-            }
+def evaluation_scope_from_args(
+    args: argparse.Namespace,
+    manifest: dict[str, Any] | None = None,
+) -> str:
+    scope = getattr(args, "evaluation_scope", None)
+    recorded_scope: object | None = None
+    if scope is None and manifest:
+        parameters = (
+            manifest.get("parameters")
+            if isinstance(manifest.get("parameters"), dict)
+            else {}
         )
-    return normalize_reward_condition(
-        {
-            "operator": getattr(args, "reward_operator", "eq"),
-            "value": getattr(args, "reward_value", 0.0),
-            "include_missing": getattr(args, "include_missing_reward", False),
-        }
-    )
+        recorded_scope = parameters.get("evaluation_scope")
+        scope = recorded_scope
+    elif manifest:
+        parameters = (
+            manifest.get("parameters")
+            if isinstance(manifest.get("parameters"), dict)
+            else {}
+        )
+        recorded_scope = parameters.get("evaluation_scope")
+    normalized = normalize_tts_evaluation_scope(scope)
+    if recorded_scope is not None and normalized != normalize_tts_evaluation_scope(
+        recorded_scope
+    ):
+        raise ValueError(
+            "TTS evaluation scope cannot change within an existing run: "
+            f"manifest={recorded_scope!r} requested={normalized!r}"
+        )
+    return normalized
 
 
 def shell_join(parts: list[object]) -> str:
@@ -149,6 +153,8 @@ def render_eval_launcher(
     gate_index: int,
     gate_skill_root: Path,
     args: argparse.Namespace,
+    task_file_glob: str | None = None,
+    num_shards: int | None = None,
 ) -> str:
     eval_run_id = f"{run_id}_gate{gate_index:03d}_verified_eval"
     command = [
@@ -161,9 +167,9 @@ def render_eval_launcher(
         "--external-skill-pack-root",
         gate_skill_root,
         "--task-file-glob",
-        args.task_file_glob,
+        task_file_glob or args.task_file_glob,
         "--num-shards",
-        args.num_shards,
+        num_shards if num_shards is not None else args.num_shards,
         "--concurrency-per-shard",
         args.concurrency_per_shard,
         "--harness",
@@ -215,6 +221,18 @@ def render_eval_launcher(
 
 def render_report_md(manifest: dict[str, Any]) -> str:
     summary = manifest["summary"]
+    evolution_contract = (
+        manifest.get("evolution_contract")
+        if isinstance(manifest.get("evolution_contract"), dict)
+        else {}
+    )
+    evidence_filter = evolution_contract.get("target_trace_filter") or "not recorded"
+    parameters = (
+        manifest.get("parameters")
+        if isinstance(manifest.get("parameters"), dict)
+        else {}
+    )
+    evaluation_scope = parameters.get("evaluation_scope") or "not recorded"
     lines = [
         "# SWE-bench Verified Test-Time Skill Evolution Gates",
         "",
@@ -223,7 +241,8 @@ def render_report_md(manifest: dict[str, Any]) -> str:
         f"- Run id: `{manifest['run_id']}`",
         f"- Source direct run: `{manifest['source_run_id']}`",
         f"- Selected traces used for evolution: `{summary['task_evidence']}`",
-        f"- Reward condition: `{manifest['evolution_contract']['target_trace_filter']}`",
+        f"- Evidence filter: `{evidence_filter}`",
+        f"- TTS evaluation scope: `{evaluation_scope}`",
         "- Evolution verifier access: `false`",
         "- Promotion source: `evaluator_only`",
         f"- Repo candidates: `{summary['repo_candidates']}`",
@@ -252,7 +271,7 @@ def render_report_md(manifest: dict[str, Any]) -> str:
             "",
             "## Boundary",
             "",
-            "The source direct-run reward is used only by the recorded reward condition to select traces for evolution and later reporting. Candidate generation and promotion do not consume hidden verifier labels; accepted gate skills come from the evaluator decision log.",
+            "Exact-zero rewards select trace evidence for evolution. The configured evaluation scope independently controls whether a gate runs on that reward-zero subset or on all downstream tasks. Candidate generation and promotion do not consume hidden verifier labels; accepted gate skills come from the evaluator decision log.",
             "",
         ]
     )
@@ -270,7 +289,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--out-root", type=Path, default=ROOT / "run_logs" / "swebench_verified_tts_evo")
     parser.add_argument("--skill-output-root", type=Path, default=ROOT / "skills" / "test_time")
-    add_reward_condition_args(parser)
+    add_evaluation_scope_arg(parser)
     parser.add_argument("--max-evidence", type=int, default=None)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
@@ -333,11 +352,15 @@ def main() -> None:
     skill_run_root = args.skill_output_root / run_id
     evaluator_policy = load_evaluator_policy(args.policy_state)
     writer_policy = load_writer_policy(args.policy_state)
-    reward_condition = reward_condition_from_args(args)
+    evaluation_scope = evaluation_scope_from_args(args)
+    source_report = read_json(args.source_aggregate)
+    evaluation_task_names = select_tts_evaluation_task_names(
+        source_report,
+        evaluation_scope,
+    )
 
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=args.source_aggregate,
-        reward_condition=reward_condition,
         max_evidence=args.max_evidence,
     )
     generated = generate_test_time_decisions(
@@ -417,14 +440,15 @@ def main() -> None:
         "evaluator_policy": evaluator_policy,
         "writer_policy": writer_policy,
         "evolution_contract": {
-            "target_trace_filter": reward_condition["expression"],
+            "target_trace_filter": "reward == 0",
+            "evaluation_scope": evaluation_scope,
             "candidate_generation": "trained_writer_policy_from_public_trace_evidence",
             "promotion": "evaluator_only",
             "verifier_access_for_evolution": False,
             "verifier_metrics": "report_only_after_each_gate_eval",
         },
         "parameters": {
-            "reward_condition": reward_condition,
+            "evaluation_scope": evaluation_scope,
             "repo_update_batch_size": args.repo_update_batch_size,
             "repo_min_support": args.repo_min_support,
             "repo_min_positive_support": args.repo_min_positive_support,
@@ -439,6 +463,7 @@ def main() -> None:
         },
         "summary": {
             "task_evidence": len(evidence_rows),
+            "evaluation_tasks": len(evaluation_task_names),
             "repo_clusters": len(generated["repo_clusters"]),
             "failure_clusters": len(generated["failure_clusters"]),
             "repo_candidates": len(generated["repo_candidates"]),
@@ -468,6 +493,12 @@ def main() -> None:
         print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
+    evaluation_task_file: Path | None = None
+    if evaluation_scope == "reward-zero":
+        evaluation_task_file = run_dir / "subsets" / "source_reward_zero_tasks.txt"
+        evaluation_task_file.parent.mkdir(parents=True, exist_ok=True)
+        evaluation_task_file.write_text("\n".join(evaluation_task_names) + "\n")
+
     if gate0_root.exists():
         shutil.rmtree(gate0_root)
     gate0_root.parent.mkdir(parents=True, exist_ok=True)
@@ -494,11 +525,29 @@ def main() -> None:
                 gate_index=gate_index,
                 gate_skill_root=gate_skill_root,
                 args=args,
+                task_file_glob=(
+                    str(evaluation_task_file) if evaluation_task_file else None
+                ),
+                num_shards=1 if evaluation_task_file else None,
             )
         )
         launcher_path.chmod(0o755)
-        write_json(gate_dir / "manifest.json", {**gate_manifest, "eval_launcher": str(launcher_path)})
+        write_json(
+            gate_dir / "manifest.json",
+            {
+                **gate_manifest,
+                "evaluation_scope": evaluation_scope,
+                "evaluation_task_file": (
+                    str(evaluation_task_file) if evaluation_task_file else None
+                ),
+                "eval_launcher": str(launcher_path),
+            },
+        )
         manifest["gates"][gate_index]["eval_launcher"] = str(launcher_path)
+        manifest["gates"][gate_index]["evaluation_scope"] = evaluation_scope
+        manifest["gates"][gate_index]["evaluation_task_file"] = (
+            str(evaluation_task_file) if evaluation_task_file else None
+        )
         manifest["gates"][gate_index]["skill_counts"] = gate_manifest["skill_counts"]
 
     write_jsonl(run_dir / "evidence" / "task_evidence.jsonl", evidence_rows)

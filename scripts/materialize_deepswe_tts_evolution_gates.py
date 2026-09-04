@@ -26,10 +26,10 @@ from evolution.tts_evolution import (  # noqa: E402
 )
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
     DEFAULT_POLICY_STATE,
-    add_reward_condition_args,
+    add_evaluation_scope_arg,
+    evaluation_scope_from_args,
     load_evaluator_policy,
     load_writer_policy,
-    reward_condition_from_args,
 )
 from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
 
@@ -45,6 +45,12 @@ def render_report_md(manifest: dict[str, Any]) -> str:
         evolution_contract.get("target_trace_filter")
         or "not recorded (legacy manifest)"
     )
+    parameters = (
+        manifest.get("parameters")
+        if isinstance(manifest.get("parameters"), dict)
+        else {}
+    )
+    evaluation_scope = parameters.get("evaluation_scope") or "not recorded"
     lines = [
         "# DeepSWE Test-Time Skill Evolution Gates",
         "",
@@ -53,7 +59,8 @@ def render_report_md(manifest: dict[str, Any]) -> str:
         f"- Run id: `{manifest['run_id']}`",
         f"- Source direct run: `{manifest['source_run_id']}`",
         f"- Selected traces used for evolution: `{summary['task_evidence']}`",
-        f"- Reward condition: `{reward_filter}`",
+        f"- Evidence filter: `{reward_filter}`",
+        f"- TTS evaluation scope: `{evaluation_scope}`",
         "- Evolution verifier access: `false`",
         "- Promotion source: `evaluator_only`",
         f"- Repo candidates: `{summary['repo_candidates']}`",
@@ -247,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", type=Path, default=ROOT / "run_logs" / "deepswe_tts_evo")
     parser.add_argument("--skill-output-root", type=Path, default=ROOT / "skills" / "test_time")
     parser.add_argument("--benchmark-name", default="deepswe")
-    add_reward_condition_args(parser)
+    add_evaluation_scope_arg(parser)
     parser.add_argument("--max-evidence", type=int, default=None)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
@@ -275,7 +282,7 @@ def run_materialization(args: argparse.Namespace) -> None:
         raise SystemExit(f"Missing base skill root: {args.base_skill_root}")
     if not args.policy_state.is_file():
         raise SystemExit(f"Missing writer/evaluator policy state: {args.policy_state}")
-    reward_condition = reward_condition_from_args(args)
+    evaluation_scope = evaluation_scope_from_args(args)
     try:
         source_report = json.loads(args.source_aggregate.read_text(errors="replace"))
     except json.JSONDecodeError as exc:
@@ -303,7 +310,7 @@ def run_materialization(args: argparse.Namespace) -> None:
         },
         "source_run_id": args.source_run_id,
         "benchmark_name": args.benchmark_name,
-        "reward_condition": reward_condition,
+        "evaluation_scope": evaluation_scope,
         "max_evidence": args.max_evidence,
         "repo_update_batch_size": args.repo_update_batch_size,
         "repo_min_support": args.repo_min_support,
@@ -345,7 +352,6 @@ def run_materialization(args: argparse.Namespace) -> None:
 
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=args.source_aggregate,
-        reward_condition=reward_condition,
         max_evidence=args.max_evidence,
         benchmark_name=args.benchmark_name,
     )
@@ -417,14 +423,15 @@ def run_materialization(args: argparse.Namespace) -> None:
             "gate_001_tree_sha256": sha256_tree(gate1_root),
         },
         "evolution_contract": {
-            "target_trace_filter": reward_condition["expression"],
+            "target_trace_filter": "reward == 0",
+            "evaluation_scope": evaluation_scope,
             "candidate_generation": "trained_writer_policy_from_public_trace_evidence",
             "promotion": "evaluator_only",
             "verifier_access_for_evolution": False,
             "verifier_metrics": "report_only_after_each_gate_eval",
         },
         "parameters": {
-            "reward_condition": reward_condition,
+            "evaluation_scope": evaluation_scope,
             "repo_update_batch_size": args.repo_update_batch_size,
             "repo_min_support": args.repo_min_support,
             "repo_min_positive_support": args.repo_min_positive_support,

@@ -18,16 +18,17 @@ from evolution.tts_evolution import (  # noqa: E402
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
+    select_tts_evaluation_task_names,
     write_json,
     write_jsonl,
 )
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
     DEFAULT_PYTHON,
     DEFAULT_TASK_FILE_GLOB,
-    add_reward_condition_args,
+    add_evaluation_scope_arg,
+    evaluation_scope_from_args,
     load_evaluator_policy,
     load_writer_policy,
-    reward_condition_from_args,
     render_eval_launcher,
 )
 
@@ -90,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verified-root", type=Path, default=ROOT / "run_logs" / "swebench_verified_frozen_shards")
     parser.add_argument("--skill-output-root", type=Path, default=ROOT / "skills" / "test_time")
     parser.add_argument("--policy-state", type=Path, default=DEFAULT_POLICY_STATE)
-    add_reward_condition_args(parser)
+    add_evaluation_scope_arg(parser, default=None)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
     parser.add_argument("--repo-min-positive-support", type=int, default=0)
@@ -147,10 +148,13 @@ def main() -> None:
     args.python = str(Path(args.python).expanduser()) if "/" in args.python else args.python
     evaluator_policy = load_evaluator_policy(args.policy_state)
     writer_policy = load_writer_policy(args.policy_state)
-    reward_condition = reward_condition_from_args(args)
+    evaluation_scope = evaluation_scope_from_args(args, manifest)
+    evaluation_task_names = select_tts_evaluation_task_names(
+        read_json(aggregate_path),
+        evaluation_scope,
+    )
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=aggregate_path,
-        reward_condition=reward_condition,
     )
     generated = generate_test_time_decisions(
         evidence_rows=evidence_rows,
@@ -178,7 +182,8 @@ def main() -> None:
         "base_skill_root": str(base_skill_root),
         "gate_skill_root": str(gate_root),
         "source_aggregate": str(aggregate_path),
-        "reward_condition": reward_condition,
+        "evaluation_scope": evaluation_scope,
+        "evaluation_tasks": len(evaluation_task_names),
         "task_evidence": len(evidence_rows),
         "repo_candidates": len(generated["repo_candidates"]),
         "failure_candidates": len(generated["failure_candidates"]),
@@ -199,16 +204,28 @@ def main() -> None:
     )
     launcher_path = gate_dir / "eval_launcher.sh"
     launcher_path.parent.mkdir(parents=True, exist_ok=True)
+    evaluation_task_file: Path | None = None
+    if evaluation_scope == "reward-zero":
+        evaluation_task_file = gate_dir / "source_reward_zero_tasks.txt"
+        evaluation_task_file.write_text("\n".join(evaluation_task_names) + "\n")
     launcher_path.write_text(
         render_eval_launcher(
             run_id=args.run_id,
             gate_index=gate_index,
             gate_skill_root=gate_root,
             args=args,
+            task_file_glob=(
+                str(evaluation_task_file) if evaluation_task_file else None
+            ),
+            num_shards=1 if evaluation_task_file else None,
         )
     )
     launcher_path.chmod(0o755)
     gate_manifest["eval_launcher"] = str(launcher_path)
+    gate_manifest["evaluation_scope"] = evaluation_scope
+    gate_manifest["evaluation_task_file"] = (
+        str(evaluation_task_file) if evaluation_task_file else None
+    )
     write_json(gate_dir / "manifest.json", gate_manifest)
 
     evidence_dir = run_dir / "evidence" / f"gate_{gate_index:03d}"
@@ -230,7 +247,10 @@ def main() -> None:
         "promotion_source": "evaluator_only",
         "source_previous_gate": previous_gate_index,
         "source_aggregate": str(aggregate_path),
-        "reward_condition": reward_condition,
+        "evaluation_scope": evaluation_scope,
+        "evaluation_task_file": (
+            str(evaluation_task_file) if evaluation_task_file else None
+        ),
         "eval_launcher": str(launcher_path),
         "verifier_report": {
             "status": "not_run",
@@ -251,7 +271,7 @@ def main() -> None:
             "previous_gate": previous_gate_index,
             "gate_index": gate_index,
             "source_aggregate": str(aggregate_path),
-            "reward_condition": reward_condition,
+            "evaluation_scope": evaluation_scope,
             "summary": gate_row["evolution_summary"],
         }
     )

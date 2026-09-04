@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from evolution.tts_evolution import select_tts_evaluation_task_names  # noqa: E402
 from scripts.job_run_lock import exclusive_job_run  # noqa: E402
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
-    add_reward_condition_args,
-    reward_condition_from_args,
+    add_evaluation_scope_arg,
+    evaluation_scope_from_args,
 )
 from providers import resolve_provider  # noqa: E402
 
@@ -53,18 +54,8 @@ def timestamp_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-def reward_condition_cli_args(condition: dict[str, Any]) -> list[str]:
-    return [
-        "--reward-operator",
-        str(condition["operator"]),
-        "--reward-value",
-        f"{float(condition['value']):g}",
-        (
-            "--include-missing-reward"
-            if condition["include_missing"]
-            else "--no-include-missing-reward"
-        ),
-    ]
+def evaluation_scope_cli_args(evaluation_scope: str) -> list[str]:
+    return ["--evaluation-scope", evaluation_scope]
 
 
 def absolute_path_preserving_symlinks(path: Path) -> Path:
@@ -175,6 +166,7 @@ def run_eval_until_valid(
     output_dir: Path,
     log_dir: Path,
     expected_trials: int,
+    task_names_file: Path | None = None,
 ) -> Path:
     report_path = output_dir / "score_report.json"
     if aggregate_is_complete(report_path, expected_trials, job_name):
@@ -217,6 +209,8 @@ def run_eval_until_valid(
         "--force-agent-internet",
         "--use-skills",
     ]
+    if task_names_file is not None:
+        eval_command.extend(["--task-names-file", str(task_names_file)])
     aggregate_command = [
         str(args.python),
         "scripts/aggregate_benchmark_job.py",
@@ -285,7 +279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-setup-timeout-sec", type=int, default=1200)
     parser.add_argument("--recovery-rounds", type=int, default=4)
     parser.add_argument("--max-gate", type=int, default=4)
-    add_reward_condition_args(parser)
+    add_evaluation_scope_arg(parser)
     return parser.parse_args()
 
 
@@ -295,8 +289,8 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     args.policy_state = args.policy_state.expanduser().resolve()
     args.env_file = args.env_file.expanduser().resolve()
     args.python = absolute_path_preserving_symlinks(args.python)
-    reward_condition = reward_condition_from_args(args)
-    reward_cli_args = reward_condition_cli_args(reward_condition)
+    evaluation_scope = evaluation_scope_from_args(args)
+    evaluation_scope_args = evaluation_scope_cli_args(evaluation_scope)
     if not 2 <= args.max_gate <= 4:
         raise SystemExit("--max-gate must be between 2 and 4.")
     for path, label in (
@@ -367,7 +361,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "frozen_run_id": args.frozen_run_id,
         "tts_run_id": args.tts_run_id,
         "max_gate": args.max_gate,
-        "reward_condition": reward_condition,
+        "evaluation_scope": evaluation_scope,
         "expected_trials": expected_trials,
         "tmp_dir": str(tmp_dir),
         "tmp_free_bytes_at_start": tmp_free_bytes,
@@ -389,6 +383,20 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     )
     state["current_step"] = "materialize_gate_1"
     state["frozen_report"] = str(frozen_report)
+    frozen_report_data = json.loads(frozen_report.read_text(errors="replace"))
+    gate1_task_names = select_tts_evaluation_task_names(
+        frozen_report_data,
+        evaluation_scope,
+    )
+    gate1_task_file: Path | None = None
+    if evaluation_scope == "reward-zero":
+        gate1_task_file = run_dir / "subsets" / "gate000_reward_zero_tasks.txt"
+        gate1_task_file.parent.mkdir(parents=True, exist_ok=True)
+        gate1_task_file.write_text(
+            "\n".join(task_name.rsplit("/", 1)[-1] for task_name in gate1_task_names)
+            + "\n"
+        )
+    state["gate_1_evaluation_tasks"] = len(gate1_task_names)
     write_json_atomic(state_path, state)
 
     tts_root = ROOT / "run_logs" / "deepswe_tts_evo"
@@ -412,7 +420,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         str(skill_output_root),
         "--benchmark-name",
         "deepswe",
-        *reward_cli_args,
+        *evaluation_scope_args,
     ]
     if run_logged(
         command=materialize_command,
@@ -453,7 +461,8 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         skill_root=gate1_root,
         output_dir=run_dir / "gate_001" / "aggregate",
         log_dir=log_dir,
-        expected_trials=expected_trials,
+        expected_trials=len(gate1_task_names),
+        task_names_file=gate1_task_file,
     )
     attach_gate1 = [
         str(args.python),
@@ -522,7 +531,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         str(args.env_file),
         "--python",
         str(args.python),
-        *reward_cli_args,
+        *evaluation_scope_args,
     ]
     if run_logged(
         command=subset_command,

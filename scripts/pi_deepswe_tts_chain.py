@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""pi_deepswe TTS chain with a configurable reward-selected subset per gate."""
+"""pi_deepswe TTS chain with reward-zero or all-task gate evaluation."""
 import json, glob, os, subprocess, sys, shutil
 from pathlib import Path
 from datetime import datetime
@@ -8,7 +8,10 @@ ROOT = Path("/vePFS-Mindverse/user/intern/jungao/SKILLS_EVO")
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from evolution.tts_evolution import normalize_reward_condition, reward_matches_condition
+from evolution.tts_evolution import (
+    normalize_tts_evaluation_scope,
+    reward_is_selected_for_tts_evaluation,
+)
 
 PY = "/vePFS-Mindverse/user/intern/jungao/Marcronv1_SWE/.venv312/bin/python"
 DATASET = "/vePFS-Mindverse/user/intern/jungao/Marcronv1-Coding/deep-swe/tasks"
@@ -19,13 +22,8 @@ BASE_SKILL = ROOT / "skills/downstream/swebench_verified_glm52_novita_v0100_froz
 POLICY = ROOT / "run_logs/swegym_skill_evo/swegym_novita_glm52_c15_resume_merged_20260630_071956/training/policy_state.json"
 MAX_GATE = 4
 CONCURRENCY = 4
-REWARD_CONDITION = normalize_reward_condition(
-    {
-        "operator": os.getenv("TTS_REWARD_OPERATOR", "eq"),
-        "value": os.getenv("TTS_REWARD_VALUE", "0"),
-        "include_missing": os.getenv("TTS_INCLUDE_MISSING_REWARD", "false").lower()
-        in {"1", "true", "yes"},
-    }
+EVALUATION_SCOPE = normalize_tts_evaluation_scope(
+    os.getenv("TTS_EVALUATION_SCOPE", "reward-zero")
 )
 
 def load_env():
@@ -42,7 +40,7 @@ def selected_tasks(report_path):
     return [
         t["task_name"]
         for t in r["tasks"]
-        if reward_matches_condition(t.get("reward"), REWARD_CONDITION)
+        if reward_is_selected_for_tts_evaluation(t.get("reward"), EVALUATION_SCOPE)
     ]
 
 def write_tasks(tasks, path):
@@ -90,7 +88,7 @@ def make_report(job_name, prev_report_tasks):
     results = collect_results(job_name)
     tasks = []
     for tn, prev_rw in prev_report_tasks.items():
-        if tn in results and reward_matches_condition(prev_rw, REWARD_CONDITION):
+        if tn in results and reward_is_selected_for_tts_evaluation(prev_rw, EVALUATION_SCOPE):
             rw = results[tn]["reward"]
             rp = results[tn]["result_path"]
             trial = results[tn]["trial_name"]
@@ -124,7 +122,6 @@ def materialize_gate(gate_index, source_report, base_skill_root):
     writer_policy = load_writer_policy(POLICY)
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=source_report,
-        reward_condition=REWARD_CONDITION,
         max_evidence=None,
         benchmark_name="deepswe",
     )
@@ -165,8 +162,8 @@ def main():
     else:
         frozen_report = json.load(open(FROZEN_REPORT))
         prev_tasks = {t["task_name"]: t["reward"] for t in frozen_report["tasks"]}
-        pending = [tn for tn, rw in prev_tasks.items() if reward_matches_condition(rw, REWARD_CONDITION)]
-        print(f"[gate1] rerun {len(pending)} tasks matching {REWARD_CONDITION['expression']}", flush=True)
+        pending = [tn for tn, rw in prev_tasks.items() if reward_is_selected_for_tts_evaluation(rw, EVALUATION_SCOPE)]
+        print(f"[gate1] rerun {len(pending)} tasks with scope={EVALUATION_SCOPE}", flush=True)
         gate1_skill = SKILL_ROOT_BASE / "gate_001"
         run_eval(f"pi_deepswe_tts_gate1_20260807", gate1_skill, pending, env,
                  ROOT / "run_logs/pi_deepswe_tts/gate1.log")
@@ -174,9 +171,9 @@ def main():
     resolved = sum(1 for v in prev_tasks.values() if v == 1.0)
     print(f"[gate1] done, cumulative resolved={resolved}/113", flush=True)
 
-    # gate2-4: materialize from and rerun the configured reward-selected subset.
+    # gate2-4: learn from reward-zero traces, then use the configured eval scope.
     for g in range(2, MAX_GATE + 1):
-        pending = [tn for tn, rw in prev_tasks.items() if reward_matches_condition(rw, REWARD_CONDITION)]
+        pending = [tn for tn, rw in prev_tasks.items() if reward_is_selected_for_tts_evaluation(rw, EVALUATION_SCOPE)]
         if not pending:
             print(f"[gate{g}] no pending, stop", flush=True); break
         # materialize gate g from prev gate's report
@@ -188,7 +185,7 @@ def main():
         gate_skill = SKILL_ROOT_BASE / f"gate_{g:03d}"
         if not gate_skill.is_dir():
             print(f"[gate{g}] skill lib not found, stop", flush=True); break
-        print(f"[gate{g}] rerun {len(pending)} tasks matching {REWARD_CONDITION['expression']}", flush=True)
+        print(f"[gate{g}] rerun {len(pending)} tasks with scope={EVALUATION_SCOPE}", flush=True)
         run_eval(f"pi_deepswe_tts_gate{g}_20260807", gate_skill, pending, env,
                  ROOT / f"run_logs/pi_deepswe_tts/gate{g}.log")
         report_path, prev_tasks = make_report(f"pi_deepswe_tts_gate{g}_20260807", prev_tasks)

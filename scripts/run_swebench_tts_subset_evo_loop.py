@@ -24,8 +24,8 @@ from evolution.tts_evolution import (  # noqa: E402
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
-    reward_matches_condition,
     safe_slug,
+    select_tts_evaluation_task_names,
     write_json,
     write_jsonl,
 )
@@ -34,10 +34,10 @@ from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
 from scripts.run_benchmark import _deepswe_result_infra_reason  # noqa: E402
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
     DEFAULT_PYTHON,
-    add_reward_condition_args,
+    add_evaluation_scope_arg,
+    evaluation_scope_from_args,
     load_evaluator_policy,
     load_writer_policy,
-    reward_condition_from_args,
 )
 from scripts.materialize_deepswe_tts_evolution_gates import (  # noqa: E402
     render_report_md,
@@ -114,20 +114,6 @@ def all_report_tasks(report: dict[str, Any]) -> set[str]:
         str(row.get("task_name") or "")
         for row in rows
         if str(row.get("task_name") or "")
-    }
-
-
-def reward_selected_tasks(
-    report: dict[str, Any],
-    reward_condition: dict[str, Any],
-) -> set[str]:
-    evaluation = report.get("evaluation") if isinstance(report.get("evaluation"), dict) else {}
-    rows = evaluation.get("tasks") or report.get("tasks") or []
-    return {
-        str(row.get("task_name") or "")
-        for row in rows
-        if str(row.get("task_name") or "")
-        and reward_matches_condition(row.get("reward"), reward_condition)
     }
 
 
@@ -378,6 +364,7 @@ def write_subset_report(
     previous_success_count: int,
     cumulative_success_count: int,
     benchmark_name: str,
+    evaluation_scope: str,
 ) -> dict[str, Any]:
     summary = summarize_job(job_dir)
     for row in summary.get("tasks") or []:
@@ -405,6 +392,7 @@ def write_subset_report(
         "expected_trials": len(expected_tasks),
         "complete": complete,
         "benchmark_name": benchmark_name,
+        "evaluation_scope": evaluation_scope,
         "infra_invalid_trials": [],
         "evaluation": summary,
         "tasks": summary.get("tasks") or [],
@@ -440,10 +428,10 @@ def materialize_next_gate(
         source_report_path,
         expected_benchmark_name=args.benchmark_name,
     )
-    reward_condition = reward_condition_from_args(args)
+    evaluation_scope = evaluation_scope_from_args(args, manifest)
     parameter_payload = {
         "benchmark_name": args.benchmark_name,
-        "reward_condition": reward_condition,
+        "evaluation_scope": evaluation_scope,
         "repo_update_batch_size": args.repo_update_batch_size,
         "repo_min_support": args.repo_min_support,
         "repo_min_positive_support": args.repo_min_positive_support,
@@ -513,7 +501,6 @@ def materialize_next_gate(
 
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=source_report_path,
-        reward_condition=reward_condition,
         benchmark_name=args.benchmark_name,
     )
     generated = generate_test_time_decisions(
@@ -553,14 +540,13 @@ def materialize_next_gate(
         "skill_counts": gate_manifest["skill_counts"],
         "promotion_source": "evaluator_only",
         "source_previous_gate": previous_gate_index,
-        "reward_condition": reward_condition,
+        "evaluation_scope": evaluation_scope,
         "source_aggregate": str(source_report_path),
         "verifier_report": {
             "status": "subset_pending",
             "note": (
-                "This gate is evaluated only on tasks selected from the previous "
-                f"report by {reward_condition['expression']}; compose with earlier "
-                "successes."
+                "This gate uses the configured TTS evaluation scope "
+                f"{evaluation_scope!r}; verifier outcomes remain report-only."
             ),
         },
         "evolution_summary": {
@@ -867,7 +853,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-state", type=Path, default=DEFAULT_POLICY_STATE)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--python", default=DEFAULT_PYTHON)
-    add_reward_condition_args(parser)
+    add_evaluation_scope_arg(parser, default=None)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
     parser.add_argument("--repo-min-positive-support", type=int, default=0)
@@ -901,7 +887,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
     manifest = read_json(manifest_path)
     evaluator_policy = load_evaluator_policy(args.policy_state)
     writer_policy = load_writer_policy(args.policy_state)
-    reward_condition = reward_condition_from_args(args)
+    evaluation_scope = evaluation_scope_from_args(args, manifest)
 
     gate1 = gate_row(manifest, 1)
     gate1_report = gate1.get("verifier_report") or {}
@@ -914,15 +900,18 @@ def run_subset_loop(args: argparse.Namespace) -> None:
     )
     all_tasks = all_report_tasks(base_report)
     success_tasks = successful_tasks(base_report)
-    unresolved_tasks = sorted(reward_selected_tasks(base_report, reward_condition))
+    pending_tasks = select_tts_evaluation_task_names(base_report, evaluation_scope)
     previous_report_path = gate1_aggregate
     previous_gate_index = 1
 
     state_path = run_dir / "subset_eval" / "loop_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
     for gate_index in range(args.start_gate, args.max_gate + 1):
-        if not unresolved_tasks:
-            print(f"[tts-subset-loop] no unresolved tasks before gate_{gate_index:03d}; stop", flush=True)
+        if not pending_tasks:
+            print(
+                f"[tts-subset-loop] no tasks selected before gate_{gate_index:03d}; stop",
+                flush=True,
+            )
             break
         previous_gate = gate_row(manifest, previous_gate_index)
         previous_gate_root = Path(previous_gate["skill_root"]).expanduser().resolve()
@@ -938,9 +927,14 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             evaluator_policy=evaluator_policy,
         )
         gate_root = Path(gate_manifest["output_root"]).expanduser().resolve()
-        subset_tasks = set(unresolved_tasks)
+        subset_tasks = set(pending_tasks)
         dataset_task_filters = dataset_filter_task_names(args.dataset, subset_tasks)
-        task_file = run_dir / "subsets" / f"gate{previous_gate_index:03d}_unresolved_tasks.txt"
+        scope_slug = evaluation_scope.replace("-", "_")
+        task_file = (
+            run_dir
+            / "subsets"
+            / f"gate{previous_gate_index:03d}_{scope_slug}_tasks.txt"
+        )
         write_text(task_file, "\n".join(sorted(dataset_task_filters)) + "\n")
         job_name = subset_job_name(
             args.run_id,
@@ -977,8 +971,9 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             previous_success_count=previous_success_count,
             cumulative_success_count=len(success_tasks),
             benchmark_name=args.benchmark_name,
+            evaluation_scope=evaluation_scope,
         )
-        unresolved_tasks = sorted(reward_selected_tasks(report, reward_condition))
+        pending_tasks = select_tts_evaluation_task_names(report, evaluation_scope)
         evaluation = report.get("evaluation") or {}
         verifier_report = {
             "status": "available_subset",
@@ -989,8 +984,8 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             "n_errors": evaluation.get("n_errors"),
             "resolved": len(recovered),
             "cumulative_resolved": len(success_tasks),
-            "remaining_unresolved": len(unresolved_tasks),
-            "reward_condition": reward_condition,
+            "next_evaluation_tasks": len(pending_tasks),
+            "evaluation_scope": evaluation_scope,
             "mean_reward": evaluation.get("mean_reward"),
         }
         gate = gate_row(manifest, gate_index)
@@ -1009,11 +1004,11 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             "max_gate": args.max_gate,
             "latest_gate": gate_index,
             "combined_resolved": len(success_tasks),
-            "remaining_unresolved": len(unresolved_tasks),
+            "next_evaluation_tasks": len(pending_tasks),
             "latest_subset_report": str(subset_report_path),
             "latest_job_name": job_name,
             "latest_subset_recovered": len(recovered),
-            "reward_condition": reward_condition,
+            "evaluation_scope": evaluation_scope,
         }
         write_json(state_path, loop_state)
         print(
@@ -1022,7 +1017,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
                 recovered=len(recovered),
                 combined=len(success_tasks),
                 total=len(all_tasks),
-                remaining=len(unresolved_tasks),
+                remaining=len(pending_tasks),
             ),
             flush=True,
         )

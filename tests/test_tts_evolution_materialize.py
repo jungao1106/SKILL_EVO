@@ -4,14 +4,19 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from agents.skill_writer import write_failure_mode_candidate, write_repo_candidate
 from evolution.tts_evolution import (
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
-    normalize_reward_condition,
-    reward_matches_condition,
+    normalize_tts_evaluation_scope,
+    select_tts_evaluation_task_names,
+)
+from scripts.materialize_swebench_tts_evolution_gates import (
+    evaluation_scope_from_args,
+    render_eval_launcher,
 )
 
 
@@ -60,17 +65,28 @@ class GateSkillCountTest(unittest.TestCase):
             self.assertEqual(counts["total"], 1)
 
 
-class RewardConditionTest(unittest.TestCase):
-    def test_default_condition_selects_only_exact_zero(self) -> None:
-        condition = normalize_reward_condition()
+class TtsEvaluationScopeTest(unittest.TestCase):
+    def test_scope_selects_reward_zero_or_all_tasks(self) -> None:
+        report = {
+            "tasks": [
+                {"task_name": "zero", "reward": 0},
+                {"task_name": "partial", "reward": 0.5},
+                {"task_name": "solved", "reward": 1},
+                {"task_name": "missing", "reward": None},
+            ]
+        }
 
-        self.assertEqual(condition["expression"], "reward == 0")
-        self.assertTrue(reward_matches_condition(0, condition))
-        self.assertFalse(reward_matches_condition(0.5, condition))
-        self.assertFalse(reward_matches_condition(1, condition))
-        self.assertFalse(reward_matches_condition(None, condition))
+        self.assertEqual(normalize_tts_evaluation_scope(), "reward-zero")
+        self.assertEqual(
+            select_tts_evaluation_task_names(report, "reward-zero"),
+            ["zero"],
+        )
+        self.assertEqual(
+            select_tts_evaluation_task_names(report, "all"),
+            ["zero", "partial", "solved", "missing"],
+        )
 
-    def test_collection_uses_configured_condition(self) -> None:
+    def test_evolution_evidence_remains_exact_zero(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
             report_path = root / "report.json"
@@ -92,21 +108,62 @@ class RewardConditionTest(unittest.TestCase):
             default_rows = collect_failed_trace_evidence(
                 aggregate_report_path=report_path,
             )
-            broad_rows = collect_failed_trace_evidence(
-                aggregate_report_path=report_path,
-                reward_condition={
-                    "operator": "lt",
-                    "value": 1,
-                    "include_missing": True,
-                },
-            )
 
         self.assertEqual([row["reward"] for row in default_rows], [0])
-        self.assertEqual([row["reward"] for row in broad_rows], [0, 0.5, None])
         self.assertEqual(
-            broad_rows[0]["selection_reward_condition"]["expression"],
-            "(reward < 1) or reward is missing/invalid",
+            default_rows[0]["selection_reward_condition"]["expression"],
+            "reward == 0",
         )
+
+    def test_existing_run_inherits_and_locks_evaluation_scope(self) -> None:
+        manifest = {"parameters": {"evaluation_scope": "all"}}
+
+        self.assertEqual(
+            evaluation_scope_from_args(
+                SimpleNamespace(evaluation_scope=None),
+                manifest,
+            ),
+            "all",
+        )
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            evaluation_scope_from_args(
+                SimpleNamespace(evaluation_scope="reward-zero"),
+                manifest,
+            )
+
+    def test_reward_zero_scope_launcher_uses_selected_task_file(self) -> None:
+        args = SimpleNamespace(
+            python="python",
+            task_file_glob="all_tasks_*.txt",
+            num_shards=5,
+            concurrency_per_shard=10,
+            harness="pi",
+            provider="openai",
+            env_file=Path(".env"),
+            agent_timeout_sec=3600,
+            agent_setup_timeout_sec=1200,
+            e2b_sandbox_timeout_sec=7200,
+            provider_base_url=None,
+            provider_anthropic_base_url=None,
+            provider_model=None,
+            provider_api=None,
+            claude_max_turns=None,
+            claude_max_budget_usd=None,
+            materialize_eval_scripts_only=False,
+        )
+
+        launcher = render_eval_launcher(
+            run_id="test",
+            gate_index=1,
+            gate_skill_root=Path("skills/gate_001"),
+            args=args,
+            task_file_glob="selected_reward_zero.txt",
+            num_shards=1,
+        )
+
+        self.assertIn("--task-file-glob selected_reward_zero.txt", launcher)
+        self.assertIn("--num-shards 1", launcher)
+        self.assertNotIn("all_tasks_*.txt", launcher)
 
 
 class WriterPolicyApplicationTest(unittest.TestCase):

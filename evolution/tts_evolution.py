@@ -22,6 +22,7 @@ from evolution.score import first_reward_value
 
 
 REWARD_CONDITION_OPERATORS = ("eq", "ne", "lt", "le", "gt", "ge")
+TTS_EVALUATION_SCOPES = ("reward-zero", "all")
 _REWARD_OPERATOR_SYMBOLS = {
     "eq": "==",
     "ne": "!=",
@@ -173,6 +174,50 @@ def reward_matches_condition(
         "gt": actual > expected,
         "ge": actual >= expected,
     }[operator]
+
+
+def normalize_tts_evaluation_scope(scope: object = "reward-zero") -> str:
+    normalized = str(scope or "reward-zero").strip().lower()
+    if normalized not in TTS_EVALUATION_SCOPES:
+        raise ValueError(
+            f"Unsupported TTS evaluation scope {normalized!r}; "
+            f"expected one of {', '.join(TTS_EVALUATION_SCOPES)}"
+        )
+    return normalized
+
+
+def reward_is_selected_for_tts_evaluation(
+    reward: object,
+    evaluation_scope: object = "reward-zero",
+) -> bool:
+    scope = normalize_tts_evaluation_scope(evaluation_scope)
+    return scope == "all" or reward_matches_condition(reward)
+
+
+def select_tts_evaluation_task_names(
+    report: dict[str, Any],
+    evaluation_scope: object = "reward-zero",
+) -> list[str]:
+    evaluation = (
+        report.get("evaluation")
+        if isinstance(report.get("evaluation"), dict)
+        else {}
+    )
+    rows = evaluation.get("tasks") or report.get("tasks") or []
+    selected: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        task_name = str(row.get("task_name") or "")
+        if (
+            task_name
+            and task_name not in seen
+            and reward_is_selected_for_tts_evaluation(
+                row.get("reward"), evaluation_scope
+            )
+        ):
+            selected.append(task_name)
+            seen.add(task_name)
+    return selected
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any]:
