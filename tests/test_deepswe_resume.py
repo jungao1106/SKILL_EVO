@@ -29,7 +29,10 @@ from scripts.run_benchmark import (
     _upgrade_deepswe_resume_config,
 )
 from scripts.run_deepswe import build_deepswe_argv
-from scripts.run_deepswe_full_evolution import absolute_path_preserving_symlinks
+from scripts.run_deepswe_full_evolution import (
+    absolute_path_preserving_symlinks,
+    reward_condition_cli_args,
+)
 from scripts import run_swebench_tts_subset_evo_loop as subset_loop
 
 
@@ -108,6 +111,50 @@ class FullEvolutionRunnerTest(unittest.TestCase):
 
             self.assertEqual(normalized, venv_python)
             self.assertTrue(normalized.is_symlink())
+
+    def test_reward_condition_is_serialized_for_child_processes(self) -> None:
+        args = reward_condition_cli_args(
+            {
+                "operator": "lt",
+                "value": 0.75,
+                "include_missing": True,
+            }
+        )
+
+        self.assertEqual(
+            args,
+            [
+                "--reward-operator",
+                "lt",
+                "--reward-value",
+                "0.75",
+                "--include-missing-reward",
+            ],
+        )
+
+
+class TtsRewardConditionTest(unittest.TestCase):
+    def test_subset_scope_uses_configured_reward_condition(self) -> None:
+        report = {
+            "tasks": [
+                {"task_name": "zero", "reward": 0},
+                {"task_name": "partial", "reward": 0.5},
+                {"task_name": "solved", "reward": 1},
+                {"task_name": "missing", "reward": None},
+            ]
+        }
+
+        exact_zero = subset_loop.reward_selected_tasks(
+            report,
+            {"operator": "eq", "value": 0, "include_missing": False},
+        )
+        below_one = subset_loop.reward_selected_tasks(
+            report,
+            {"operator": "lt", "value": 1, "include_missing": True},
+        )
+
+        self.assertEqual(exact_zero, {"zero"})
+        self.assertEqual(below_one, {"zero", "partial", "missing"})
 
 
 class JobResumeStateTest(unittest.TestCase):

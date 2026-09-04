@@ -18,6 +18,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.job_run_lock import exclusive_job_run  # noqa: E402
+from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
+    add_reward_condition_args,
+    reward_condition_from_args,
+)
 from providers import resolve_provider  # noqa: E402
 
 
@@ -47,6 +51,20 @@ def utc_now() -> str:
 
 def timestamp_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def reward_condition_cli_args(condition: dict[str, Any]) -> list[str]:
+    return [
+        "--reward-operator",
+        str(condition["operator"]),
+        "--reward-value",
+        f"{float(condition['value']):g}",
+        (
+            "--include-missing-reward"
+            if condition["include_missing"]
+            else "--no-include-missing-reward"
+        ),
+    ]
 
 
 def absolute_path_preserving_symlinks(path: Path) -> Path:
@@ -267,6 +285,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-setup-timeout-sec", type=int, default=1200)
     parser.add_argument("--recovery-rounds", type=int, default=4)
     parser.add_argument("--max-gate", type=int, default=4)
+    add_reward_condition_args(parser)
     return parser.parse_args()
 
 
@@ -276,12 +295,14 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
     args.policy_state = args.policy_state.expanduser().resolve()
     args.env_file = args.env_file.expanduser().resolve()
     args.python = absolute_path_preserving_symlinks(args.python)
+    reward_condition = reward_condition_from_args(args)
+    reward_cli_args = reward_condition_cli_args(reward_condition)
     if not 2 <= args.max_gate <= 4:
         raise SystemExit("--max-gate must be between 2 and 4.")
     for path, label in (
         (args.dataset, "DeepSWE dataset"),
         (args.base_skill_root, "base skill root"),
-        (args.policy_state, "evaluator policy"),
+        (args.policy_state, "writer/evaluator policy"),
         (args.python, "Python executable"),
     ):
         if not path.exists():
@@ -346,6 +367,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         "frozen_run_id": args.frozen_run_id,
         "tts_run_id": args.tts_run_id,
         "max_gate": args.max_gate,
+        "reward_condition": reward_condition,
         "expected_trials": expected_trials,
         "tmp_dir": str(tmp_dir),
         "tmp_free_bytes_at_start": tmp_free_bytes,
@@ -390,6 +412,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         str(skill_output_root),
         "--benchmark-name",
         "deepswe",
+        *reward_cli_args,
     ]
     if run_logged(
         command=materialize_command,
@@ -499,6 +522,7 @@ def run_full(args: argparse.Namespace, state_path: Path) -> None:
         str(args.env_file),
         "--python",
         str(args.python),
+        *reward_cli_args,
     ]
     if run_logged(
         command=subset_command,

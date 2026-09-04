@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import tomllib
@@ -18,6 +19,17 @@ from agents.skill_writer import (
     write_repo_candidate,
 )
 from evolution.score import first_reward_value
+
+
+REWARD_CONDITION_OPERATORS = ("eq", "ne", "lt", "le", "gt", "ge")
+_REWARD_OPERATOR_SYMBOLS = {
+    "eq": "==",
+    "ne": "!=",
+    "lt": "<",
+    "le": "<=",
+    "gt": ">",
+    "ge": ">=",
+}
 
 
 def utc_now() -> str:
@@ -107,6 +119,60 @@ def result_reward(result: dict[str, Any]) -> float | None:
         else None
     )
     return first_reward_value(rewards)
+
+
+def normalize_reward_condition(
+    condition: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw = condition if isinstance(condition, dict) else {}
+    operator = str(raw.get("operator") or "eq").strip().lower()
+    if operator not in REWARD_CONDITION_OPERATORS:
+        raise ValueError(
+            f"Unsupported reward condition operator {operator!r}; "
+            f"expected one of {', '.join(REWARD_CONDITION_OPERATORS)}"
+        )
+    try:
+        value = float(raw.get("value", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid reward condition value: {raw.get('value')!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"Reward condition value must be finite: {value!r}")
+    include_missing = bool(raw.get("include_missing", False))
+    value_label = f"{value:g}"
+    expression = f"reward {_REWARD_OPERATOR_SYMBOLS[operator]} {value_label}"
+    if include_missing:
+        expression = f"({expression}) or reward is missing/invalid"
+    return {
+        "operator": operator,
+        "value": value,
+        "include_missing": include_missing,
+        "expression": expression,
+    }
+
+
+def reward_matches_condition(
+    reward: object,
+    condition: dict[str, Any] | None = None,
+) -> bool:
+    normalized = normalize_reward_condition(condition)
+    if reward is None or isinstance(reward, bool):
+        return bool(normalized["include_missing"])
+    try:
+        actual = float(reward)
+    except (TypeError, ValueError):
+        return bool(normalized["include_missing"])
+    if not math.isfinite(actual):
+        return bool(normalized["include_missing"])
+    expected = float(normalized["value"])
+    operator = normalized["operator"]
+    return {
+        "eq": actual == expected,
+        "ne": actual != expected,
+        "lt": actual < expected,
+        "le": actual <= expected,
+        "gt": actual > expected,
+        "ge": actual >= expected,
+    }[operator]
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any]:
@@ -275,16 +341,25 @@ def failure_signature_for_evidence(entry: dict[str, Any]) -> str:
 def collect_failed_trace_evidence(
     *,
     aggregate_report_path: Path,
-    reward_threshold: float = 1.0,
+    reward_condition: dict[str, Any] | None = None,
+    reward_threshold: float | None = None,
     max_evidence: int | None = None,
     benchmark_name: str = "swebench_verified",
 ) -> list[dict[str, Any]]:
+    if reward_threshold is not None:
+        if reward_condition is not None:
+            raise ValueError("Use reward_condition or legacy reward_threshold, not both")
+        reward_condition = {
+            "operator": "lt",
+            "value": reward_threshold,
+            "include_missing": True,
+        }
+    selection_condition = normalize_reward_condition(reward_condition)
     report = read_json(aggregate_report_path)
     evidence_rows: list[dict[str, Any]] = []
     for index, row in enumerate(report.get("tasks") or [], start=1):
         reward = row.get("reward")
-        failed = reward is None or float(reward) < reward_threshold
-        if not failed:
+        if not reward_matches_condition(reward, selection_condition):
             continue
         result_path = Path(row["result_path"]).expanduser().resolve()
         result = _load_json_if_exists(result_path)
@@ -325,7 +400,11 @@ def collect_failed_trace_evidence(
             "trial_dir": str(trial_dir),
             "reward": reward,
             "selection_verifier_reward": reward,
-            "selection_note": "reward is used only to select direct-run failures for test-time evolution",
+            "selection_reward_condition": selection_condition,
+            "selection_note": (
+                "reward is used only for task selection under "
+                f"{selection_condition['expression']}"
+            ),
             "exception": row.get("exception_type") or _exception_type(result),
             "case_label": None,
             "failure_signature": None,

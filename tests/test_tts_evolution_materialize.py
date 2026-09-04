@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from agents.skill_writer import write_failure_mode_candidate, write_repo_candidate
-from evolution.tts_evolution import generate_test_time_decisions, materialize_gate_library
+from evolution.tts_evolution import (
+    collect_failed_trace_evidence,
+    generate_test_time_decisions,
+    materialize_gate_library,
+    normalize_reward_condition,
+    reward_matches_condition,
+)
 
 
 class GateSkillCountTest(unittest.TestCase):
@@ -51,6 +58,55 @@ class GateSkillCountTest(unittest.TestCase):
             self.assertEqual(counts["added_this_gate"], 0)
             self.assertEqual(counts["updated_this_gate"], 1)
             self.assertEqual(counts["total"], 1)
+
+
+class RewardConditionTest(unittest.TestCase):
+    def test_default_condition_selects_only_exact_zero(self) -> None:
+        condition = normalize_reward_condition()
+
+        self.assertEqual(condition["expression"], "reward == 0")
+        self.assertTrue(reward_matches_condition(0, condition))
+        self.assertFalse(reward_matches_condition(0.5, condition))
+        self.assertFalse(reward_matches_condition(1, condition))
+        self.assertFalse(reward_matches_condition(None, condition))
+
+    def test_collection_uses_configured_condition(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            report_path = root / "report.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "task_name": f"owner__repo-{index}",
+                                "reward": reward,
+                                "result_path": str(root / f"trial-{index}" / "result.json"),
+                            }
+                            for index, reward in enumerate((0, 0.5, 1, None))
+                        ]
+                    }
+                )
+            )
+
+            default_rows = collect_failed_trace_evidence(
+                aggregate_report_path=report_path,
+            )
+            broad_rows = collect_failed_trace_evidence(
+                aggregate_report_path=report_path,
+                reward_condition={
+                    "operator": "lt",
+                    "value": 1,
+                    "include_missing": True,
+                },
+            )
+
+        self.assertEqual([row["reward"] for row in default_rows], [0])
+        self.assertEqual([row["reward"] for row in broad_rows], [0, 0.5, None])
+        self.assertEqual(
+            broad_rows[0]["selection_reward_condition"]["expression"],
+            "(reward < 1) or reward is missing/invalid",
+        )
 
 
 class WriterPolicyApplicationTest(unittest.TestCase):

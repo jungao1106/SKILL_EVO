@@ -24,6 +24,7 @@ from evolution.tts_evolution import (  # noqa: E402
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
+    reward_matches_condition,
     safe_slug,
     write_json,
     write_jsonl,
@@ -33,7 +34,10 @@ from scripts.job_run_lock import exclusive_job_run, job_is_running  # noqa: E402
 from scripts.run_benchmark import _deepswe_result_infra_reason  # noqa: E402
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
     DEFAULT_PYTHON,
+    add_reward_condition_args,
     load_evaluator_policy,
+    load_writer_policy,
+    reward_condition_from_args,
 )
 from scripts.materialize_deepswe_tts_evolution_gates import (  # noqa: E402
     render_report_md,
@@ -110,6 +114,20 @@ def all_report_tasks(report: dict[str, Any]) -> set[str]:
         str(row.get("task_name") or "")
         for row in rows
         if str(row.get("task_name") or "")
+    }
+
+
+def reward_selected_tasks(
+    report: dict[str, Any],
+    reward_condition: dict[str, Any],
+) -> set[str]:
+    evaluation = report.get("evaluation") if isinstance(report.get("evaluation"), dict) else {}
+    rows = evaluation.get("tasks") or report.get("tasks") or []
+    return {
+        str(row.get("task_name") or "")
+        for row in rows
+        if str(row.get("task_name") or "")
+        and reward_matches_condition(row.get("reward"), reward_condition)
     }
 
 
@@ -414,6 +432,7 @@ def materialize_next_gate(
     previous_gate_index: int,
     previous_gate_root: Path,
     source_report_path: Path,
+    writer_policy: dict[str, Any],
     evaluator_policy: dict[str, Any],
 ) -> dict[str, Any]:
     validate_source_aggregate(
@@ -421,9 +440,10 @@ def materialize_next_gate(
         source_report_path,
         expected_benchmark_name=args.benchmark_name,
     )
+    reward_condition = reward_condition_from_args(args)
     parameter_payload = {
         "benchmark_name": args.benchmark_name,
-        "reward_threshold": args.reward_threshold,
+        "reward_condition": reward_condition,
         "repo_update_batch_size": args.repo_update_batch_size,
         "repo_min_support": args.repo_min_support,
         "repo_min_positive_support": args.repo_min_positive_support,
@@ -445,6 +465,9 @@ def materialize_next_gate(
         },
         "evaluator_policy_sha256": hashlib.sha256(
             json.dumps(evaluator_policy, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "writer_policy_sha256": hashlib.sha256(
+            json.dumps(writer_policy, sort_keys=True).encode("utf-8")
         ).hexdigest(),
         "parameters_sha256": hashlib.sha256(
             json.dumps(parameter_payload, sort_keys=True).encode("utf-8")
@@ -490,13 +513,14 @@ def materialize_next_gate(
 
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=source_report_path,
-        reward_threshold=args.reward_threshold,
+        reward_condition=reward_condition,
         benchmark_name=args.benchmark_name,
     )
     generated = generate_test_time_decisions(
         evidence_rows=evidence_rows,
         run_name=f"{args.run_id}_gate{gate_index:03d}",
         benchmark_name=args.benchmark_name,
+        writer_policy=writer_policy,
         evaluator_policy=evaluator_policy,
         repo_update_batch_size=args.repo_update_batch_size,
         repo_min_support=args.repo_min_support,
@@ -529,12 +553,14 @@ def materialize_next_gate(
         "skill_counts": gate_manifest["skill_counts"],
         "promotion_source": "evaluator_only",
         "source_previous_gate": previous_gate_index,
+        "reward_condition": reward_condition,
         "source_aggregate": str(source_report_path),
         "verifier_report": {
             "status": "subset_pending",
             "note": (
-                "This gate is evaluated only on the previous unresolved subset; "
-                "compose with earlier successes."
+                "This gate is evaluated only on tasks selected from the previous "
+                f"report by {reward_condition['expression']}; compose with earlier "
+                "successes."
             ),
         },
         "evolution_summary": {
@@ -841,7 +867,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-state", type=Path, default=DEFAULT_POLICY_STATE)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--python", default=DEFAULT_PYTHON)
-    parser.add_argument("--reward-threshold", type=float, default=1.0)
+    add_reward_condition_args(parser)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
     parser.add_argument("--repo-min-positive-support", type=int, default=0)
@@ -874,6 +900,8 @@ def run_subset_loop(args: argparse.Namespace) -> None:
     manifest_path = run_dir / "manifest.json"
     manifest = read_json(manifest_path)
     evaluator_policy = load_evaluator_policy(args.policy_state)
+    writer_policy = load_writer_policy(args.policy_state)
+    reward_condition = reward_condition_from_args(args)
 
     gate1 = gate_row(manifest, 1)
     gate1_report = gate1.get("verifier_report") or {}
@@ -886,7 +914,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
     )
     all_tasks = all_report_tasks(base_report)
     success_tasks = successful_tasks(base_report)
-    unresolved_tasks = sorted(all_tasks - success_tasks)
+    unresolved_tasks = sorted(reward_selected_tasks(base_report, reward_condition))
     previous_report_path = gate1_aggregate
     previous_gate_index = 1
 
@@ -906,6 +934,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             previous_gate_index=previous_gate_index,
             previous_gate_root=previous_gate_root,
             source_report_path=previous_report_path,
+            writer_policy=writer_policy,
             evaluator_policy=evaluator_policy,
         )
         gate_root = Path(gate_manifest["output_root"]).expanduser().resolve()
@@ -935,7 +964,6 @@ def run_subset_loop(args: argparse.Namespace) -> None:
         summary = summarize_job(job_dir)
         recovered = successful_tasks({"evaluation": summary})
         success_tasks.update(recovered)
-        unresolved_tasks = sorted(subset_tasks - recovered)
         subset_report_path = run_dir / "subset_eval" / f"gate{gate_index:03d}_subset_report.json"
         report = write_subset_report(
             path=subset_report_path,
@@ -950,6 +978,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             cumulative_success_count=len(success_tasks),
             benchmark_name=args.benchmark_name,
         )
+        unresolved_tasks = sorted(reward_selected_tasks(report, reward_condition))
         evaluation = report.get("evaluation") or {}
         verifier_report = {
             "status": "available_subset",
@@ -961,6 +990,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             "resolved": len(recovered),
             "cumulative_resolved": len(success_tasks),
             "remaining_unresolved": len(unresolved_tasks),
+            "reward_condition": reward_condition,
             "mean_reward": evaluation.get("mean_reward"),
         }
         gate = gate_row(manifest, gate_index)
@@ -983,6 +1013,7 @@ def run_subset_loop(args: argparse.Namespace) -> None:
             "latest_subset_report": str(subset_report_path),
             "latest_job_name": job_name,
             "latest_subset_recovered": len(recovered),
+            "reward_condition": reward_condition,
         }
         write_json(state_path, loop_state)
         print(

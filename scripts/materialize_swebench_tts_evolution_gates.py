@@ -16,9 +16,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evolution.tts_evolution import (  # noqa: E402
+    REWARD_CONDITION_OPERATORS,
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
+    normalize_reward_condition,
     safe_slug,
     write_json,
     write_jsonl,
@@ -57,6 +59,52 @@ def utc_tag() -> str:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(errors="replace"))
+
+
+def add_reward_condition_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--reward-operator",
+        choices=REWARD_CONDITION_OPERATORS,
+        default="eq",
+        help="Comparison used to select TTS evidence and rerun tasks (default: eq).",
+    )
+    parser.add_argument(
+        "--reward-value",
+        type=float,
+        default=0.0,
+        help="Reward value used by --reward-operator (default: 0).",
+    )
+    parser.add_argument(
+        "--include-missing-reward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include missing or invalid rewards in the selected TTS condition.",
+    )
+    parser.add_argument(
+        "--reward-threshold",
+        type=float,
+        default=None,
+        help="Deprecated compatibility alias for reward < threshold including missing rewards.",
+    )
+
+
+def reward_condition_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    legacy_threshold = getattr(args, "reward_threshold", None)
+    if legacy_threshold is not None:
+        return normalize_reward_condition(
+            {
+                "operator": "lt",
+                "value": legacy_threshold,
+                "include_missing": True,
+            }
+        )
+    return normalize_reward_condition(
+        {
+            "operator": getattr(args, "reward_operator", "eq"),
+            "value": getattr(args, "reward_value", 0.0),
+            "include_missing": getattr(args, "include_missing_reward", False),
+        }
+    )
 
 
 def shell_join(parts: list[object]) -> str:
@@ -174,7 +222,8 @@ def render_report_md(manifest: dict[str, Any]) -> str:
         "",
         f"- Run id: `{manifest['run_id']}`",
         f"- Source direct run: `{manifest['source_run_id']}`",
-        f"- Failed traces used for evolution: `{summary['task_evidence']}`",
+        f"- Selected traces used for evolution: `{summary['task_evidence']}`",
+        f"- Reward condition: `{manifest['evolution_contract']['target_trace_filter']}`",
         "- Evolution verifier access: `false`",
         "- Promotion source: `evaluator_only`",
         f"- Repo candidates: `{summary['repo_candidates']}`",
@@ -203,7 +252,7 @@ def render_report_md(manifest: dict[str, Any]) -> str:
             "",
             "## Boundary",
             "",
-            "The source direct-run reward is used only to select `reward != 1` traces for evolution and for later reporting. Candidate generation and promotion do not consume hidden verifier labels; accepted gate skills come from the evaluator decision log.",
+            "The source direct-run reward is used only by the recorded reward condition to select traces for evolution and later reporting. Candidate generation and promotion do not consume hidden verifier labels; accepted gate skills come from the evaluator decision log.",
             "",
         ]
     )
@@ -221,7 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--out-root", type=Path, default=ROOT / "run_logs" / "swebench_verified_tts_evo")
     parser.add_argument("--skill-output-root", type=Path, default=ROOT / "skills" / "test_time")
-    parser.add_argument("--reward-threshold", type=float, default=1.0)
+    add_reward_condition_args(parser)
     parser.add_argument("--max-evidence", type=int, default=None)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
@@ -229,7 +278,7 @@ def parse_args() -> argparse.Namespace:
         "--repo-min-positive-support",
         type=int,
         default=0,
-        help="Default is 0 because this script evolves from direct-run reward!=1 traces; repeated public repo signals still gate repo candidates.",
+        help="Default is 0 because selected TTS traces need not contain verifier-positive rows; repeated public repo signals still gate repo candidates.",
     )
     parser.add_argument("--failure-mode-min-repo-support", type=int, default=2)
     parser.add_argument("--max-repo-skills-per-gate", type=int, default=12)
@@ -284,10 +333,11 @@ def main() -> None:
     skill_run_root = args.skill_output_root / run_id
     evaluator_policy = load_evaluator_policy(args.policy_state)
     writer_policy = load_writer_policy(args.policy_state)
+    reward_condition = reward_condition_from_args(args)
 
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=args.source_aggregate,
-        reward_threshold=args.reward_threshold,
+        reward_condition=reward_condition,
         max_evidence=args.max_evidence,
     )
     generated = generate_test_time_decisions(
@@ -367,14 +417,14 @@ def main() -> None:
         "evaluator_policy": evaluator_policy,
         "writer_policy": writer_policy,
         "evolution_contract": {
-            "target_trace_filter": "source direct run reward != 1",
+            "target_trace_filter": reward_condition["expression"],
             "candidate_generation": "trained_writer_policy_from_public_trace_evidence",
             "promotion": "evaluator_only",
             "verifier_access_for_evolution": False,
             "verifier_metrics": "report_only_after_each_gate_eval",
         },
         "parameters": {
-            "reward_threshold": args.reward_threshold,
+            "reward_condition": reward_condition,
             "repo_update_batch_size": args.repo_update_batch_size,
             "repo_min_support": args.repo_min_support,
             "repo_min_positive_support": args.repo_min_positive_support,

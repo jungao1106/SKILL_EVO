@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import shlex
 import sys
 from datetime import datetime, timezone
@@ -19,14 +18,16 @@ from evolution.tts_evolution import (  # noqa: E402
     collect_failed_trace_evidence,
     generate_test_time_decisions,
     materialize_gate_library,
-    safe_slug,
     write_json,
     write_jsonl,
 )
 from scripts.materialize_swebench_tts_evolution_gates import (  # noqa: E402
     DEFAULT_PYTHON,
     DEFAULT_TASK_FILE_GLOB,
+    add_reward_condition_args,
     load_evaluator_policy,
+    load_writer_policy,
+    reward_condition_from_args,
     render_eval_launcher,
 )
 
@@ -89,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verified-root", type=Path, default=ROOT / "run_logs" / "swebench_verified_frozen_shards")
     parser.add_argument("--skill-output-root", type=Path, default=ROOT / "skills" / "test_time")
     parser.add_argument("--policy-state", type=Path, default=DEFAULT_POLICY_STATE)
-    parser.add_argument("--reward-threshold", type=float, default=1.0)
+    add_reward_condition_args(parser)
     parser.add_argument("--repo-update-batch-size", type=int, default=5)
     parser.add_argument("--repo-min-support", type=int, default=2)
     parser.add_argument("--repo-min-positive-support", type=int, default=0)
@@ -145,13 +146,16 @@ def main() -> None:
     args.env_file = args.env_file.expanduser().resolve()
     args.python = str(Path(args.python).expanduser()) if "/" in args.python else args.python
     evaluator_policy = load_evaluator_policy(args.policy_state)
+    writer_policy = load_writer_policy(args.policy_state)
+    reward_condition = reward_condition_from_args(args)
     evidence_rows = collect_failed_trace_evidence(
         aggregate_report_path=aggregate_path,
-        reward_threshold=args.reward_threshold,
+        reward_condition=reward_condition,
     )
     generated = generate_test_time_decisions(
         evidence_rows=evidence_rows,
         run_name=f"{args.run_id}_gate{gate_index:03d}",
+        writer_policy=writer_policy,
         evaluator_policy=evaluator_policy,
         repo_update_batch_size=args.repo_update_batch_size,
         repo_min_support=args.repo_min_support,
@@ -174,6 +178,7 @@ def main() -> None:
         "base_skill_root": str(base_skill_root),
         "gate_skill_root": str(gate_root),
         "source_aggregate": str(aggregate_path),
+        "reward_condition": reward_condition,
         "task_evidence": len(evidence_rows),
         "repo_candidates": len(generated["repo_candidates"]),
         "failure_candidates": len(generated["failure_candidates"]),
@@ -225,6 +230,7 @@ def main() -> None:
         "promotion_source": "evaluator_only",
         "source_previous_gate": previous_gate_index,
         "source_aggregate": str(aggregate_path),
+        "reward_condition": reward_condition,
         "eval_launcher": str(launcher_path),
         "verifier_report": {
             "status": "not_run",
@@ -245,6 +251,7 @@ def main() -> None:
             "previous_gate": previous_gate_index,
             "gate_index": gate_index,
             "source_aggregate": str(aggregate_path),
+            "reward_condition": reward_condition,
             "summary": gate_row["evolution_summary"],
         }
     )
