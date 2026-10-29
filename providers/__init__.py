@@ -9,6 +9,7 @@ from providers.specs import (
     is_macaron_base_url,
     is_novita_base_url,
     normalize_provider_name,
+    populate_anthropic_provider_env,
     requires_reasoning_effort_none,
     resolve_provider,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "is_macaron_base_url",
     "is_novita_base_url",
     "normalize_provider_name",
+    "populate_anthropic_provider_env",
     "requires_reasoning_effort_none",
     "resolve_provider",
 ]

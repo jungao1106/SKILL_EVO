@@ -19,6 +19,11 @@ from harbor.models.trajectories import (
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.utils.trajectory_utils import format_trajectory_json
 
+from agents.pi_agent import (
+    _pi_skill_pack,
+    _pi_skills_metadata,
+    _task_filter_text as _pi_task_filter_text,
+)
 from agents.skill_harness_memory import retrieve_task_memory
 
 
@@ -54,16 +59,37 @@ BENCHMARK ISSUE:
 
 REMOTE_VENV = PurePosixPath("/tmp/harbor-claude-agent-venv")
 REMOTE_PYTHON = REMOTE_VENV / "bin/python"
+DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.116"
+
+
+class DeepSweProviderAuthenticationError(RuntimeError):
+    pass
+
+
+class DeepSweProviderTransientError(RuntimeError):
+    pass
+
+
+class DeepSweProviderRequestError(RuntimeError):
+    pass
+
+
+class DeepSweAgentIncompleteError(RuntimeError):
+    pass
 
 
 RUNNER_SCRIPT = r'''
 import asyncio
 import copy
+import http.client
 import json
 import os
+import threading
 from dataclasses import asdict, is_dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
@@ -163,9 +189,268 @@ def _optional_float(name: str) -> float | None:
     return float(raw) if raw else None
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _force_disable_thinking() -> bool:
+    return _env_flag("FORCE_DISABLE_THINKING")
+
+
 def _disable_thinking_for_model(model: str) -> bool:
+    if _force_disable_thinking():
+        return True
     normalized = model.lower().replace("_", "-")
-    return "glm-5.2" in normalized or "glm5.2" in normalized
+    return (
+        "glm-5.2" in normalized
+        or "glm5.2" in normalized
+        or "qwen3.6" in normalized
+        or "qwen3-6" in normalized
+    )
+
+
+def _provider_auth_error(event: dict[str, Any]) -> bool:
+    if event.get("api_error_status") in {401, 403} or event.get("error") == "authentication_failed":
+        return True
+    data = event.get("data")
+    if isinstance(data, dict) and (
+        data.get("api_error_status") in {401, 403}
+        or data.get("error") == "authentication_failed"
+        or data.get("error_status") == 401
+    ):
+        return True
+    text = json.dumps(event, ensure_ascii=False).lower()
+    return "failed to authenticate" in text or "authentication_failed" in text
+
+
+def _error_statuses(value: Any) -> set[int]:
+    statuses: set[int] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"api_error_status", "error_status", "status", "status_code"}:
+                try:
+                    statuses.add(int(item))
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(item, (dict, list)):
+                statuses.update(_error_statuses(item))
+    elif isinstance(value, list):
+        for item in value:
+            statuses.update(_error_statuses(item))
+    return statuses
+
+
+_TRANSIENT_PROVIDER_MARKERS = (
+    "429",
+    "502",
+    "503",
+    "504",
+    "connection reset",
+    "connection terminated",
+    "connection refused",
+    "connection error",
+    "connect timeout",
+    "read timeout",
+    "timed out",
+    "timeout",
+    "unexpected_eof",
+    "unexpected eof",
+    "eof occurred",
+    "temporarily unavailable",
+    "temporary server",
+    "server-side issue",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "rate limit",
+    "overloaded",
+    "goaway",
+    "max_age",
+)
+
+
+def _provider_failure_kind(event: dict[str, Any]) -> str | None:
+    message_class = event.get("sdk_message_class")
+    event_type = event.get("type")
+    error_bearing = (
+        (message_class == "ResultMessage" and event.get("is_error") is True)
+        or (message_class == "AssistantMessage" and bool(event.get("error")))
+        or message_class == "SDKException"
+        or (message_class is None and event_type == "error")
+    )
+    if not error_bearing:
+        return None
+    subtype = str(event.get("subtype") or "").lower()
+    if subtype.startswith("error_max_turns") or subtype.startswith(
+        "error_max_budget"
+    ):
+        return "budget_exhausted"
+    if _provider_auth_error(event):
+        return "authentication"
+    statuses = _error_statuses(event)
+    text = json.dumps(event, ensure_ascii=False).lower()
+    if event.get("error") in {"rate_limit", "server_error", "overloaded_error"}:
+        return "transient"
+    if any(status in {408, 409, 425, 429} or status >= 500 for status in statuses):
+        return "transient"
+    if any(marker in text for marker in _TRANSIENT_PROVIDER_MARKERS):
+        return "transient"
+    if statuses & {400, 402, 422} or any(
+        marker in text
+        for marker in ("billing_error", "invalid_request", "invalid request")
+    ):
+        return "request"
+    is_error = event.get("is_error") is True
+    error_type = event.get("error") or event.get("type")
+    if is_error or error_type in {"error", "api_error", "sdk_error"}:
+        return "agent_error"
+    return None
+
+
+def _failure_summary(event: dict[str, Any], limit: int = 1200) -> str:
+    text = json.dumps(event, ensure_ascii=False, sort_keys=True)
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+class ClaudeProviderAuthenticationError(RuntimeError):
+    pass
+
+
+class ClaudeProviderTransientError(RuntimeError):
+    pass
+
+
+class ClaudeProviderRequestError(RuntimeError):
+    pass
+
+
+class ClaudeAgentIncompleteError(RuntimeError):
+    pass
+
+
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+class _ThinkingProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _start_thinking_disable_proxy(real_base_url: str, auth_token: str) -> tuple[str, _ThinkingProxyServer]:
+    target = urlsplit(real_base_url.rstrip("/"))
+    if target.scheme not in {"http", "https"} or not target.netloc:
+        raise ValueError(f"Unsupported Anthropic base URL for thinking proxy: {real_base_url!r}")
+    target_prefix = target.path.rstrip("/")
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            self._forward()
+
+        def do_POST(self) -> None:
+            self._forward()
+
+        def do_HEAD(self) -> None:
+            self._forward()
+
+        def _forward(self) -> None:
+            try:
+                body_len = int(self.headers.get("content-length") or "0")
+            except ValueError:
+                body_len = 0
+            body = self.rfile.read(body_len) if body_len else b""
+            out_body = self._maybe_disable_thinking(body)
+            request_path = self.path if self.path.startswith("/") else f"/{self.path}"
+            upstream_path = f"{target_prefix}{request_path}"
+            conn_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+            conn = conn_cls(target.netloc, timeout=600)
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in _HOP_BY_HOP_HEADERS
+                and key.lower() not in {"host", "content-length"}
+            }
+            headers["Host"] = target.netloc
+            headers["Authorization"] = f"Bearer {auth_token}"
+            headers["Connection"] = "close"
+            if self.command.upper() in {"POST", "PUT", "PATCH"}:
+                headers["Content-Length"] = str(len(out_body))
+            try:
+                conn.request(
+                    self.command,
+                    upstream_path,
+                    body=out_body if out_body or self.command.upper() in {"POST", "PUT", "PATCH"} else None,
+                    headers=headers,
+                )
+                response = conn.getresponse()
+                self.send_response(response.status, response.reason)
+                for key, value in response.getheaders():
+                    lower = key.lower()
+                    if lower in _HOP_BY_HOP_HEADERS or lower == "content-length":
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if self.command.upper() != "HEAD":
+                    while True:
+                        chunk = response.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except Exception as exc:
+                payload = json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "thinking_proxy_error",
+                            "message": str(exc),
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+            finally:
+                conn.close()
+                self.close_connection = True
+
+        def _maybe_disable_thinking(self, body: bytes) -> bytes:
+            request_path = self.path.split("?", 1)[0]
+            if self.command.upper() != "POST" or not request_path.endswith("/v1/messages"):
+                return body
+            try:
+                payload = json.loads(body.decode("utf-8") if body else "{}")
+            except Exception:
+                return body
+            if not isinstance(payload, dict):
+                return body
+            payload["thinking"] = {"type": "disabled"}
+            payload.pop("max_thinking_tokens", None)
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    server = _ThinkingProxyServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return f"http://{host}:{port}", server
 
 
 async def main() -> int:
@@ -225,10 +510,20 @@ async def main() -> int:
         "max_turns": _optional_int("HARBOR_CLAUDE_MAX_TURNS"),
         "max_budget_usd": _optional_float("HARBOR_CLAUDE_MAX_BUDGET_USD"),
     }
-    if _disable_thinking_for_model(provider_model):
+    thinking_disabled = _disable_thinking_for_model(provider_model)
+    thinking_proxy = None
+    if thinking_disabled:
         sdk_env["MAX_THINKING_TOKENS"] = "0"
         options_kwargs["thinking"] = {"type": "disabled"}
         options_kwargs["max_thinking_tokens"] = 0
+        if not _env_flag("HARBOR_CLAUDE_DISABLE_THINKING_PROXY"):
+            real_base_url = sdk_env["ANTHROPIC_BASE_URL"]
+            proxy_base_url, thinking_proxy = _start_thinking_disable_proxy(
+                real_base_url,
+                sdk_env["ANTHROPIC_AUTH_TOKEN"],
+            )
+            sdk_env["HARBOR_CLAUDE_REAL_ANTHROPIC_BASE_URL"] = real_base_url
+            sdk_env["ANTHROPIC_BASE_URL"] = proxy_base_url
 
     options = ClaudeAgentOptions(**options_kwargs)
 
@@ -242,7 +537,27 @@ async def main() -> int:
                     events.append(event)
                     handle.write(json.dumps(event, ensure_ascii=False) + "\n")
                     handle.flush()
+                    failure_kind = _provider_failure_kind(event)
+                    if failure_kind == "authentication":
+                        raise ClaudeProviderAuthenticationError(
+                            "Claude provider authentication failed; check the configured API key."
+                        )
+                    if failure_kind == "transient":
+                        raise ClaudeProviderTransientError(
+                            "Claude provider transient failure: "
+                            + _failure_summary(event)
+                        )
+                    if failure_kind == "request":
+                        raise ClaudeProviderRequestError(
+                            "Claude provider request failure: "
+                            + _failure_summary(event)
+                        )
                     if event.get("sdk_message_class") == "ResultMessage":
+                        if failure_kind == "agent_error":
+                            raise ClaudeAgentIncompleteError(
+                                "Claude agent ResultMessage reported an error: "
+                                + _failure_summary(event)
+                            )
                         break
         except BaseException as exc:
             error = {
@@ -255,18 +570,58 @@ async def main() -> int:
                 json.dumps({"ok": False, "error": error}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            raise
+            if isinstance(
+                exc,
+                (
+                    ClaudeProviderAuthenticationError,
+                    ClaudeProviderTransientError,
+                    ClaudeProviderRequestError,
+                    ClaudeAgentIncompleteError,
+                ),
+            ):
+                raise
+            failure_kind = _provider_failure_kind(error)
+            if failure_kind == "authentication":
+                raise ClaudeProviderAuthenticationError(
+                    "Claude provider authentication failed; check the configured API key."
+                ) from exc
+            if failure_kind == "transient":
+                raise ClaudeProviderTransientError(
+                    f"Claude provider transient failure: {exc.__class__.__name__}: {exc}"
+                ) from exc
+            if failure_kind == "request":
+                raise ClaudeProviderRequestError(
+                    f"Claude provider request failure: {exc.__class__.__name__}: {exc}"
+                ) from exc
+            raise ClaudeAgentIncompleteError(
+                f"Claude agent SDK execution failed: {exc.__class__.__name__}: {exc}"
+            ) from exc
+        finally:
+            if thinking_proxy is not None:
+                thinking_proxy.shutdown()
+                thinking_proxy.server_close()
 
+    last_event = events[-1] if events and isinstance(events[-1], dict) else {}
     completed = bool(
-        events and isinstance(events[-1], dict)
-        and events[-1].get("sdk_message_class") == "ResultMessage"
+        last_event.get("sdk_message_class") == "ResultMessage"
+        and last_event.get("is_error") is not True
     )
+    budget_exhausted = (
+        _provider_failure_kind(last_event) == "budget_exhausted"
+    )
+    accepted_for_verification = completed or budget_exhausted
     result_path.write_text(
         json.dumps(
             {
-                "ok": completed,
+                "ok": accepted_for_verification,
                 "completed": completed,
-                "termination": "result_message" if completed else "stream_ended_without_result",
+                "termination": (
+                    "result_message"
+                    if completed
+                    else "budget_exhausted"
+                    if budget_exhausted
+                    else "stream_ended_without_result"
+                ),
                 "message_count": len(events),
             },
             ensure_ascii=False,
@@ -274,6 +629,10 @@ async def main() -> int:
         ),
         encoding="utf-8",
     )
+    if not accepted_for_verification:
+        raise ClaudeAgentIncompleteError(
+            "Claude agent stream ended without ResultMessage"
+        )
     return 0
 
 
@@ -441,12 +800,31 @@ def _filtered_event(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _events_completed(events: list[dict[str, Any]]) -> bool:
-    return any(_event_class(event) == "ResultMessage" for event in events)
+    return any(
+        _event_class(event) == "ResultMessage"
+        and event.get("is_error") is not True
+        and event.get("api_error_status") is None
+        for event in events
+    )
+
+
+def _events_budget_exhausted(events: list[dict[str, Any]]) -> bool:
+    return any(
+        _event_class(event) == "ResultMessage"
+        and str(event.get("subtype") or "").lower().startswith(
+            ("error_max_turns", "error_max_budget")
+        )
+        for event in events
+    )
 
 
 def _termination_status(events: list[dict[str, Any]]) -> str:
     if _events_completed(events):
         return "result_message"
+    if _events_budget_exhausted(events):
+        return "budget_exhausted"
+    if any(_event_class(event) == "ResultMessage" for event in events):
+        return "result_error"
     if any(_event_class(event) == "SDKException" for event in events):
         return "sdk_exception"
     if events:
@@ -455,6 +833,8 @@ def _termination_status(events: list[dict[str, Any]]) -> str:
 
 
 def _disable_thinking_for_provider_model(model: str) -> bool:
+    if _env_bool("FORCE_DISABLE_THINKING"):
+        return True
     normalized = model.lower().replace("_", "-")
     return (
         "glm-5.2" in normalized
@@ -478,16 +858,58 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _task_filter_text(instruction: str, environment: BaseEnvironment) -> str:
-    parts = [instruction]
-    for attr in ("environment_name", "session_id"):
-        value = getattr(environment, attr, "")
-        if value:
-            parts.append(str(value))
-    return "\n".join(parts)
+    return _pi_task_filter_text(instruction, environment)
 
 
-def _claude_system_prompt(memory_prompt: str = "") -> str:
-    return CLAUDE_SYSTEM_PROMPT.rstrip() + str(memory_prompt or "") + "\n"
+def _claude_transferable_skills_prompt(skills: list[dict[str, Any]]) -> str:
+    if not skills:
+        return ""
+
+    max_skill_chars = int(os.getenv("CLAUDE_SKILL_PROMPT_MAX_CHARS_PER_SKILL", "3600"))
+    lines = [
+        "",
+        "Transferable skill library:",
+        "- Treat these skills as evidence-gated weak hints, not mandatory patches.",
+        "- First inspect the current repository evidence. Use a skill only if its checks, owner path, error signal, or validation command match.",
+        "- If no skill matches concrete repository evidence, continue with the normal no-skill workflow.",
+        "- Prefer at most two matching skills before the first edit.",
+        "",
+    ]
+    for skill in skills:
+        root = skill.get("_root")
+        relative_path = skill.get("relative_path")
+        if not root or not relative_path:
+            continue
+        skill_path = Path(str(root)) / str(relative_path)
+        try:
+            body = skill_path.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if len(body) > max_skill_chars:
+            body = body[: max_skill_chars - 32].rstrip() + "\n... [skill truncated]"
+        quality = skill.get("quality_score")
+        quality_text = f", quality={quality:.2f}" if isinstance(quality, (int, float)) else ""
+        lines.extend(
+            [
+                f"### {skill.get('name') or skill_path.parent.name}",
+                f"- Source: `{relative_path}`",
+                f"- Use policy: `{skill.get('use_policy', 'evidence-gated')}`{quality_text}",
+                "",
+                body,
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _claude_system_prompt(memory_prompt: str = "", skill_prompt: str = "") -> str:
+    return (
+        CLAUDE_SYSTEM_PROMPT.rstrip()
+        + "\n"
+        + str(skill_prompt or "")
+        + str(memory_prompt or "")
+        + "\n"
+    )
 
 
 def _python_selector_script() -> str:
@@ -535,6 +957,7 @@ class ClaudeSdkAgent(BaseInstalledAgent):
         model_env: str = "NOVITA_MODEL",
         default_anthropic_base_url: str = "https://api.novita.ai/anthropic",
         default_model: str = "zai-org/glm-5.2",
+        claude_sdk_version: str = DEFAULT_CLAUDE_AGENT_SDK_VERSION,
         max_turns: int | None = None,
         max_budget_usd: float | None = None,
         result_only: bool = False,
@@ -550,6 +973,7 @@ class ClaudeSdkAgent(BaseInstalledAgent):
         self.model_env = model_env
         self.default_anthropic_base_url = default_anthropic_base_url
         self.default_model = default_model
+        self.claude_sdk_version = claude_sdk_version
         self.max_turns = max_turns
         self.max_budget_usd = max_budget_usd
         self.result_only = result_only
@@ -602,7 +1026,8 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             f"rm -rf {shlex.quote(str(REMOTE_VENV))}\n"
             f"\"$PYBIN\" -m venv {shlex.quote(str(REMOTE_VENV))}\n"
             f"{shlex.quote(str(REMOTE_PYTHON))} -m pip install --upgrade pip\n"
-            f"{shlex.quote(str(REMOTE_PYTHON))} -m pip install --upgrade claude-agent-sdk\n"
+            f"{shlex.quote(str(REMOTE_PYTHON))} -m pip install "
+            f"claude-agent-sdk=={shlex.quote(self.claude_sdk_version)}\n"
             f"{shlex.quote(str(REMOTE_PYTHON))} - <<'PY'\n"
             "import claude_agent_sdk\n"
             "print(getattr(claude_agent_sdk, '__version__', 'unknown'))\n"
@@ -640,6 +1065,14 @@ class ClaudeSdkAgent(BaseInstalledAgent):
         max_output_tokens = self._get_env("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
         if max_output_tokens:
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = max_output_tokens
+        for optional_name in (
+            "FORCE_DISABLE_THINKING",
+            "HARBOR_CLAUDE_DISABLE_THINKING_PROXY",
+            "HARBOR_CLAUDE_KEEP_PROXY",
+        ):
+            optional_value = self._get_env(optional_name)
+            if optional_value:
+                env[optional_name] = optional_value
         return env
 
     def _effective_instruction(self, instruction: str, *, use_skills: bool = False) -> str:
@@ -684,6 +1117,20 @@ class ClaudeSdkAgent(BaseInstalledAgent):
         env = self._required_env()
         provider_model = env[self.model_env]
         model = self.model_name or f"{self.provider_name}/{provider_model}"
+        task_filter_text = _task_filter_text(instruction, environment)
+        if self.use_skills:
+            claude_skills, _, _, all_claude_skills_count, skill_retrieval_filter = _pi_skill_pack(
+                task_filter_text
+            )
+        else:
+            claude_skills = []
+            all_claude_skills_count = 0
+            skill_retrieval_filter = {
+                "task_slug": "",
+                "repo_slug": "",
+                "max_prompt_skills": "0",
+            }
+        transferable_skill_prompt = _claude_transferable_skills_prompt(claude_skills)
         skill_harness_memory = {
             "enabled": False,
             "reason": "disabled",
@@ -694,16 +1141,15 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             "CLAUDE_USE_SKILL_HARNESS_MEMORY",
             _env_bool("PI_USE_SKILL_HARNESS_MEMORY", True),
         ):
-            skill_harness_memory = retrieve_task_memory(
-                _task_filter_text(instruction, environment)
-            )
-        effective_use_skills = self.use_skills and bool(
-            skill_harness_memory.get("prompt")
+            skill_harness_memory = retrieve_task_memory(task_filter_text)
+        effective_use_skills = self.use_skills and (
+            bool(transferable_skill_prompt) or bool(skill_harness_memory.get("prompt"))
         )
         claude_system_prompt = _claude_system_prompt(
             str(skill_harness_memory.get("prompt") or "")
             if effective_use_skills
-            else ""
+            else "",
+            transferable_skill_prompt if effective_use_skills else "",
         )
         effective_instruction = self._effective_instruction(
             instruction,
@@ -733,12 +1179,18 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             "system_prompt": claude_system_prompt,
             "tool_policy": "default Claude Code toolset; permission_mode=bypassPermissions",
             "skills_policy": (
-                "skill_harness_memory prompt injected; "
+                "transferable skill prompt and/or skill_harness_memory injected; "
                 "ClaudeAgentOptions(skills=[], setting_sources=[])"
                 if effective_use_skills
                 else "disabled via ClaudeAgentOptions(skills=[], setting_sources=[])"
             ),
             "use_skills": effective_use_skills,
+            "transferable_skills": {
+                "source_root_filter": skill_retrieval_filter,
+                "all_discovered_count": all_claude_skills_count,
+                "selected": _pi_skills_metadata(claude_skills),
+                "prompt_chars": len(transferable_skill_prompt),
+            },
             "skill_harness_memory": {
                 key: value
                 for key, value in skill_harness_memory.items()
@@ -746,7 +1198,10 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             },
             "thinking_policy": (
                 "disabled via ClaudeAgentOptions(thinking={'type': 'disabled'}, "
-                "max_thinking_tokens=0) for GLM/Qwen provider models"
+                "max_thinking_tokens=0) for GLM/Qwen provider models; "
+                "runner also injects thinking={'type':'disabled'} into Anthropic "
+                "request bodies through a local proxy unless "
+                "HARBOR_CLAUDE_DISABLE_THINKING_PROXY=1"
                 if thinking_disabled
                 else "provider default"
             ),
@@ -789,7 +1244,31 @@ class ClaudeSdkAgent(BaseInstalledAgent):
             f"{shlex.quote(str(REMOTE_PYTHON))} {shlex.quote(str(runner_path))} "
             f"2> >(tee {shlex.quote(str(stderr_path))} >&2)"
         )
-        await self.exec_as_agent(environment, command=command, env=run_env)
+        try:
+            await self.exec_as_agent(environment, command=command, env=run_env)
+        except Exception as exc:
+            probe = await environment.exec(
+                command=f"cat {shlex.quote(str(result_path))}",
+                env=run_env,
+            )
+            runner_result: dict[str, Any] = {}
+            if probe.return_code == 0 and probe.stdout:
+                try:
+                    parsed = json.loads(probe.stdout)
+                    if isinstance(parsed, dict):
+                        runner_result = parsed
+                except json.JSONDecodeError:
+                    pass
+            error = runner_result.get("error") or {}
+            error_type = str(error.get("type") or "")
+            error_message = str(error.get("message") or exc)
+            if error_type == "ClaudeProviderAuthenticationError":
+                raise DeepSweProviderAuthenticationError(error_message) from exc
+            if error_type == "ClaudeProviderTransientError":
+                raise DeepSweProviderTransientError(error_message) from exc
+            if error_type == "ClaudeProviderRequestError":
+                raise DeepSweProviderRequestError(error_message) from exc
+            raise DeepSweAgentIncompleteError(error_message) from exc
 
     def _jsonl_events(self) -> list[dict[str, Any]]:
         path = self.logs_dir / self._JSONL_FILENAME

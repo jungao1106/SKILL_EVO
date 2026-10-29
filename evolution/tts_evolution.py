@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import tomllib
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from agents.skill_evaluator import calibration_event, evaluate_candidate
 from agents.skill_writer import (
@@ -50,13 +52,52 @@ def task_slug(task_name: str) -> str:
     return leaf or "unknown-task"
 
 
+def _repo_slug_from_url(value: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    path = parsed.path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 2:
+        return f"{safe_slug(parts[-2], limit=80)}__{safe_slug(parts[-1], limit=80)}"
+    return None
+
+
+def _deepswe_task_roots() -> list[Path]:
+    roots = [
+        Path("/vePFS-Mindverse/user/intern/jungao/Marcronv1-Coding/deep-swe/tasks"),
+        Path(__file__).resolve().parents[1] / "deep-swe" / "tasks",
+    ]
+    return [root for root in roots if root.exists()]
+
+
+def _deepswe_repo_slug(task_name: str) -> str | None:
+    slug = task_slug(task_name)
+    for root in _deepswe_task_roots():
+        task_toml = root / slug / "task.toml"
+        if not task_toml.exists():
+            continue
+        try:
+            data = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        repo = _repo_slug_from_url(str(metadata.get("repository_url") or ""))
+        if repo:
+            return repo
+    return None
+
+
 def repo_slug_from_task(task_name: str) -> str:
     leaf = task_slug(task_name)
     if "__" in leaf:
         owner, rest = leaf.split("__", 1)
         repo = rest.rsplit("-", 1)[0]
         return f"{owner}__{repo}"
-    return "unknown"
+    return _deepswe_repo_slug(task_name) or "unknown"
 
 
 def result_reward(result: dict[str, Any]) -> float | None:
@@ -173,7 +214,15 @@ def _edited_paths_from_commands(commands: list[str], touched_paths: list[str]) -
 
 def _selected_skills(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for skill in metadata.get("skills") or []:
+    skills = metadata.get("skills")
+    if not isinstance(skills, list):
+        transferable = metadata.get("transferable_skills")
+        skills = (
+            transferable.get("selected")
+            if isinstance(transferable, dict)
+            else []
+        )
+    for skill in skills or []:
         if not isinstance(skill, dict):
             continue
         rows.append(
@@ -228,6 +277,7 @@ def collect_failed_trace_evidence(
     aggregate_report_path: Path,
     reward_threshold: float = 1.0,
     max_evidence: int | None = None,
+    benchmark_name: str = "swebench_verified",
 ) -> list[dict[str, Any]]:
     report = read_json(aggregate_report_path)
     evidence_rows: list[dict[str, Any]] = []
@@ -241,17 +291,31 @@ def collect_failed_trace_evidence(
         trial_dir = result_path.parent
         agent_dir = trial_dir / "agent"
         metadata = _load_json_if_exists(agent_dir / "pi-metadata.json")
+        metadata_kind = "pi"
+        if not metadata:
+            metadata = _load_json_if_exists(
+                agent_dir / "claude-agent-metadata.json"
+            )
+            metadata_kind = "claude"
         tool_names, commands, touched_paths = _extract_tool_calls_from_trajectory(agent_dir / "trajectory.json")
         test_commands = _classify_test_commands(commands)
         edited_paths = _edited_paths_from_commands(commands, touched_paths)
-        events = _iter_event_lines(agent_dir / "pi-events.jsonl", limit=200)
+        events_path = agent_dir / "pi-events.jsonl"
+        if metadata_kind == "claude":
+            events_path = agent_dir / "claude-agent-sdk.filtered.jsonl"
+            if not events_path.is_file():
+                events_path = agent_dir / "claude-agent-sdk.jsonl"
+        events = _iter_event_lines(events_path, limit=200)
+        transferable = metadata.get("transferable_skills")
+        transferable = transferable if isinstance(transferable, dict) else {}
         task_name = str(row.get("task_name") or result.get("task_name") or "")
         entry = {
             "created_at": utc_now(),
             "schema_version": 1,
             "level": "task_evidence",
             "entry_id": f"tts-{index:04d}-{safe_slug(task_slug(task_name), limit=80)}",
-            "source": "swebench_verified_direct_skill_run",
+            "source": f"{benchmark_name}_direct_skill_run",
+            "benchmark": benchmark_name,
             "task_name": task_name,
             "trial_name": row.get("trial_name") or result.get("trial_name") or trial_dir.name,
             "repo": repo_slug_from_task(task_name),
@@ -271,8 +335,10 @@ def collect_failed_trace_evidence(
             "touched_paths": touched_paths[:12],
             "edited_paths": edited_paths,
             "selected_skills": _selected_skills(metadata),
-            "skills_count": metadata.get("skills_count"),
-            "skills_source_root": metadata.get("skills_source_root"),
+            "skills_count": metadata.get("skills_count")
+            or transferable.get("all_discovered_count"),
+            "skills_source_root": metadata.get("skills_source_root")
+            or transferable.get("source_root_filter"),
             "model": metadata.get("provider_model") or metadata.get("model"),
             "thinking": metadata.get("thinking"),
             "public_signal": {
@@ -318,6 +384,7 @@ def generate_test_time_decisions(
     *,
     evidence_rows: list[dict[str, Any]],
     run_name: str,
+    benchmark_name: str = "swebench_verified",
     evaluator_policy: dict[str, Any] | None = None,
     repo_update_batch_size: int = 5,
     repo_min_support: int = 2,
@@ -371,7 +438,7 @@ def generate_test_time_decisions(
             repo_clusters.append(cluster)
             candidate = write_repo_candidate(cluster)
             candidate["source"] = "test_time_writer"
-            candidate["benchmark"] = "swebench_verified"
+            candidate["benchmark"] = benchmark_name
             candidate["skill_polarity"] = "mixed"
             repo_candidates.append(candidate)
             evaluator_decision = evaluate_candidate(
@@ -450,7 +517,7 @@ def generate_test_time_decisions(
         failure_clusters.append(failure_cluster)
         candidate = write_failure_mode_candidate(failure_cluster)
         candidate["source"] = "test_time_writer"
-        candidate["benchmark"] = "swebench_verified"
+        candidate["benchmark"] = benchmark_name
         candidate["skill_polarity"] = "negative"
         failure_candidates.append(candidate)
         evaluator_decision = evaluate_candidate(
@@ -764,6 +831,8 @@ def materialize_gate_library(
         copied_base = True
 
     skill_rows: list[dict[str, Any]] = []
+    added_count = 0
+    updated_count = 0
     for decision in promotion_decisions:
         if decision.get("decision") != "promote":
             continue
@@ -780,6 +849,10 @@ def materialize_gate_library(
             skill_dir = output_root / "_test_time" / safe_slug(level) / safe_slug(name)
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / "SKILL.md"
+        if skill_path.is_file():
+            updated_count += 1
+        else:
+            added_count += 1
         skill_path.write_text(render_test_time_skill(decision=decision, run_name=run_name))
         decision["skill_path"] = str(skill_path)
         skill_rows.append(
@@ -797,6 +870,10 @@ def materialize_gate_library(
         )
 
     base_count = len(list(base_skill_root.rglob("SKILL.md"))) if copied_base else 0
+    actual_total = len(list(output_root.rglob("SKILL.md")))
+    actual_test_time_total = len(
+        list((output_root / "_test_time").rglob("SKILL.md"))
+    )
     manifest = {
         "schema_version": 1,
         "kind": "test_time_skill_evolution_gate_library",
@@ -816,7 +893,10 @@ def materialize_gate_library(
         "skill_counts": {
             "base": base_count,
             "test_time_promoted": len(skill_rows),
-            "total": base_count + len(skill_rows),
+            "added_this_gate": added_count,
+            "updated_this_gate": updated_count,
+            "test_time_total": actual_test_time_total,
+            "total": actual_total,
         },
         "skills": skill_rows,
     }

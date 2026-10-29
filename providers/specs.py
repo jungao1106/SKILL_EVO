@@ -60,6 +60,31 @@ def ensure_reasoning_effort_none(
     return True
 
 
+def populate_anthropic_provider_env(
+    provider: "ProviderSpec",
+    env: MutableMapping[str, str] | None = None,
+) -> bool:
+    """Map standard Anthropic variables onto the selected provider profile."""
+
+    if not provider.anthropic_base_url_env:
+        return False
+    target = os.environ if env is None else env
+    changed = False
+    if not target.get(provider.anthropic_base_url_env):
+        base_url = target.get("ANTHROPIC_BASE_URL")
+        if base_url:
+            target[provider.anthropic_base_url_env] = base_url
+            changed = True
+    if not target.get(provider.api_key_env):
+        api_key = target.get("ANTHROPIC_AUTH_TOKEN") or target.get(
+            "ANTHROPIC_API_KEY"
+        )
+        if api_key:
+            target[provider.api_key_env] = api_key
+            changed = True
+    return changed
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     """Provider settings for both Pi and Claude Code harnesses."""
